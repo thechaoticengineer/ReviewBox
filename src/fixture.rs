@@ -1,40 +1,123 @@
-#[derive(Debug)]
-pub struct DemoFixture {
-    pub repositories: &'static [Repository],
-}
+use chrono::{TimeZone, Utc};
 
-#[derive(Debug)]
-pub struct Repository {
-    pub name: &'static str,
-    pub commits: &'static [Commit],
-}
+use crate::inbox::{ChildPane, Commit, FileChange, GitHubAuthor, Inbox, Repository};
 
-#[derive(Debug)]
-pub struct Commit {
-    pub short_id: &'static str,
-    pub subject: &'static str,
-    pub files: &'static [FileChange],
-}
-
-impl Commit {
-    pub fn label(&self) -> String {
-        format!("{}  {}", self.short_id, self.subject)
-    }
-}
-
-#[derive(Debug)]
-pub struct FileChange {
-    pub path: &'static str,
-    pub diff_lines: &'static [&'static str],
-}
+/// Builds the fictional, fully populated inbox used by `--demo` and tests.
+/// The application-facing types are owned so live data can use the same panes.
+pub struct DemoFixture;
 
 impl DemoFixture {
-    pub const fn new(repositories: &'static [Repository]) -> Self {
-        Self { repositories }
+    pub fn load() -> Inbox {
+        Inbox::demo(vec![
+            repository("fictional-labs/orbit-notes-demo", primary_commits()),
+            repository("fictional-studio/pixel-garden-demo", secondary_commits()),
+            repository("fictional-co/clockwork-api-demo", single_commit()),
+            repository("fictional-works/lantern-map-demo", secondary_commits()),
+            repository("fictional-lab/paper-comet-demo", single_commit()),
+            repository("fictional-foundry/quiet-signal-demo", primary_commits()),
+        ])
     }
+}
 
-    pub fn load() -> Self {
-        Self::new(REPOSITORIES)
+fn repository(name: &str, commits: Vec<Commit>) -> Repository {
+    Repository {
+        name: name.to_owned(),
+        commits,
+    }
+}
+
+fn commit(sha: &str, subject: &str, files: Vec<FileChange>) -> Commit {
+    Commit {
+        sha: sha.to_owned(),
+        subject: subject.to_owned(),
+        author: GitHubAuthor {
+            login: "fictional-reviewer".to_owned(),
+        },
+        authored_at: Utc.with_ymd_and_hms(2024, 1, 15, 12, 0, 0).unwrap(),
+        files: ChildPane::Available(files),
+    }
+}
+
+fn primary_commits() -> Vec<Commit> {
+    vec![
+        commit(
+            "a1b2c3d00000000000000000000000000000000",
+            "Refine fictional launch screen",
+            primary_files(),
+        ),
+        commit(
+            "b2c3d4e00000000000000000000000000000000",
+            "Tune sample twilight palette",
+            small_files(),
+        ),
+        commit(
+            "c3d4e5f00000000000000000000000000000000",
+            "Add imaginary planet routes",
+            primary_files(),
+        ),
+        commit(
+            "d4e5f6a00000000000000000000000000000000",
+            "Document offline fixture mode",
+            small_files(),
+        ),
+        commit(
+            "e5f6a7b00000000000000000000000000000000",
+            "Cover made-up route examples",
+            primary_files(),
+        ),
+        commit(
+            "f6a7b8c00000000000000000000000000000000",
+            "Polish demonstration labels",
+            small_files(),
+        ),
+    ]
+}
+
+fn secondary_commits() -> Vec<Commit> {
+    vec![
+        commit(
+            "13579bd00000000000000000000000000000000",
+            "Plant fictional color seeds",
+            small_files(),
+        ),
+        commit(
+            "2468ace00000000000000000000000000000000",
+            "Arrange sample garden tiles",
+            primary_files(),
+        ),
+    ]
+}
+
+fn single_commit() -> Vec<Commit> {
+    vec![commit(
+        "0decafe00000000000000000000000000000000",
+        "Calibrate imaginary clockwork",
+        small_files(),
+    )]
+}
+
+fn primary_files() -> Vec<FileChange> {
+    vec![
+        file("src/welcome.rs", WELCOME_DIFF),
+        file("themes/twilight.toml", THEME_DIFF),
+        file("src/routes.rs", ROUTES_DIFF),
+        file("tests/routes.rs", TEST_DIFF),
+        file("README.md", DOC_DIFF),
+        file("notes/empty-placeholder.txt", &[]),
+    ]
+}
+
+fn small_files() -> Vec<FileChange> {
+    vec![
+        file("src/lib.rs", ROUTES_DIFF),
+        file("tests/demo.rs", TEST_DIFF),
+    ]
+}
+
+fn file(path: &str, lines: &[&str]) -> FileChange {
+    FileChange {
+        path: path.to_owned(),
+        diff_lines: ChildPane::Available(lines.iter().map(|line| (*line).to_owned()).collect()),
     }
 }
 
@@ -55,7 +138,6 @@ const WELCOME_DIFF: &[&str] = &[
     "     \"demo-1\"",
     " }",
 ];
-
 const THEME_DIFF: &[&str] = &[
     "@@ -4,9 +4,11 @@",
     " [palette]",
@@ -69,7 +151,6 @@ const THEME_DIFF: &[&str] = &[
     "+focused_border = \"accent\"",
     " inactive_border = \"#53606d\"",
 ];
-
 const ROUTES_DIFF: &[&str] = &[
     "@@ -18,7 +18,16 @@",
     " pub fn routes() -> Router {",
@@ -86,7 +167,6 @@ const ROUTES_DIFF: &[&str] = &[
     "+    ])",
     "+}",
 ];
-
 const TEST_DIFF: &[&str] = &[
     "@@ -0,0 +1,13 @@",
     "+#[test]",
@@ -101,7 +181,6 @@ const TEST_DIFF: &[&str] = &[
     "+    assert_eq!(health(), \"ready\");",
     "+}",
 ];
-
 const DOC_DIFF: &[&str] = &[
     "@@ -2,5 +2,8 @@",
     " # Orbit Notes (fictional demo)",
@@ -112,133 +191,13 @@ const DOC_DIFF: &[&str] = &[
     " Run the example with `cargo run`.",
 ];
 
-const EMPTY_DIFF: &[&str] = &[];
-
-const FILES_PRIMARY: &[FileChange] = &[
-    FileChange {
-        path: "src/welcome.rs",
-        diff_lines: WELCOME_DIFF,
-    },
-    FileChange {
-        path: "themes/twilight.toml",
-        diff_lines: THEME_DIFF,
-    },
-    FileChange {
-        path: "src/routes.rs",
-        diff_lines: ROUTES_DIFF,
-    },
-    FileChange {
-        path: "tests/routes.rs",
-        diff_lines: TEST_DIFF,
-    },
-    FileChange {
-        path: "README.md",
-        diff_lines: DOC_DIFF,
-    },
-    FileChange {
-        path: "notes/empty-placeholder.txt",
-        diff_lines: EMPTY_DIFF,
-    },
-];
-
-const FILES_SMALL: &[FileChange] = &[
-    FileChange {
-        path: "src/lib.rs",
-        diff_lines: ROUTES_DIFF,
-    },
-    FileChange {
-        path: "tests/demo.rs",
-        diff_lines: TEST_DIFF,
-    },
-];
-
-const COMMITS_PRIMARY: &[Commit] = &[
-    Commit {
-        short_id: "a1b2c3d",
-        subject: "Refine fictional launch screen",
-        files: FILES_PRIMARY,
-    },
-    Commit {
-        short_id: "b2c3d4e",
-        subject: "Tune sample twilight palette",
-        files: FILES_SMALL,
-    },
-    Commit {
-        short_id: "c3d4e5f",
-        subject: "Add imaginary planet routes",
-        files: FILES_PRIMARY,
-    },
-    Commit {
-        short_id: "d4e5f6a",
-        subject: "Document offline fixture mode",
-        files: FILES_SMALL,
-    },
-    Commit {
-        short_id: "e5f6a7b",
-        subject: "Cover made-up route examples",
-        files: FILES_PRIMARY,
-    },
-    Commit {
-        short_id: "f6a7b8c",
-        subject: "Polish demonstration labels",
-        files: FILES_SMALL,
-    },
-];
-
-const COMMITS_SECONDARY: &[Commit] = &[
-    Commit {
-        short_id: "13579bd",
-        subject: "Plant fictional color seeds",
-        files: FILES_SMALL,
-    },
-    Commit {
-        short_id: "2468ace",
-        subject: "Arrange sample garden tiles",
-        files: FILES_PRIMARY,
-    },
-];
-
-const COMMITS_SINGLE: &[Commit] = &[Commit {
-    short_id: "0decafe",
-    subject: "Calibrate imaginary clockwork",
-    files: FILES_SMALL,
-}];
-
-const REPOSITORIES: &[Repository] = &[
-    Repository {
-        name: "fictional-labs/orbit-notes-demo",
-        commits: COMMITS_PRIMARY,
-    },
-    Repository {
-        name: "fictional-studio/pixel-garden-demo",
-        commits: COMMITS_SECONDARY,
-    },
-    Repository {
-        name: "fictional-co/clockwork-api-demo",
-        commits: COMMITS_SINGLE,
-    },
-    Repository {
-        name: "fictional-works/lantern-map-demo",
-        commits: COMMITS_SECONDARY,
-    },
-    Repository {
-        name: "fictional-lab/paper-comet-demo",
-        commits: COMMITS_SINGLE,
-    },
-    Repository {
-        name: "fictional-foundry/quiet-signal-demo",
-        commits: COMMITS_PRIMARY,
-    },
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn demo_fixture_has_nested_navigation_data() {
+    fn demo_fixture_has_owned_nested_navigation_data() {
         let fixture = DemoFixture::load();
-
         assert!(fixture.repositories.len() > 1);
         assert!(
             fixture
@@ -250,15 +209,14 @@ mod tests {
             fixture
                 .repositories
                 .iter()
-                .flat_map(|repo| repo.commits)
-                .all(|commit| !commit.files.is_empty())
+                .flat_map(|repo| &repo.commits)
+                .all(|commit| {
+                    !commit.sha.is_empty()
+                        && !commit.subject.is_empty()
+                        && !commit.files.as_slice().is_empty()
+                })
         );
+        assert!(fixture.child_panes_available());
         assert!(WELCOME_DIFF.len() > 10);
-        assert!(
-            fixture
-                .repositories
-                .iter()
-                .all(|repo| repo.name.contains("fictional"))
-        );
     }
 }

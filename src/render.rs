@@ -39,7 +39,7 @@ fn draw_panes(frame: &mut Frame<'_>, area: Rect, app: &App) {
         left[0],
         Pane::Repository,
         app,
-        app.fixture()
+        app.inbox()
             .repositories
             .iter()
             .map(|repository| repository.name.to_owned())
@@ -116,8 +116,13 @@ fn draw_list_pane(
 
 fn draw_diff_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let lines = if app.current_diff_lines().is_empty() {
+        let unavailable = !app.inbox().child_panes_available();
         vec![Line::styled(
-            "  (no diff content in this fixture)",
+            if unavailable {
+                "  (file and diff content are unavailable for the live inbox)"
+            } else {
+                "  (no diff content in this fixture)"
+            },
             Style::default().fg(Color::DarkGray),
         )]
     } else {

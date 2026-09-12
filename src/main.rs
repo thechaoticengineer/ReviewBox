@@ -1,7 +1,9 @@
 mod app;
 mod cli;
+mod day;
 mod event;
 mod fixture;
+mod inbox;
 mod render;
 mod smoke;
 mod terminal;
@@ -13,13 +15,21 @@ use app::App;
 use cli::Command;
 use event::CrosstermEventSource;
 use fixture::DemoFixture;
+use inbox::Inbox;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use terminal::{CrosstermOps, with_terminal};
 
 fn main() -> ExitCode {
     match cli::parse(std::env::args_os().skip(1)) {
-        Ok(Command::Demo) => match run_demo() {
+        Ok(Command::Live(selection)) => match run_inbox(Inbox::live(selection)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("reviewbox: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(Command::Demo) => match run_inbox(DemoFixture::load()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("reviewbox: {error}");
@@ -47,14 +57,13 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_demo() -> io::Result<()> {
+fn run_inbox(inbox: Inbox) -> io::Result<()> {
     with_terminal(CrosstermOps, || {
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
 
-        let fixture = DemoFixture::load();
-        let mut app = App::new(fixture);
+        let mut app = App::new(inbox);
         let mut events = CrosstermEventSource;
         event::run(&mut terminal, &mut app, &mut events)
     })

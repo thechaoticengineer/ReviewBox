@@ -1,4 +1,4 @@
-use crate::fixture::{Commit, DemoFixture, FileChange, Repository};
+use crate::inbox::{Commit, FileChange, Inbox, Repository};
 
 pub const MIN_FULL_WIDTH: u16 = 60;
 pub const MIN_FULL_HEIGHT: u16 = 16;
@@ -145,7 +145,7 @@ struct ListPosition {
 
 #[derive(Debug)]
 pub struct App {
-    fixture: DemoFixture,
+    inbox: Inbox,
     pub terminal_width: u16,
     pub terminal_height: u16,
     mode: Mode,
@@ -162,9 +162,22 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(fixture: DemoFixture) -> Self {
+    pub fn new(inbox: Inbox) -> Self {
+        let status = match &inbox.source {
+            crate::inbox::InboxSource::Demo => "Offline fictional demo".to_owned(),
+            crate::inbox::InboxSource::Live { selection } => format!(
+                "Live inbox configured for {} in {}{}; loading is available in the next increment",
+                selection.date,
+                selection.timezone_name,
+                if selection.timezone_source == crate::day::TimezoneSource::Fallback {
+                    " (local timezone fallback)"
+                } else {
+                    ""
+                }
+            ),
+        };
         let mut app = Self {
-            fixture,
+            inbox,
             terminal_width: 0,
             terminal_height: 0,
             mode: Mode::Normal,
@@ -176,7 +189,7 @@ impl App {
             viewport_heights: [0; 4],
             pending_g: false,
             search_query: String::new(),
-            status: "Offline fictional demo".to_owned(),
+            status,
             should_quit: false,
         };
         app.normalize();
@@ -318,10 +331,10 @@ impl App {
         let needle = query.to_lowercase();
         let found = match target {
             Pane::Repository => find_wrapped(
-                self.fixture.repositories.len(),
+                self.inbox.repositories.len(),
                 self.repositories.selected,
                 |index| {
-                    self.fixture.repositories[index]
+                    self.inbox.repositories[index]
                         .name
                         .to_lowercase()
                         .contains(&needle)
@@ -395,7 +408,7 @@ impl App {
             Pane::Repository => {
                 let selected = moved_index(
                     self.repositories.selected,
-                    self.fixture.repositories.len(),
+                    self.inbox.repositories.len(),
                     upward,
                     amount,
                 );
@@ -443,7 +456,7 @@ impl App {
     fn move_to_last(&mut self) {
         match self.focus {
             Pane::Repository => {
-                self.select_repository(self.fixture.repositories.len().saturating_sub(1));
+                self.select_repository(self.inbox.repositories.len().saturating_sub(1));
             }
             Pane::Commit => {
                 self.select_commit(self.current_commits().len().saturating_sub(1));
@@ -487,7 +500,7 @@ impl App {
     fn normalize(&mut self) {
         normalize_list(
             &mut self.repositories,
-            self.fixture.repositories.len(),
+            self.inbox.repositories.len(),
             self.viewport_heights[Pane::Repository.index()],
         );
 
@@ -510,9 +523,9 @@ impl App {
     }
 
     fn deepest_meaningful_pane(&self) -> Pane {
-        if self.fixture.repositories.is_empty() || self.current_commits().is_empty() {
+        if self.inbox.repositories.is_empty() || self.current_commits().is_empty() {
             Pane::Repository
-        } else if self.current_files().is_empty() {
+        } else if !self.inbox.child_panes_available() || self.current_files().is_empty() {
             Pane::Commit
         } else {
             Pane::Diff
@@ -524,17 +537,22 @@ impl App {
         self.current_diff_lines().len().saturating_sub(capacity)
     }
 
-    pub fn fixture(&self) -> &DemoFixture {
-        &self.fixture
+    pub fn inbox(&self) -> &Inbox {
+        &self.inbox
+    }
+
+    /// Kept as a compatibility accessor for the fixture-driven demo tests.
+    pub fn fixture(&self) -> &Inbox {
+        self.inbox()
     }
 
     pub fn current_repository(&self) -> Option<&Repository> {
-        self.fixture.repositories.get(self.repositories.selected)
+        self.inbox.repositories.get(self.repositories.selected)
     }
 
     pub fn current_commits(&self) -> &[Commit] {
         self.current_repository()
-            .map_or(&[], |repository| repository.commits)
+            .map_or(&[], |repository| repository.commits.as_slice())
     }
 
     pub fn current_commit(&self) -> Option<&Commit> {
@@ -542,15 +560,21 @@ impl App {
     }
 
     pub fn current_files(&self) -> &[FileChange] {
-        self.current_commit().map_or(&[], |commit| commit.files)
+        if self.inbox.child_panes_available() {
+            self.current_commit()
+                .map_or(&[], |commit| commit.files.as_slice())
+        } else {
+            &[]
+        }
     }
 
     pub fn current_file(&self) -> Option<&FileChange> {
         self.current_files().get(self.files.selected)
     }
 
-    pub fn current_diff_lines(&self) -> &[&'static str] {
-        self.current_file().map_or(&[], |file| file.diff_lines)
+    pub fn current_diff_lines(&self) -> &[String] {
+        self.current_file()
+            .map_or(&[], |file| file.diff_lines.as_slice())
     }
 
     pub fn mode(&self) -> Mode {
@@ -606,7 +630,7 @@ impl App {
 
     fn dataset_len(&self, pane: Pane) -> usize {
         match pane {
-            Pane::Repository => self.fixture.repositories.len(),
+            Pane::Repository => self.inbox.repositories.len(),
             Pane::Commit => self.current_commits().len(),
             Pane::File => self.current_files().len(),
             Pane::Diff => self.current_diff_lines().len(),
@@ -679,75 +703,57 @@ fn pane_viewport_heights(width: u16, height: u16) -> [usize; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture::{Commit, FileChange, Repository};
+    use crate::fixture::DemoFixture;
+    use crate::inbox::{ChildPane, GitHubAuthor};
+    use chrono::{TimeZone, Utc};
 
-    const LINES: &[&str] = &["one", "two", "three", "four", "five", "six"];
-    const FILES: &[FileChange] = &[
-        FileChange {
-            path: "one.rs",
-            diff_lines: LINES,
-        },
-        FileChange {
-            path: "two.rs",
-            diff_lines: LINES,
-        },
-        FileChange {
-            path: "three.rs",
-            diff_lines: LINES,
-        },
-    ];
-    const COMMITS: &[Commit] = &[
+    fn files() -> Vec<FileChange> {
+        ["one.rs", "two.rs", "three.rs"]
+            .into_iter()
+            .map(|path| FileChange {
+                path: path.to_owned(),
+                diff_lines: ChildPane::Available(
+                    ["one", "two", "three", "four", "five", "six"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                ),
+            })
+            .collect()
+    }
+
+    fn commit(sha: &str, subject: &str, files: Vec<FileChange>) -> Commit {
         Commit {
-            short_id: "1111111",
-            subject: "one",
-            files: FILES,
-        },
-        Commit {
-            short_id: "2222222",
-            subject: "two",
-            files: FILES,
-        },
-        Commit {
-            short_id: "3333333",
-            subject: "three",
-            files: FILES,
-        },
-    ];
-    const REPOSITORIES: &[Repository] = &[
-        Repository {
-            name: "fictional/one",
-            commits: COMMITS,
-        },
-        Repository {
-            name: "fictional/two",
-            commits: COMMITS,
-        },
-        Repository {
-            name: "fictional/three",
-            commits: COMMITS,
-        },
-    ];
-    const NO_REPOSITORIES: &[Repository] = &[];
-    const ONE_REPOSITORY: &[Repository] = &[Repository {
-        name: "fictional/only",
-        commits: &[],
-    }];
-    const ONE_FILE: &[FileChange] = &[FileChange {
-        path: "only.rs",
-        diff_lines: &["only line"],
-    }];
-    const ONE_COMMIT: &[Commit] = &[Commit {
-        short_id: "0000001",
-        subject: "only",
-        files: ONE_FILE,
-    }];
-    const ONE_NESTED_REPOSITORY: &[Repository] = &[Repository {
-        name: "fictional/only-nested",
-        commits: ONE_COMMIT,
-    }];
+            sha: sha.to_owned(),
+            subject: subject.to_owned(),
+            author: GitHubAuthor {
+                login: "fictional".to_owned(),
+            },
+            authored_at: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            files: ChildPane::Available(files),
+        }
+    }
+
+    fn commits() -> Vec<Commit> {
+        vec![
+            commit("1111111000000000000000000000000000000000", "one", files()),
+            commit("2222222000000000000000000000000000000000", "two", files()),
+            commit("3333333000000000000000000000000000000000", "three", files()),
+        ]
+    }
+
+    fn repositories() -> Vec<Repository> {
+        ["fictional/one", "fictional/two", "fictional/three"]
+            .into_iter()
+            .map(|name| Repository {
+                name: name.to_owned(),
+                commits: commits(),
+            })
+            .collect()
+    }
 
     fn app() -> App {
-        let mut app = App::new(DemoFixture::new(REPOSITORIES));
+        let mut app = App::new(Inbox::demo(repositories()));
         app.viewport_heights = [2; 4];
         app
     }
@@ -881,7 +887,7 @@ mod tests {
 
         for (width, height) in [(1, 1), (60, 16), (100, 50), (0, 0)] {
             app.resize(width, height);
-            assert!(app.selected(Pane::Repository) < app.fixture.repositories.len());
+            assert!(app.selected(Pane::Repository) < app.inbox.repositories.len());
             assert!(app.selected(Pane::Commit) < app.current_commits().len());
             assert!(app.selected(Pane::File) < app.current_files().len());
             assert!(app.scroll(Pane::Diff) <= app.max_diff_scroll());
@@ -890,8 +896,27 @@ mod tests {
 
     #[test]
     fn empty_and_singleton_collections_never_underflow() {
-        for repositories in [NO_REPOSITORIES, ONE_REPOSITORY, ONE_NESTED_REPOSITORY] {
-            let mut app = App::new(DemoFixture::new(repositories));
+        let one_repository = Inbox::demo(vec![Repository {
+            name: "fictional/only".to_owned(),
+            commits: Vec::new(),
+        }]);
+        let one_nested_repository = Inbox::demo(vec![Repository {
+            name: "fictional/only-nested".to_owned(),
+            commits: vec![commit(
+                "0000001000000000000000000000000000000000",
+                "only",
+                vec![FileChange {
+                    path: "only.rs".to_owned(),
+                    diff_lines: ChildPane::Available(vec!["only line".to_owned()]),
+                }],
+            )],
+        }]);
+        for inbox in [
+            Inbox::demo(Vec::new()),
+            one_repository,
+            one_nested_repository,
+        ] {
+            let mut app = App::new(inbox);
             for command in [
                 Command::MoveUp,
                 Command::MoveDown,
@@ -911,6 +936,27 @@ mod tests {
             assert_eq!(app.scroll(Pane::Diff), 0);
             assert_eq!(app.focus(), Pane::Repository);
         }
+    }
+
+    #[test]
+    fn live_inbox_does_not_open_fixture_child_panes() {
+        let selection = crate::day::select_day(
+            crate::day::parse_date("2024-01-15").unwrap(),
+            crate::day::parse_timezone("Etc/UTC").unwrap(),
+            crate::day::TimezoneSource::Explicit,
+        )
+        .unwrap();
+        let mut inbox = Inbox::live(selection);
+        inbox.repositories = vec![Repository {
+            name: "owned/repository".to_owned(),
+            commits: commits(),
+        }];
+        let mut app = App::new(inbox);
+        app.apply(Command::Open);
+        assert_eq!(app.focus(), Pane::Commit);
+        app.apply(Command::Open);
+        assert_eq!(app.focus(), Pane::Commit);
+        assert!(app.current_files().is_empty());
     }
 
     #[test]

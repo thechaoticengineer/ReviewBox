@@ -4,7 +4,7 @@ A keyboard-first terminal review inbox for commits across GitHub projects.
 
 See [PRODUCT.md](PRODUCT.md) for the accepted requirements and delivery order.
 
-## Current status: terminal foundation
+## Current status: terminal foundation and inbox configuration
 
 Implemented now:
 
@@ -18,17 +18,26 @@ Implemented now:
   application errors, and recoverable partial setup failures.
 - An executable, noninteractive smoke workflow rendered through Ratatui's
   in-memory test backend.
+- Owned inbox, repository, commit, author, file, and diff models shared by the
+  fictional demo and future live data. Commits retain their complete SHA,
+  subject, GitHub login, and author timestamp; the UI displays only a short SHA.
+- Live launch configuration: no arguments selects today's calendar day in the
+  detected local IANA timezone. `--date YYYY-MM-DD` and `--timezone IANA_NAME`
+  override those values before terminal setup. If local-zone detection is not
+  available, the deterministic fallback is `Etc/UTC`.
+- A selected day is the half-open interval from local midnight through (but not
+  including) the following local midnight. Both boundaries are converted to UTC
+  independently, so daylight-saving days can be 23 or 25 hours.
 
 Planned for later delivery increments, and not implemented yet:
 
-- Live GitHub access and repository/commit discovery.
+- GitHub authentication, repository/commit discovery, and asynchronous loading.
 - Durable review state and reviewed/unreviewed filtering.
 - Real diffs loaded from GitHub repositories.
 - Drafting, editing, persistence, and publishing of comments.
-- Date/timezone selection, authentication integration, and repeated-match
-  navigation with `n` / `N`.
+- Repeated-match navigation with `n` / `N`.
 
-## Prerequisites and demo
+## Launch configuration and demo
 
 Install Rust 1.88 or newer (including Cargo) and use a terminal that supports
 Crossterm. Launch the interactive demo with:
@@ -36,6 +45,19 @@ Crossterm. Launch the interactive demo with:
 ```sh
 cargo run -- --demo
 ```
+
+The normal launch path is reserved for the live inbox configuration:
+
+```sh
+cargo run -- --date 2026-09-12 --timezone Europe/Warsaw
+```
+
+Both options are optional; `cargo run` uses today in the detected local IANA
+timezone. Argument validation and local-zone fallback happen before the terminal
+is changed. This increment deliberately does not invoke `gh`, make network
+requests, or load live commits yet; its live panes therefore contain no fixture
+files or diffs. The next loading increment will use the configured interval and
+the installed GitHub CLI authentication.
 
 The demo needs no GitHub authentication. It performs no network requests or
 network writes and does not persist runtime state. All repository names, commit

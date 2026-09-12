@@ -123,7 +123,7 @@ pub fn run() -> io::Result<SmokeReport> {
     app.handle_input(Input::Enter);
     ensure(
         app.mode() == Mode::Normal
-            && app.current_file().map(|file| file.path) == Some("src/routes.rs"),
+            && app.current_file().map(|file| file.path.as_str()) == Some("src/routes.rs"),
         "Enter must apply search and select the matching fixture file",
     )?;
     ensure_contains(
