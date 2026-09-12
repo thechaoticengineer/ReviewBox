@@ -13,3 +13,8 @@ Thumbs.db
 
 # Local logs
 *.log
+
+# Forge runtime and local review data
+.forge/
+.reviewbox/
+target/
