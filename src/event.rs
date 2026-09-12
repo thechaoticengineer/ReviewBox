@@ -7,36 +7,31 @@ use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 
-use crate::app::{App, Command};
+use crate::app::{App, Input};
 use crate::render;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppEvent {
-    Command(Command),
+    Input(Input),
     Resize(u16, u16),
 }
 
-pub fn translate_key(key: KeyEvent) -> Option<Command> {
+pub fn translate_key(key: KeyEvent) -> Option<Input> {
     if key.kind != KeyEventKind::Press {
         return None;
     }
 
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
-    let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
-    let command = match (key.code, control, plain) {
-        (KeyCode::Char('c'), true, _) => Command::Quit,
-        (KeyCode::Char('d'), true, _) => Command::HalfPageDown,
-        (KeyCode::Char('u'), true, _) => Command::HalfPageUp,
-        (KeyCode::Char('q'), false, true) => Command::Quit,
-        (KeyCode::Char('h'), false, true) => Command::FocusPrevious,
-        (KeyCode::Char('j'), false, true) => Command::MoveDown,
-        (KeyCode::Char('k'), false, true) => Command::MoveUp,
-        (KeyCode::Char('l'), false, true) => Command::FocusNext,
-        (KeyCode::Char('g'), false, true) => Command::GPrefix,
-        (KeyCode::Char('G'), false, true) => Command::Last,
-        (KeyCode::Enter, false, _) => Command::Open,
-        (KeyCode::Esc, false, _) => Command::Back,
-        _ => Command::Unrelated,
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let command = match (key.code, control, alt) {
+        (KeyCode::Char('c'), true, _) => Input::Quit,
+        (KeyCode::Char('d'), true, _) => Input::HalfPageDown,
+        (KeyCode::Char('u'), true, _) => Input::HalfPageUp,
+        (KeyCode::Char(character), false, false) => Input::Character(character),
+        (KeyCode::Enter, false, false) => Input::Enter,
+        (KeyCode::Esc, false, false) => Input::Escape,
+        (KeyCode::Backspace, false, false) => Input::Backspace,
+        _ => Input::Unrelated,
     };
     Some(command)
 }
@@ -52,8 +47,8 @@ impl EventSource for CrosstermEventSource {
         loop {
             match event::read()? {
                 CrosstermEvent::Key(key) => {
-                    if let Some(command) = translate_key(key) {
-                        return Ok(AppEvent::Command(command));
+                    if let Some(input) = translate_key(key) {
+                        return Ok(AppEvent::Input(input));
                     }
                 }
                 CrosstermEvent::Resize(width, height) => {
@@ -83,7 +78,7 @@ where
             .map_err(io::Error::other)?;
 
         match events.next()? {
-            AppEvent::Command(command) => app.apply(command),
+            AppEvent::Input(input) => app.handle_input(input),
             AppEvent::Resize(width, height) => {
                 terminal
                     .resize(Rect::new(0, 0, width, height))
@@ -116,20 +111,19 @@ mod tests {
     }
 
     #[test]
-    fn translates_every_normal_navigation_key() {
+    fn translates_printable_and_editing_keys_without_assigning_a_mode() {
         for (key, expected) in [
-            (key(KeyCode::Char('h')), Command::FocusPrevious),
-            (key(KeyCode::Char('j')), Command::MoveDown),
-            (key(KeyCode::Char('k')), Command::MoveUp),
-            (key(KeyCode::Char('l')), Command::FocusNext),
-            (key(KeyCode::Char('g')), Command::GPrefix),
+            (key(KeyCode::Char('h')), Input::Character('h')),
+            (key(KeyCode::Char('j')), Input::Character('j')),
+            (key(KeyCode::Char('/')), Input::Character('/')),
+            (key(KeyCode::Char('?')), Input::Character('?')),
             (
                 KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
-                Command::Last,
+                Input::Character('G'),
             ),
-            (key(KeyCode::Enter), Command::Open),
-            (key(KeyCode::Esc), Command::Back),
-            (key(KeyCode::Char('q')), Command::Quit),
+            (key(KeyCode::Enter), Input::Enter),
+            (key(KeyCode::Esc), Input::Escape),
+            (key(KeyCode::Backspace), Input::Backspace),
         ] {
             assert_eq!(translate_key(key), Some(expected));
         }
@@ -138,9 +132,9 @@ mod tests {
     #[test]
     fn translates_control_movement_and_quit_keys() {
         for (character, expected) in [
-            ('d', Command::HalfPageDown),
-            ('u', Command::HalfPageUp),
-            ('c', Command::Quit),
+            ('d', Input::HalfPageDown),
+            ('u', Input::HalfPageUp),
+            ('c', Input::Quit),
         ] {
             let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL);
             assert_eq!(translate_key(key), Some(expected));
@@ -148,10 +142,10 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_press_resets_prefix_but_repeat_and_release_are_ignored() {
+    fn printable_press_is_preserved_but_repeat_and_release_are_ignored() {
         assert_eq!(
             translate_key(key(KeyCode::Char('x'))),
-            Some(Command::Unrelated)
+            Some(Input::Character('x'))
         );
         for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
             let key = KeyEvent::new_with_kind(KeyCode::Char('j'), KeyModifiers::NONE, kind);
@@ -169,7 +163,7 @@ mod tests {
         let mut app = App::new(DemoFixture::load());
         let mut events = Events(vec![
             Ok(AppEvent::Resize(40, 10)),
-            Ok(AppEvent::Command(Command::Quit)),
+            Ok(AppEvent::Input(Input::Character('q'))),
         ]);
 
         run(&mut terminal, &mut app, &mut events).expect("event loop succeeds");
@@ -179,14 +173,14 @@ mod tests {
     }
 
     #[test]
-    fn semantic_commands_reach_the_reducer() {
+    fn inputs_reach_the_modal_reducer() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut app = App::new(DemoFixture::load());
         let mut events = Events(vec![
-            Ok(AppEvent::Command(Command::MoveDown)),
-            Ok(AppEvent::Command(Command::FocusNext)),
-            Ok(AppEvent::Command(Command::Quit)),
+            Ok(AppEvent::Input(Input::Character('j'))),
+            Ok(AppEvent::Input(Input::Character('l'))),
+            Ok(AppEvent::Input(Input::Character('q'))),
         ]);
 
         run(&mut terminal, &mut app, &mut events).expect("event loop succeeds");

@@ -6,6 +6,8 @@ pub const MIN_FULL_HEIGHT: u16 = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
+    SearchEntry { target: Pane },
+    Help { previous_focus: Pane },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -70,6 +72,71 @@ pub enum Command {
     Unrelated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Input {
+    Character(char),
+    Backspace,
+    Enter,
+    Escape,
+    HalfPageDown,
+    HalfPageUp,
+    Quit,
+    Unrelated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelpBinding {
+    pub keys: &'static str,
+    pub action: &'static str,
+}
+
+pub const HELP_BINDINGS: &[HelpBinding] = &[
+    HelpBinding {
+        keys: "h / l",
+        action: "focus previous / next pane",
+    },
+    HelpBinding {
+        keys: "j / k",
+        action: "move or scroll down / up",
+    },
+    HelpBinding {
+        keys: "gg / G",
+        action: "first / last position",
+    },
+    HelpBinding {
+        keys: "Ctrl-d / Ctrl-u",
+        action: "move down / up half a pane",
+    },
+    HelpBinding {
+        keys: "Enter / Escape",
+        action: "open child / return to parent",
+    },
+    HelpBinding {
+        keys: "/",
+        action: "search the focused pane",
+    },
+    HelpBinding {
+        keys: "?",
+        action: "open this help",
+    },
+    HelpBinding {
+        keys: "q / Ctrl-c",
+        action: "quit from normal mode / quit globally",
+    },
+    HelpBinding {
+        keys: "Search: text, Backspace",
+        action: "edit the query",
+    },
+    HelpBinding {
+        keys: "Search: Enter / Escape",
+        action: "apply / cancel",
+    },
+    HelpBinding {
+        keys: "Help: Escape",
+        action: "close help",
+    },
+];
+
 #[derive(Debug, Default, Clone, Copy)]
 struct ListPosition {
     selected: usize,
@@ -89,7 +156,8 @@ pub struct App {
     diff_scroll: usize,
     viewport_heights: [usize; 4],
     pending_g: bool,
-    status: &'static str,
+    search_query: String,
+    status: String,
     should_quit: bool,
 }
 
@@ -107,7 +175,8 @@ impl App {
             diff_scroll: 0,
             viewport_heights: [0; 4],
             pending_g: false,
-            status: "Offline fictional demo",
+            search_query: String::new(),
+            status: "Offline fictional demo".to_owned(),
             should_quit: false,
         };
         app.normalize();
@@ -128,7 +197,7 @@ impl App {
                 self.apply_normal(Command::GPrefix);
             } else {
                 self.pending_g = true;
-                self.status = "g: waiting for second g";
+                self.status = "g: waiting for second g".to_owned();
             }
             self.normalize();
             return;
@@ -137,15 +206,92 @@ impl App {
         self.pending_g = false;
         match self.mode {
             Mode::Normal => self.apply_normal(command),
+            Mode::SearchEntry { .. } | Mode::Help { .. } => {}
         }
         self.normalize();
+    }
+
+    pub fn handle_input(&mut self, input: Input) {
+        if input == Input::Quit {
+            self.pending_g = false;
+            self.apply_normal(Command::Quit);
+            return;
+        }
+
+        match self.mode {
+            Mode::Normal => self.handle_normal_input(input),
+            Mode::SearchEntry { target } => self.handle_search_input(target, input),
+            Mode::Help { previous_focus } => self.handle_help_input(previous_focus, input),
+        }
+        self.normalize();
+    }
+
+    fn handle_normal_input(&mut self, input: Input) {
+        let command = match input {
+            Input::Character('/') => {
+                self.pending_g = false;
+                self.search_query.clear();
+                self.mode = Mode::SearchEntry { target: self.focus };
+                self.status = format!("Searching {}", self.focus.title());
+                return;
+            }
+            Input::Character('?') => {
+                self.pending_g = false;
+                self.mode = Mode::Help {
+                    previous_focus: self.focus,
+                };
+                self.status = "Keyboard help open".to_owned();
+                return;
+            }
+            Input::Character('q') => Command::Quit,
+            Input::Character('h') => Command::FocusPrevious,
+            Input::Character('j') => Command::MoveDown,
+            Input::Character('k') => Command::MoveUp,
+            Input::Character('l') => Command::FocusNext,
+            Input::Character('g') => Command::GPrefix,
+            Input::Character('G') => Command::Last,
+            Input::Enter => Command::Open,
+            Input::Escape => Command::Back,
+            Input::HalfPageDown => Command::HalfPageDown,
+            Input::HalfPageUp => Command::HalfPageUp,
+            Input::Character(_) | Input::Backspace | Input::Unrelated | Input::Quit => {
+                Command::Unrelated
+            }
+        };
+        self.apply(command);
+    }
+
+    fn handle_search_input(&mut self, target: Pane, input: Input) {
+        self.pending_g = false;
+        match input {
+            Input::Character(character) => self.search_query.push(character),
+            Input::Backspace => {
+                self.search_query.pop();
+            }
+            Input::Enter => self.apply_search(target),
+            Input::Escape => {
+                self.search_query.clear();
+                self.mode = Mode::Normal;
+                self.status = "Search cancelled".to_owned();
+            }
+            Input::HalfPageDown | Input::HalfPageUp | Input::Unrelated | Input::Quit => {}
+        }
+    }
+
+    fn handle_help_input(&mut self, previous_focus: Pane, input: Input) {
+        self.pending_g = false;
+        if input == Input::Escape {
+            self.focus = previous_focus;
+            self.mode = Mode::Normal;
+            self.status = "Keyboard help closed".to_owned();
+        }
     }
 
     fn apply_normal(&mut self, command: Command) {
         match command {
             Command::Quit => {
                 self.should_quit = true;
-                self.status = "Closing demo";
+                self.status = "Closing demo".to_owned();
             }
             Command::FocusPrevious => self.focus_previous("Focus moved left"),
             Command::FocusNext => self.focus_next("Focus moved right"),
@@ -157,16 +303,79 @@ impl App {
             Command::HalfPageUp => self.move_active(true, self.half_page_step()),
             Command::Open => self.focus_next("Opened selected item"),
             Command::Back => self.focus_previous("Returned to parent pane"),
-            Command::Unrelated => self.status = "Key has no action in normal mode",
+            Command::Unrelated => self.status = "Key has no action in normal mode".to_owned(),
+        }
+    }
+
+    fn apply_search(&mut self, target: Pane) {
+        let query = std::mem::take(&mut self.search_query);
+        self.mode = Mode::Normal;
+        if query.is_empty() {
+            self.status = "Empty search; position unchanged".to_owned();
+            return;
+        }
+
+        let needle = query.to_lowercase();
+        let found = match target {
+            Pane::Repository => find_wrapped(
+                self.fixture.repositories.len(),
+                self.repositories.selected,
+                |index| {
+                    self.fixture.repositories[index]
+                        .name
+                        .to_lowercase()
+                        .contains(&needle)
+                },
+            ),
+            Pane::Commit => find_wrapped(
+                self.current_commits().len(),
+                self.commits.selected,
+                |index| {
+                    self.current_commits()[index]
+                        .label()
+                        .to_lowercase()
+                        .contains(&needle)
+                },
+            ),
+            Pane::File => find_wrapped(self.current_files().len(), self.files.selected, |index| {
+                self.current_files()[index]
+                    .path
+                    .to_lowercase()
+                    .contains(&needle)
+            }),
+            Pane::Diff => {
+                find_wrapped(self.current_diff_lines().len(), self.diff_scroll, |index| {
+                    self.current_diff_lines()[index]
+                        .to_lowercase()
+                        .contains(&needle)
+                })
+            }
+        };
+
+        if let Some(index) = found {
+            match target {
+                Pane::Repository => self.select_repository(index),
+                Pane::Commit => self.select_commit(index),
+                Pane::File => self.select_file(index),
+                Pane::Diff => self.diff_scroll = index,
+            }
+            let length = self.dataset_len(target);
+            self.status = format!(
+                "Match for '{query}' in {} ({}/{length})",
+                target.title(),
+                index + 1
+            );
+        } else {
+            self.status = format!("No match for '{query}' in {}", target.title());
         }
     }
 
     fn focus_previous(&mut self, status: &'static str) {
         if let Some(previous) = self.focus.previous() {
             self.focus = previous;
-            self.status = status;
+            self.status = status.to_owned();
         } else {
-            self.status = "Already at repository pane";
+            self.status = "Already at repository pane".to_owned();
         }
     }
 
@@ -175,10 +384,10 @@ impl App {
             && next <= self.deepest_meaningful_pane()
         {
             self.focus = next;
-            self.status = status;
+            self.status = status.to_owned();
             return;
         }
-        self.status = "No child pane to open";
+        self.status = "No child pane to open".to_owned();
     }
 
     fn move_active(&mut self, upward: bool, amount: usize) {
@@ -218,7 +427,7 @@ impl App {
                 };
             }
         }
-        self.status = if upward { "Moved up" } else { "Moved down" };
+        self.status = if upward { "Moved up" } else { "Moved down" }.to_owned();
     }
 
     fn move_to_first(&mut self) {
@@ -228,7 +437,7 @@ impl App {
             Pane::File => self.select_file(0),
             Pane::Diff => self.diff_scroll = 0,
         }
-        self.status = "Moved to first position";
+        self.status = "Moved to first position".to_owned();
     }
 
     fn move_to_last(&mut self) {
@@ -244,7 +453,7 @@ impl App {
             }
             Pane::Diff => self.diff_scroll = self.max_diff_scroll(),
         }
-        self.status = "Moved to last position";
+        self.status = "Moved to last position".to_owned();
     }
 
     fn half_page_step(&self) -> usize {
@@ -371,12 +580,7 @@ impl App {
     }
 
     pub fn position(&self, pane: Pane) -> (usize, usize) {
-        let length = match pane {
-            Pane::Repository => self.fixture.repositories.len(),
-            Pane::Commit => self.current_commits().len(),
-            Pane::File => self.current_files().len(),
-            Pane::Diff => self.current_diff_lines().len(),
-        };
+        let length = self.dataset_len(pane);
         if length == 0 {
             (0, 0)
         } else {
@@ -388,13 +592,41 @@ impl App {
         self.pending_g
     }
 
-    pub fn status(&self) -> &'static str {
-        self.status
+    pub fn search_query(&self) -> &str {
+        &self.search_query
+    }
+
+    pub fn status(&self) -> &str {
+        &self.status
     }
 
     pub fn should_quit(&self) -> bool {
         self.should_quit
     }
+
+    fn dataset_len(&self, pane: Pane) -> usize {
+        match pane {
+            Pane::Repository => self.fixture.repositories.len(),
+            Pane::Commit => self.current_commits().len(),
+            Pane::File => self.current_files().len(),
+            Pane::Diff => self.current_diff_lines().len(),
+        }
+    }
+}
+
+fn find_wrapped(
+    length: usize,
+    current: usize,
+    mut matches: impl FnMut(usize) -> bool,
+) -> Option<usize> {
+    if length == 0 {
+        return None;
+    }
+
+    let current = current.min(length - 1);
+    ((current + 1)..length)
+        .chain(0..=current)
+        .find(|&index| matches(index))
 }
 
 fn moved_index(current: usize, length: usize, upward: bool, amount: usize) -> usize {
@@ -702,6 +934,145 @@ mod tests {
         assert!(app.scroll(Pane::Commit) <= app.selected(Pane::Commit));
         assert!(app.scroll(Pane::File) <= app.selected(Pane::File));
         assert!(app.scroll(Pane::Diff) <= app.max_diff_scroll());
+    }
+
+    #[test]
+    fn search_entry_isolates_printable_navigation_and_help_keys() {
+        let mut app = app();
+        let focus = app.focus();
+        let selected = app.selected(Pane::Repository);
+
+        app.handle_input(Input::Character('/'));
+        for character in ['h', 'j', 'k', 'l', 'g', 'G', '?', 'q'] {
+            app.handle_input(Input::Character(character));
+        }
+
+        assert_eq!(
+            app.mode(),
+            Mode::SearchEntry {
+                target: Pane::Repository
+            }
+        );
+        assert_eq!(app.search_query(), "hjklgG?q");
+        assert_eq!(app.focus(), focus);
+        assert_eq!(app.selected(Pane::Repository), selected);
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn search_query_supports_editing_cancel_and_empty_apply() {
+        let mut app = app();
+        app.handle_input(Input::Character('l'));
+        let focus = app.focus();
+
+        app.handle_input(Input::Character('/'));
+        for character in ['t', 'w', 'x'] {
+            app.handle_input(Input::Character(character));
+        }
+        app.handle_input(Input::Backspace);
+        assert_eq!(app.search_query(), "tw");
+        app.handle_input(Input::Escape);
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.focus(), focus);
+        assert!(app.search_query().is_empty());
+        assert_eq!(app.status(), "Search cancelled");
+
+        app.handle_input(Input::Character('/'));
+        app.handle_input(Input::Enter);
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.focus(), focus);
+        assert_eq!(app.status(), "Empty search; position unchanged");
+    }
+
+    #[test]
+    fn search_selects_list_matches_case_insensitively_and_wraps() {
+        let mut app = app();
+
+        enter_search(&mut app, "THREE");
+        assert_eq!(app.selected(Pane::Repository), 2);
+        assert!(app.status().contains("Match for 'THREE'"));
+
+        enter_search(&mut app, "one");
+        assert_eq!(app.selected(Pane::Repository), 0);
+        assert!(app.status().contains("(1/3)"));
+
+        app.handle_input(Input::Character('l'));
+        enter_search(&mut app, "3333333");
+        assert_eq!(app.selected(Pane::Commit), 2);
+        app.handle_input(Input::Character('l'));
+        enter_search(&mut app, "TWO.RS");
+        assert_eq!(app.selected(Pane::File), 1);
+    }
+
+    #[test]
+    fn diff_search_scrolls_to_match_wraps_and_preserves_no_match_state() {
+        let mut app = app();
+        app.focus = Pane::Diff;
+
+        enter_search(&mut app, "five");
+        assert_eq!(app.scroll(Pane::Diff), 4);
+        enter_search(&mut app, "one");
+        assert_eq!(app.scroll(Pane::Diff), 0);
+
+        let before = app.scroll(Pane::Diff);
+        enter_search(&mut app, "not present");
+        assert_eq!(app.scroll(Pane::Diff), before);
+        assert_eq!(app.status(), "No match for 'not present' in Diff");
+    }
+
+    #[test]
+    fn help_ignores_normal_commands_then_escape_restores_focus() {
+        let mut app = app();
+        app.handle_input(Input::Character('l'));
+        let focus = app.focus();
+        let selected = app.selected(Pane::Commit);
+
+        app.handle_input(Input::Character('?'));
+        assert_eq!(
+            app.mode(),
+            Mode::Help {
+                previous_focus: focus
+            }
+        );
+        for input in [
+            Input::Character('h'),
+            Input::Character('j'),
+            Input::Character('/'),
+            Input::Character('q'),
+            Input::Enter,
+        ] {
+            app.handle_input(input);
+        }
+        assert_eq!(app.focus(), focus);
+        assert_eq!(app.selected(Pane::Commit), selected);
+        assert!(!app.should_quit());
+
+        app.handle_input(Input::Escape);
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.focus(), focus);
+        app.handle_input(Input::Character('j'));
+        assert_eq!(app.selected(Pane::Commit), selected + 1);
+    }
+
+    #[test]
+    fn resize_does_not_retarget_an_active_search() {
+        let mut app = app();
+        app.focus = Pane::File;
+        app.handle_input(Input::Character('/'));
+
+        for (width, height) in [(1, 1), (0, 0), (120, 40)] {
+            app.resize(width, height);
+            assert_eq!(app.mode(), Mode::SearchEntry { target: Pane::File });
+            assert_eq!(app.focus(), Pane::File);
+        }
+    }
+
+    fn enter_search(app: &mut App, query: &str) {
+        app.handle_input(Input::Character('/'));
+        for character in query.chars() {
+            app.handle_input(Input::Character(character));
+        }
+        app.handle_input(Input::Enter);
     }
 
     #[test]

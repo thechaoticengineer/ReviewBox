@@ -11,10 +11,12 @@ The demo now provides populated repository, commit, file, and diff panes backed
 by deterministic fictional fixtures. Normal-mode navigation keeps parent and
 child selections coherent, clamps movement at every boundary, redraws after a
 terminal resize, and uses a compact fallback on small terminals. Terminal state
-is restored after normal exit and propagated application errors.
+is restored after normal exit and propagated application errors. Search works
+against the focused pane's fictional data, and an in-app help overlay documents
+normal and search mode.
 
-Search, keyboard help, live GitHub access, review persistence, real GitHub
-diffs, and comments remain planned work.
+Live GitHub access, review persistence, real GitHub diffs, comments, and repeated
+match navigation remain planned work.
 
 ## Run the demo
 
@@ -40,10 +42,18 @@ Implemented normal-mode bindings:
   available.
 - `Escape`: return to the parent pane. At the repository pane it stays put and
   never quits unexpectedly.
+- `/`: enter search-entry mode for the focused pane. Typed characters—including
+  normal-mode navigation letters—edit the query. `Backspace` edits, `Enter`
+  selects or scrolls to the first case-insensitive match with one wrap, and
+  `Escape` cancels. Empty and no-match searches leave the current position
+  unchanged and report their result in the status line.
+- `?`: open contextual keyboard help. `Escape` closes it and restores the prior
+  pane focus.
 - `q` / `Ctrl-c`: quit and restore the terminal.
 
-The status line shows normal mode, a pending `g`, the focused pane, and the most
-recent action. `/` search and `?` help are planned for the next stage.
+The status line shows the active mode, a pending `g`, the focused pane, and the
+most recent action. Search and help remain usable after a resize and fall back
+to clipped, panic-free overlays in very small terminals.
 
 Development checks for this stage are:
 
