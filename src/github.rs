@@ -831,6 +831,10 @@ struct HttpEnvelope<'a> {
 }
 
 fn parse_http_envelope(bytes: &[u8]) -> Result<HttpEnvelope<'_>, ()> {
+    // Version managers and other executable launchers can emit a bounded
+    // informational line before handing control to `gh`. The response remains
+    // unambiguous because an included HTTP envelope starts at a line boundary.
+    let bytes = http_envelope_start(bytes).ok_or(())?;
     let (header, body) = split_header(bytes).ok_or(())?;
     let header = std::str::from_utf8(header).map_err(|_| ())?;
     let mut lines = header.lines();
@@ -854,6 +858,16 @@ fn parse_http_envelope(bytes: &[u8]) -> Result<HttpEnvelope<'_>, ()> {
         headers,
         body,
     })
+}
+
+fn http_envelope_start(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.starts_with(b"HTTP/") {
+        return Some(bytes);
+    }
+    bytes
+        .windows(b"\nHTTP/".len())
+        .position(|window| window == b"\nHTTP/")
+        .map(|index| &bytes[index + 1..])
 }
 
 fn split_header(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -1613,6 +1627,29 @@ mod tests {
             ));
             runner.assert_finished();
         }
+    }
+
+    #[test]
+    fn accepts_a_launcher_notice_before_the_included_http_envelope() {
+        let mut output = http_output(200, &[], br#"{"login":"Octo"}"#, true);
+        let mut prefixed = b"tool launcher notice\n".to_vec();
+        prefixed.extend_from_slice(&output.stdout.bytes);
+        output.stdout.bytes = prefixed;
+        let runner = ScriptedRunner::new(vec![
+            Step {
+                endpoint: "/user".to_owned(),
+                fields: vec![],
+                result: ScriptResult::Output(output),
+            },
+            repos_step(json!([])),
+        ]);
+
+        let report = GitHubLoader::new(&runner)
+            .load(&selection(), |_| {})
+            .expect("the HTTP envelope remains parseable after launcher output");
+
+        assert!(report.no_owned_repositories());
+        runner.assert_finished();
     }
 
     #[test]

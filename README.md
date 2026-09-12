@@ -64,24 +64,42 @@ Planned for later delivery increments, and not implemented yet:
 ## Launch configuration and demo
 
 Install Rust 1.88 or newer (including Cargo) and use a terminal that supports
-Crossterm. Launch the interactive demo with:
+Crossterm. Launch the live inbox for today in the detected local timezone with:
 
 ```sh
-cargo run -- --demo
+cargo run
 ```
 
-The normal launch path currently configures the live inbox selection:
+Select a different date or IANA timezone with either or both options:
 
 ```sh
 cargo run -- --date 2026-09-12 --timezone Europe/Warsaw
 ```
 
-Both options are optional; `cargo run` uses today in the detected local IANA
-timezone. Argument validation and local-zone fallback happen before the terminal
-is changed. The live inbox starts immediately in the background. It requires the
-`gh` executable and an existing authenticated GitHub CLI session (normally set
-up with `gh auth login`). Every request is a read-only `gh api --method GET`
-request. Press `q` or `Ctrl-c` at any time to cancel loading and exit.
+Launch the interactive fictional demo with:
+
+```sh
+cargo run -- --demo
+```
+
+Both options are optional and independent. Without `--date`, ReviewBox chooses
+today as observed in the selected timezone; without `--timezone`, it uses the
+detected local IANA timezone. If detection fails or produces an invalid IANA
+name, it visibly falls back to `Etc/UTC`. Argument validation and timezone
+fallback happen before the terminal is changed.
+
+The live inbox starts loading immediately in the background. It requires the
+`gh` executable and an existing authenticated GitHub CLI session, normally set
+up with [`gh auth login`](https://cli.github.com/manual/gh_auth_login). The
+credential must be allowed to see each desired repository: GitHub documents
+Metadata (read) permission for authenticated repository discovery and Contents
+(read) permission for listing private-repository branches and commits. A
+classic token needs the `repo` scope to include private repositories; a
+fine-grained token must select the desired repositories and grant those read
+permissions. Repositories hidden from the credential cannot be discovered.
+ReviewBox does not inspect or persist the credential. Every request is a
+read-only `gh api --method GET` request. Press `q` or `Ctrl-c` at any time to
+cancel loading and exit.
 
 The demo needs no GitHub authentication. It performs no network requests or
 network writes and does not persist runtime state. All repository names, commit
@@ -152,22 +170,33 @@ to clipped, panic-free overlays in very small terminals.
 
 The loader first resolves the authenticated account with `GET /user`, then
 explicitly paginates `GET /user/repos` with `affiliation=owner` and defensively
-checks each returned owner login. For every stably sorted repository it paginates
-the branch list and requests commits once per distinct branch with the selected
-UTC `since`/`until` interval and authenticated `author` login. Results are checked
-again locally against the top-level GitHub `author.login` and
-`commit.author.date`; the end instant is always excluded even if the server
-returns its inclusive boundary. Shared commits reachable from several branches
-are retained once by full SHA.
+checks each returned owner login. It therefore includes accessible public and
+private repositories owned by that personal account, but not organization-owned
+repositories or repositories owned by someone else where the user collaborates.
+Pages contain at most 100 items and are fetched until a short or empty page.
 
-This is branch coverage, not a transactional snapshot. Commits reachable only
-from deleted or inaccessible refs cannot be found, and repositories or branches
-can change during traversal. Unlinked commits whose top-level GitHub author is
-null are excluded even when commit metadata names or email addresses resemble
-the user; ReviewBox does not guess identity from those fields. The filtered time
-is Git's documented author timestamp (`commit.author.date`), not committer time,
-push time, or the contribution-calendar date. Forks owned by another account are
-excluded by the owner-only inbox definition.
+For every stably sorted repository, ReviewBox paginates every branch currently
+returned by GitHub and requests commit pages once per distinct branch, also 100
+at a time until a short or empty page. Each request supplies the branch, the
+authenticated `author` login, and the selected UTC `since` and `until`
+boundaries. The correctness interval is exactly
+`[selected-date 00:00:00, following-date 00:00:00)` in the named IANA timezone;
+its two local midnights are independently converted to UTC. Results are checked
+again locally against an exact, case-insensitive top-level GitHub `author.login`
+match and the Git author timestamp in `commit.author.date`. The start instant is
+included and the end instant excluded. Shared commits reachable from several
+branches are retained once per repository by full SHA.
+
+This is branch coverage, not a transactional snapshot. Commits unreachable from
+the currently listed branch heads—including tag-only, dangling, deleted-ref, or
+inaccessible-ref commits—cannot be found. Inaccessible repositories and branches
+are also absent or incomplete, and repositories or branches can be created,
+deleted, or advanced during traversal. Unlinked commits whose top-level GitHub
+author is null are excluded even when commit metadata names or email addresses
+resemble the user; ReviewBox does not guess identity from those fields. The
+filtered time is Git's author timestamp (`commit.author.date`), not committer
+time, push time, or the contribution-calendar date. Forks owned by another
+account are excluded by the owner-only inbox definition.
 
 GitHub can return permission/not-found, authentication, rate-limit, and other
 API failures. A 403 is considered rate-limited only when response headers report
