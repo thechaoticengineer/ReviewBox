@@ -3,6 +3,7 @@ mod cli;
 mod event;
 mod fixture;
 mod render;
+mod smoke;
 mod terminal;
 
 use std::io;
@@ -22,6 +23,16 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("reviewbox: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(Command::DemoSmoke) => match smoke::run() {
+            Ok(report) => {
+                println!("ReviewBox demo smoke: ok ({} frames)", report.frames);
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("reviewbox demo smoke: {error}");
                 ExitCode::FAILURE
             }
         },

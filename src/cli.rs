@@ -1,11 +1,12 @@
 use std::ffi::OsString;
 use std::fmt;
 
-pub const USAGE: &str = "ReviewBox terminal foundation\n\nUsage:\n  reviewbox --demo\n  reviewbox --help\n\nOptions:\n  --demo  Run the fictional, offline terminal demo\n  -h, --help  Show this help\n";
+pub const USAGE: &str = "ReviewBox terminal foundation\n\nUsage:\n  reviewbox --demo\n  reviewbox --demo-smoke\n  reviewbox --help\n\nOptions:\n  --demo        Run the fictional, offline terminal demo\n  --demo-smoke  Verify the demo noninteractively with an in-memory terminal\n  -h, --help    Show this help\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Demo,
+    DemoSmoke,
     Help,
 }
 
@@ -34,6 +35,7 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, P
     let mut arguments = arguments.into_iter();
     let command = match arguments.next() {
         Some(argument) if argument == "--demo" => Command::Demo,
+        Some(argument) if argument == "--demo-smoke" => Command::DemoSmoke,
         Some(argument) if argument == "--help" || argument == "-h" => Command::Help,
         Some(argument) => return Err(ParseError::UnexpectedArgument(argument)),
         None => return Err(ParseError::MissingMode),
@@ -54,6 +56,14 @@ mod tests {
     fn demo_mode_is_explicit() {
         assert_eq!(parse([OsString::from("--demo")]), Ok(Command::Demo));
         assert_eq!(parse([]), Err(ParseError::MissingMode));
+    }
+
+    #[test]
+    fn demo_smoke_mode_is_explicit() {
+        assert_eq!(
+            parse([OsString::from("--demo-smoke")]),
+            Ok(Command::DemoSmoke)
+        );
     }
 
     #[test]
