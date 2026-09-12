@@ -161,7 +161,17 @@ fn combine_errors(context: &str, primary: io::Error, secondary: Option<io::Error
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use crate::app::{App, Input};
+    use crate::event::{AppEvent, EventSource, LoaderEventSource};
+    use crate::github::LoadEvent;
+    use crate::inbox::Inbox;
 
     #[derive(Clone)]
     struct RecordingOps {
@@ -301,6 +311,81 @@ mod tests {
         assert_eq!(
             &calls(&log)[3..],
             ["show_cursor", "leave_screen", "disable_raw"]
+        );
+    }
+
+    struct QuitAfterTick(bool);
+
+    impl EventSource for QuitAfterTick {
+        fn poll(&mut self, _timeout: Duration) -> io::Result<Option<AppEvent>> {
+            if self.0 {
+                Ok(Some(AppEvent::Input(Input::Character('q'))))
+            } else {
+                self.0 = true;
+                Ok(None)
+            }
+        }
+    }
+
+    struct ActiveLoader {
+        progress_sent: bool,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl LoaderEventSource for ActiveLoader {
+        fn try_next(&mut self) -> Option<LoadEvent> {
+            if self.progress_sent {
+                None
+            } else {
+                self.progress_sent = true;
+                Some(LoadEvent::DiscoveryPage {
+                    page: 1,
+                    owned_repositories: 1,
+                })
+            }
+        }
+
+        fn cancel(&mut self) {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn quitting_during_loading_cancels_work_and_restores_terminal() {
+        let (ops, log) = RecordingOps::new(None);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let loader_cancelled = Arc::clone(&cancelled);
+
+        with_terminal(ops, || {
+            let backend = TestBackend::new(100, 24);
+            let mut terminal = Terminal::new(backend).map_err(io::Error::other)?;
+            let selection = crate::day::select_day(
+                crate::day::parse_date("2024-01-15").unwrap(),
+                crate::day::parse_timezone("Etc/UTC").unwrap(),
+                crate::day::TimezoneSource::Explicit,
+            )
+            .unwrap();
+            let mut app = App::new(Inbox::live(selection));
+            let mut events = QuitAfterTick(false);
+            let mut loader = ActiveLoader {
+                progress_sent: false,
+                cancelled: loader_cancelled,
+            };
+            crate::event::run_with_loader(&mut terminal, &mut app, &mut events, &mut loader)
+        })
+        .expect("quit succeeds");
+
+        assert!(cancelled.load(Ordering::Acquire));
+        assert_eq!(
+            calls(&log),
+            [
+                "enable_raw",
+                "enter_screen",
+                "hide_cursor",
+                "show_cursor",
+                "leave_screen",
+                "disable_raw"
+            ]
         );
     }
 }

@@ -1,4 +1,9 @@
-use crate::inbox::{Commit, FileChange, Inbox, Repository};
+use std::collections::BTreeMap;
+
+use crate::github::{
+    LoadEvent, LoadFailure, LoadProgress, LoadStatus, LoadedRepository, RepositoryCoverage,
+};
+use crate::inbox::{Commit, FileChange, Inbox, InboxSource, Repository};
 
 pub const MIN_FULL_WIDTH: u16 = 60;
 pub const MIN_FULL_HEIGHT: u16 = 16;
@@ -143,6 +148,85 @@ struct ListPosition {
     scroll: usize,
 }
 
+const MAX_VISIBLE_FAILURES: usize = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LivePhase {
+    Authenticating,
+    Discovering {
+        page: usize,
+        owned_repositories: usize,
+    },
+    LoadingRepository {
+        repository: usize,
+        total: usize,
+    },
+    LoadingBranches {
+        repository: usize,
+        page: usize,
+        branches: usize,
+    },
+    LoadingCommits {
+        repository: usize,
+        branch: usize,
+        branches: usize,
+        page: usize,
+        accepted_commits: usize,
+    },
+    Complete,
+    EmptyDay,
+    NoOwnedRepositories,
+    Incomplete,
+    Fatal,
+}
+
+#[derive(Debug)]
+pub struct LiveInboxState {
+    pub phase: LivePhase,
+    pub progress: LoadProgress,
+    failures: Vec<LoadFailure>,
+    omitted_failures: usize,
+    loaded: BTreeMap<usize, LoadedRepository>,
+    branch_totals: BTreeMap<usize, usize>,
+    branches_done: BTreeMap<usize, usize>,
+}
+
+impl LiveInboxState {
+    fn new() -> Self {
+        Self {
+            phase: LivePhase::Authenticating,
+            progress: LoadProgress::default(),
+            failures: Vec::new(),
+            omitted_failures: 0,
+            loaded: BTreeMap::new(),
+            branch_totals: BTreeMap::new(),
+            branches_done: BTreeMap::new(),
+        }
+    }
+
+    pub fn failures(&self) -> &[LoadFailure] {
+        &self.failures
+    }
+
+    pub fn omitted_failures(&self) -> usize {
+        self.omitted_failures
+    }
+
+    pub fn available_commits(&self) -> usize {
+        self.loaded
+            .values()
+            .map(|repository| repository.repository.commits.len())
+            .sum()
+    }
+
+    pub fn incomplete_repositories(&self) -> usize {
+        self.loaded
+            .values()
+            .filter(|repository| repository.coverage != RepositoryCoverage::Complete)
+            .count()
+    }
+}
+
 #[derive(Debug)]
 pub struct App {
     inbox: Inbox,
@@ -159,23 +243,16 @@ pub struct App {
     search_query: String,
     status: String,
     should_quit: bool,
+    live: Option<LiveInboxState>,
 }
 
 impl App {
     pub fn new(inbox: Inbox) -> Self {
         let status = match &inbox.source {
-            crate::inbox::InboxSource::Demo => "Offline fictional demo".to_owned(),
-            crate::inbox::InboxSource::Live { selection } => format!(
-                "Live inbox configured for {} in {}{}; loading is available in the next increment",
-                selection.date,
-                selection.timezone_name,
-                if selection.timezone_source == crate::day::TimezoneSource::Fallback {
-                    " (local timezone fallback)"
-                } else {
-                    ""
-                }
-            ),
+            InboxSource::Demo => "Offline fictional demo".to_owned(),
+            InboxSource::Live { .. } => "GitHub loading started".to_owned(),
         };
+        let live = matches!(inbox.source, InboxSource::Live { .. }).then(LiveInboxState::new);
         let mut app = Self {
             inbox,
             terminal_width: 0,
@@ -191,6 +268,7 @@ impl App {
             search_query: String::new(),
             status,
             should_quit: false,
+            live,
         };
         app.normalize();
         app
@@ -200,6 +278,177 @@ impl App {
         self.terminal_width = width;
         self.terminal_height = height;
         self.viewport_heights = pane_viewport_heights(width, height);
+        self.normalize();
+    }
+
+    pub fn apply_load_event(&mut self, event: LoadEvent) {
+        if self.live.is_none() {
+            return;
+        }
+
+        let selected_repository = self.current_repository().map(|value| value.name.clone());
+        let selected_commit = self.current_commit().map(|value| value.sha.clone());
+
+        let live = self.live.as_mut().expect("checked above");
+        match event {
+            LoadEvent::DiscoveryPage {
+                page,
+                owned_repositories,
+            } => {
+                live.progress.repositories_discovered = owned_repositories;
+                live.phase = LivePhase::Discovering {
+                    page,
+                    owned_repositories,
+                };
+            }
+            LoadEvent::RepositoriesDiscovered { total } => {
+                live.progress.repositories_discovered = total;
+                live.phase = LivePhase::LoadingRepository {
+                    repository: 0,
+                    total,
+                };
+            }
+            LoadEvent::RepositoryStarted {
+                repository_index,
+                total,
+            } => {
+                live.phase = LivePhase::LoadingRepository {
+                    repository: repository_index + 1,
+                    total,
+                };
+            }
+            LoadEvent::BranchPage {
+                repository_index,
+                page,
+                branches,
+            } => {
+                live.branch_totals.insert(repository_index, branches);
+                live.progress.branches_discovered = live.branch_totals.values().sum();
+                live.phase = LivePhase::LoadingBranches {
+                    repository: repository_index + 1,
+                    page,
+                    branches,
+                };
+            }
+            LoadEvent::BranchStarted {
+                repository_index,
+                branch_index,
+                total,
+            } => {
+                live.phase = LivePhase::LoadingCommits {
+                    repository: repository_index + 1,
+                    branch: branch_index + 1,
+                    branches: total,
+                    page: 0,
+                    accepted_commits: 0,
+                };
+            }
+            LoadEvent::CommitPage {
+                repository_index,
+                branch_index,
+                page,
+                accepted_commits,
+            } => {
+                let branches = match live.phase {
+                    LivePhase::LoadingCommits { branches, .. } => branches,
+                    _ => branch_index + 1,
+                };
+                live.phase = LivePhase::LoadingCommits {
+                    repository: repository_index + 1,
+                    branch: branch_index + 1,
+                    branches,
+                    page,
+                    accepted_commits,
+                };
+            }
+            LoadEvent::RepositorySnapshot {
+                repository_index,
+                repository,
+            } => {
+                if let LivePhase::LoadingCommits {
+                    repository, branch, ..
+                } = live.phase
+                    && repository == repository_index + 1
+                {
+                    live.branches_done.insert(repository_index, branch);
+                    live.progress.branches_processed = live.branches_done.values().sum();
+                }
+                live.loaded.insert(repository_index, repository);
+                live.progress.commits_loaded = live.available_commits();
+                self.inbox.repositories = live
+                    .loaded
+                    .values()
+                    .map(|loaded| loaded.repository.clone())
+                    .collect();
+            }
+            LoadEvent::RepositoryLoaded {
+                repository_index,
+                repository,
+            } => {
+                live.branch_totals
+                    .insert(repository_index, repository.branch_count);
+                live.branches_done
+                    .insert(repository_index, repository.branch_count);
+                live.loaded.insert(repository_index, repository);
+                live.progress.repositories_processed = live
+                    .progress
+                    .repositories_processed
+                    .max(repository_index + 1);
+                live.progress.branches_discovered = live.branch_totals.values().sum();
+                live.progress.branches_processed = live.branches_done.values().sum();
+                live.progress.commits_loaded = live.available_commits();
+                self.inbox.repositories = live
+                    .loaded
+                    .values()
+                    .map(|loaded| loaded.repository.clone())
+                    .collect();
+            }
+            LoadEvent::Failure(failure) => {
+                if live.failures.len() < MAX_VISIBLE_FAILURES {
+                    live.failures.push(failure);
+                } else {
+                    live.omitted_failures += 1;
+                }
+            }
+            LoadEvent::Finished { status, progress } => {
+                live.progress = progress;
+                live.phase = match status {
+                    LoadStatus::Fatal => LivePhase::Fatal,
+                    LoadStatus::Incomplete => LivePhase::Incomplete,
+                    LoadStatus::Complete if self.inbox.repositories.is_empty() => {
+                        LivePhase::NoOwnedRepositories
+                    }
+                    LoadStatus::Complete
+                        if self
+                            .inbox
+                            .repositories
+                            .iter()
+                            .all(|repository| repository.commits.is_empty()) =>
+                    {
+                        LivePhase::EmptyDay
+                    }
+                    LoadStatus::Complete => LivePhase::Complete,
+                };
+            }
+        }
+
+        if let Some(name) = selected_repository
+            && let Some(index) = self
+                .inbox
+                .repositories
+                .iter()
+                .position(|repository| repository.name == name)
+        {
+            self.repositories.selected = index;
+            if let Some(sha) = selected_commit
+                && let Some(index) = self.inbox.repositories[index]
+                    .commits
+                    .iter()
+                    .position(|commit| commit.sha == sha)
+            {
+                self.commits.selected = index;
+            }
+        }
         self.normalize();
     }
 
@@ -304,7 +553,7 @@ impl App {
         match command {
             Command::Quit => {
                 self.should_quit = true;
-                self.status = "Closing demo".to_owned();
+                self.status = "Closing ReviewBox".to_owned();
             }
             Command::FocusPrevious => self.focus_previous("Focus moved left"),
             Command::FocusNext => self.focus_next("Focus moved right"),
@@ -626,6 +875,10 @@ impl App {
 
     pub fn should_quit(&self) -> bool {
         self.should_quit
+    }
+
+    pub fn live_state(&self) -> Option<&LiveInboxState> {
+        self.live.as_ref()
     }
 
     fn dataset_len(&self, pane: Pane) -> usize {
@@ -1126,5 +1379,107 @@ mod tests {
         let mut app = app();
         app.apply(Command::Quit);
         assert!(app.should_quit());
+    }
+
+    fn live_app() -> App {
+        let selection = crate::day::select_day(
+            crate::day::parse_date("2024-01-15").unwrap(),
+            crate::day::parse_timezone("Etc/UTC").unwrap(),
+            crate::day::TimezoneSource::Explicit,
+        )
+        .unwrap();
+        App::new(Inbox::live(selection))
+    }
+
+    fn loaded_repository(name: &str, commits: Vec<Commit>) -> LoadedRepository {
+        LoadedRepository {
+            repository: Repository {
+                name: name.to_owned(),
+                commits,
+            },
+            branch_count: 2,
+            coverage: RepositoryCoverage::Complete,
+        }
+    }
+
+    #[test]
+    fn loader_snapshots_preserve_repository_and_full_sha_selection() {
+        let mut app = live_app();
+        let alpha = loaded_repository("fixture/alpha", commits());
+        let beta = loaded_repository("fixture/beta", commits());
+        app.apply_load_event(LoadEvent::RepositorySnapshot {
+            repository_index: 0,
+            repository: alpha.clone(),
+        });
+        app.apply_load_event(LoadEvent::RepositorySnapshot {
+            repository_index: 1,
+            repository: beta.clone(),
+        });
+        app.apply(Command::MoveDown);
+        app.apply(Command::Open);
+        app.apply(Command::MoveDown);
+        let selected_sha = app.current_commit().unwrap().sha.clone();
+
+        let mut updated_alpha = alpha;
+        updated_alpha.repository.commits.reverse();
+        app.apply_load_event(LoadEvent::RepositorySnapshot {
+            repository_index: 0,
+            repository: updated_alpha,
+        });
+        let mut updated_beta = beta;
+        updated_beta.repository.commits.insert(
+            0,
+            commit(
+                "9999999000000000000000000000000000000000",
+                "newest",
+                Vec::new(),
+            ),
+        );
+        app.apply_load_event(LoadEvent::RepositorySnapshot {
+            repository_index: 1,
+            repository: updated_beta,
+        });
+
+        assert_eq!(app.current_repository().unwrap().name, "fixture/beta");
+        assert_eq!(app.current_commit().unwrap().sha, selected_sha);
+        assert_eq!(app.selected(Pane::Commit), 2);
+    }
+
+    #[test]
+    fn loader_mutations_clamp_positions_and_bound_sanitized_failures() {
+        let mut app = live_app();
+        app.apply_load_event(LoadEvent::RepositorySnapshot {
+            repository_index: 0,
+            repository: loaded_repository("fixture/alpha", commits()),
+        });
+        app.apply(Command::Open);
+        app.apply(Command::Last);
+        assert_eq!(app.selected(Pane::Commit), 2);
+
+        app.apply_load_event(LoadEvent::RepositorySnapshot {
+            repository_index: 0,
+            repository: loaded_repository(
+                "fixture/alpha",
+                vec![commit(
+                    "1111111000000000000000000000000000000000",
+                    "one",
+                    Vec::new(),
+                )],
+            ),
+        });
+        for branch_index in 0..5 {
+            app.apply_load_event(LoadEvent::Failure(LoadFailure {
+                category: crate::github::FailureCategory::PermissionOrNotFound,
+                scope: crate::github::FailureScope::Branch {
+                    repository_index: 0,
+                    branch_index,
+                },
+                http_status: Some(403),
+            }));
+        }
+
+        assert_eq!(app.selected(Pane::Commit), 0);
+        assert_eq!(app.live_state().unwrap().failures().len(), 3);
+        assert_eq!(app.live_state().unwrap().omitted_failures(), 2);
     }
 }

@@ -5,6 +5,7 @@ mod event;
 mod fixture;
 pub mod github;
 mod inbox;
+mod loader;
 mod render;
 mod smoke;
 mod terminal;
@@ -17,6 +18,8 @@ use cli::Command;
 use event::CrosstermEventSource;
 use fixture::DemoFixture;
 use inbox::Inbox;
+use inbox::InboxSource;
+use loader::LoaderSession;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use terminal::{CrosstermOps, with_terminal};
@@ -59,6 +62,10 @@ fn main() -> ExitCode {
 }
 
 fn run_inbox(inbox: Inbox) -> io::Result<()> {
+    let selection = match &inbox.source {
+        InboxSource::Live { selection } => Some(selection.clone()),
+        InboxSource::Demo => None,
+    };
     with_terminal(CrosstermOps, || {
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend)?;
@@ -66,6 +73,13 @@ fn run_inbox(inbox: Inbox) -> io::Result<()> {
 
         let mut app = App::new(inbox);
         let mut events = CrosstermEventSource;
-        event::run(&mut terminal, &mut app, &mut events)
+        if let Some(selection) = selection {
+            let mut loader = LoaderSession::start(selection);
+            let result = event::run_with_loader(&mut terminal, &mut app, &mut events, &mut loader);
+            loader.shutdown();
+            result
+        } else {
+            event::run(&mut terminal, &mut app, &mut events)
+        }
     })
 }

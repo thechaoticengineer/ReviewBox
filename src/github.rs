@@ -8,7 +8,10 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, Read};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Deserialize;
@@ -43,6 +46,20 @@ pub struct ProcessOutput {
 pub enum ProcessError {
     NotFound,
     Transport,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 /// Injectable boundary used for every `gh` invocation.
@@ -52,6 +69,19 @@ pub trait ProcessRunner {
         executable: &OsStr,
         arguments: &[OsString],
     ) -> Result<ProcessOutput, ProcessError>;
+
+    fn run_cancellable(
+        &self,
+        executable: &OsStr,
+        arguments: &[OsString],
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, ProcessError> {
+        if cancellation.is_cancelled() {
+            Err(ProcessError::Cancelled)
+        } else {
+            self.run(executable, arguments)
+        }
+    }
 }
 
 /// Production runner. It invokes `gh` directly, never through a shell, and
@@ -65,6 +95,18 @@ impl ProcessRunner for CommandRunner {
         executable: &OsStr,
         arguments: &[OsString],
     ) -> Result<ProcessOutput, ProcessError> {
+        self.run_cancellable(executable, arguments, &CancellationToken::default())
+    }
+
+    fn run_cancellable(
+        &self,
+        executable: &OsStr,
+        arguments: &[OsString],
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, ProcessError> {
+        if cancellation.is_cancelled() {
+            return Err(ProcessError::Cancelled);
+        }
         let mut child = Command::new(executable)
             .args(arguments)
             .stdin(Stdio::null())
@@ -84,7 +126,26 @@ impl ProcessRunner for CommandRunner {
         let stdout_reader = thread::spawn(move || read_bounded(stdout, MAX_STDOUT_BYTES));
         let stderr_reader = thread::spawn(move || read_bounded(stderr, MAX_STDERR_BYTES));
 
-        let status = child.wait().map_err(|_| ProcessError::Transport)?;
+        let status = loop {
+            if cancellation.is_cancelled() {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(ProcessError::Cancelled);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Err(ProcessError::Transport);
+                }
+            }
+        };
         let stdout = stdout_reader
             .join()
             .map_err(|_| ProcessError::Transport)?
@@ -131,6 +192,7 @@ pub enum FailureCategory {
     Transport,
     Command,
     Api,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +231,7 @@ impl fmt::Display for LoadFailure {
             FailureCategory::Transport => "GitHub CLI transport failed",
             FailureCategory::Command => "GitHub CLI request failed",
             FailureCategory::Api => "GitHub API request failed",
+            FailureCategory::Cancelled => "GitHub loading was cancelled",
         };
         let scope = match self.scope {
             FailureScope::Authentication => " while resolving the authenticated account".to_owned(),
@@ -284,6 +347,10 @@ pub enum LoadEvent {
         repository_index: usize,
         repository: LoadedRepository,
     },
+    RepositorySnapshot {
+        repository_index: usize,
+        repository: LoadedRepository,
+    },
     Failure(LoadFailure),
     Finished {
         status: LoadStatus,
@@ -312,20 +379,30 @@ impl<R: ProcessRunner> GitHubLoader<R> {
         selection: &DaySelection,
         mut emit: impl FnMut(LoadEvent),
     ) -> Result<LoadReport, LoadFailure> {
-        let mut progress = LoadProgress::default();
-        let user: ApiUser = match self.get_json("/user", &[], FailureScope::Authentication) {
-            Ok(user) => user,
-            Err(failure) => {
-                emit(LoadEvent::Failure(failure.clone()));
-                emit(LoadEvent::Finished {
-                    status: LoadStatus::Fatal,
-                    progress,
-                });
-                return Err(failure);
-            }
-        };
+        self.load_cancellable(selection, &CancellationToken::default(), &mut emit)
+    }
 
-        let repositories = match self.discover_repositories(&user.login, &mut emit) {
+    pub fn load_cancellable(
+        &self,
+        selection: &DaySelection,
+        cancellation: &CancellationToken,
+        mut emit: impl FnMut(LoadEvent),
+    ) -> Result<LoadReport, LoadFailure> {
+        let mut progress = LoadProgress::default();
+        let user: ApiUser =
+            match self.get_json("/user", &[], FailureScope::Authentication, cancellation) {
+                Ok(user) => user,
+                Err(failure) => {
+                    emit(LoadEvent::Failure(failure.clone()));
+                    emit(LoadEvent::Finished {
+                        status: LoadStatus::Fatal,
+                        progress,
+                    });
+                    return Err(failure);
+                }
+            };
+
+        let repositories = match self.discover_repositories(&user.login, cancellation, &mut emit) {
             Ok(repositories) => repositories,
             Err(failure) => {
                 emit(LoadEvent::Failure(failure.clone()));
@@ -348,28 +425,32 @@ impl<R: ProcessRunner> GitHubLoader<R> {
                 repository_index,
                 total: repositories.len(),
             });
-            let branches = match self.load_branches(repository, repository_index, &mut emit) {
-                Ok(branches) => branches,
-                Err(failure) => {
-                    emit(LoadEvent::Failure(failure.clone()));
-                    failures.push(failure);
-                    progress.repositories_processed += 1;
-                    let partial = LoadedRepository {
-                        repository: Repository {
-                            name: repository.full_name(),
-                            commits: Vec::new(),
-                        },
-                        branch_count: 0,
-                        coverage: RepositoryCoverage::BranchEnumerationFailed,
-                    };
-                    emit(LoadEvent::RepositoryLoaded {
-                        repository_index,
-                        repository: partial.clone(),
-                    });
-                    loaded.push(partial);
-                    continue;
-                }
-            };
+            let branches =
+                match self.load_branches(repository, repository_index, cancellation, &mut emit) {
+                    Ok(branches) => branches,
+                    Err(failure) => {
+                        if failure.category == FailureCategory::Cancelled {
+                            return Err(failure);
+                        }
+                        emit(LoadEvent::Failure(failure.clone()));
+                        failures.push(failure);
+                        progress.repositories_processed += 1;
+                        let partial = LoadedRepository {
+                            repository: Repository {
+                                name: repository.full_name(),
+                                commits: Vec::new(),
+                            },
+                            branch_count: 0,
+                            coverage: RepositoryCoverage::BranchEnumerationFailed,
+                        };
+                        emit(LoadEvent::RepositoryLoaded {
+                            repository_index,
+                            repository: partial.clone(),
+                        });
+                        loaded.push(partial);
+                        continue;
+                    }
+                };
 
             progress.branches_discovered += branches.len();
             let mut commits = BTreeMap::<String, Commit>::new();
@@ -387,6 +468,7 @@ impl<R: ProcessRunner> GitHubLoader<R> {
                     selection,
                     repository_index,
                     branch_index,
+                    cancellation,
                     &mut emit,
                 ) {
                     Ok(branch_commits) => {
@@ -395,12 +477,38 @@ impl<R: ProcessRunner> GitHubLoader<R> {
                         }
                     }
                     Err(failure) => {
+                        if failure.category == FailureCategory::Cancelled {
+                            return Err(failure);
+                        }
                         failed_branches += 1;
                         emit(LoadEvent::Failure(failure.clone()));
                         failures.push(failure);
                     }
                 }
                 progress.branches_processed += 1;
+
+                let mut snapshot_commits = commits.values().cloned().collect::<Vec<_>>();
+                snapshot_commits.sort_by(|left, right| {
+                    right
+                        .authored_at
+                        .cmp(&left.authored_at)
+                        .then_with(|| left.sha.cmp(&right.sha))
+                });
+                emit(LoadEvent::RepositorySnapshot {
+                    repository_index,
+                    repository: LoadedRepository {
+                        repository: Repository {
+                            name: repository.full_name(),
+                            commits: snapshot_commits,
+                        },
+                        branch_count: branches.len(),
+                        coverage: if failed_branches == 0 {
+                            RepositoryCoverage::Complete
+                        } else {
+                            RepositoryCoverage::BranchesIncomplete { failed_branches }
+                        },
+                    },
+                });
             }
 
             let mut commits = commits.into_values().collect::<Vec<_>>();
@@ -449,6 +557,7 @@ impl<R: ProcessRunner> GitHubLoader<R> {
     fn discover_repositories(
         &self,
         login: &str,
+        cancellation: &CancellationToken,
         emit: &mut impl FnMut(LoadEvent),
     ) -> Result<Vec<ApiRepository>, LoadFailure> {
         let mut page = 1;
@@ -463,6 +572,7 @@ impl<R: ProcessRunner> GitHubLoader<R> {
                     ("page", fields),
                 ],
                 FailureScope::Discovery,
+                cancellation,
             )?;
             let page_len = repositories.len();
             owned.extend(
@@ -487,6 +597,7 @@ impl<R: ProcessRunner> GitHubLoader<R> {
         &self,
         repository: &ApiRepository,
         repository_index: usize,
+        cancellation: &CancellationToken,
         emit: &mut impl FnMut(LoadEvent),
     ) -> Result<Vec<String>, LoadFailure> {
         let endpoint = format!(
@@ -504,6 +615,7 @@ impl<R: ProcessRunner> GitHubLoader<R> {
                     ("page", page_fields(page)),
                 ],
                 FailureScope::Repository { repository_index },
+                cancellation,
             )?;
             let page_len = values.len();
             branches.extend(values.into_iter().map(|branch| branch.name));
@@ -531,6 +643,7 @@ impl<R: ProcessRunner> GitHubLoader<R> {
         selection: &DaySelection,
         repository_index: usize,
         branch_index: usize,
+        cancellation: &CancellationToken,
         emit: &mut impl FnMut(LoadEvent),
     ) -> Result<Vec<Commit>, LoadFailure> {
         let endpoint = format!(
@@ -557,6 +670,7 @@ impl<R: ProcessRunner> GitHubLoader<R> {
                     repository_index,
                     branch_index,
                 },
+                cancellation,
             )?;
             let page_len = values.len();
             for value in values {
@@ -597,6 +711,7 @@ impl<R: ProcessRunner> GitHubLoader<R> {
         endpoint: &str,
         fields: &[(&str, String)],
         scope: FailureScope,
+        cancellation: &CancellationToken,
     ) -> Result<T, LoadFailure> {
         let mut arguments = vec![
             OsString::from("api"),
@@ -612,11 +727,12 @@ impl<R: ProcessRunner> GitHubLoader<R> {
 
         let output = self
             .runner
-            .run(&self.executable, &arguments)
+            .run_cancellable(&self.executable, &arguments, cancellation)
             .map_err(|error| LoadFailure {
                 category: match error {
                     ProcessError::NotFound => FailureCategory::MissingGh,
                     ProcessError::Transport => FailureCategory::Transport,
+                    ProcessError::Cancelled => FailureCategory::Cancelled,
                 },
                 scope,
                 http_status: None,
@@ -1366,6 +1482,13 @@ mod tests {
                 ..
             })
         ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LoadEvent::RepositorySnapshot {
+                repository_index: 1,
+                repository,
+            } if repository.repository.commits.iter().any(|commit| commit.sha == "kept")
+        )));
         for failure in &report.failures {
             let displayed = failure.to_string();
             assert!(!displayed.contains("secret"));
@@ -1544,6 +1667,55 @@ mod tests {
         runner.assert_finished();
     }
 
+    #[test]
+    fn cancellation_stops_and_reaps_an_active_process_promptly() {
+        use std::time::Instant;
+
+        let cancellation = CancellationToken::default();
+        let cancelling_thread = {
+            let cancellation = cancellation.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(30));
+                cancellation.cancel();
+            })
+        };
+        let started = Instant::now();
+        let result = CommandRunner.run_cancellable(
+            OsStr::new("sleep"),
+            &[OsString::from("10")],
+            &cancellation,
+        );
+        cancelling_thread.join().unwrap();
+
+        assert_eq!(result, Err(ProcessError::Cancelled));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancelled child should be killed and reaped promptly"
+        );
+    }
+
+    #[test]
+    fn pre_cancelled_load_does_not_invoke_the_process_runner() {
+        let runner = ScriptedRunner::new(Vec::new());
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let mut events = Vec::new();
+
+        let failure = GitHubLoader::new(&runner)
+            .load_cancellable(&selection(), &cancellation, |event| events.push(event))
+            .expect_err("cancelled load stops");
+
+        assert_eq!(failure.category, FailureCategory::Cancelled);
+        assert!(runner.calls().is_empty());
+        assert!(matches!(
+            events.last(),
+            Some(LoadEvent::Finished {
+                status: LoadStatus::Fatal,
+                ..
+            })
+        ));
+    }
+
     impl<T: ProcessRunner + ?Sized> ProcessRunner for &T {
         fn run(
             &self,
@@ -1551,6 +1723,15 @@ mod tests {
             arguments: &[OsString],
         ) -> Result<ProcessOutput, ProcessError> {
             (**self).run(executable, arguments)
+        }
+
+        fn run_cancellable(
+            &self,
+            executable: &OsStr,
+            arguments: &[OsString],
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessError> {
+            (**self).run_cancellable(executable, arguments, cancellation)
         }
     }
 }

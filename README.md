@@ -4,7 +4,7 @@ A keyboard-first terminal review inbox for commits across GitHub projects.
 
 See [PRODUCT.md](PRODUCT.md) for the accepted requirements and delivery order.
 
-## Current status: terminal foundation and GitHub loader
+## Current status: asynchronous daily GitHub inbox
 
 Implemented now:
 
@@ -42,12 +42,20 @@ Implemented now:
   and terminal complete/incomplete/fatal outcomes. Successful branchless and
   empty repositories remain distinct from inaccessible enumeration; safe
   repository- and branch-scoped failures preserve partial results.
+- Asynchronous live loading through a bounded event channel. Terminal input,
+  resize handling, search, help, redraws, and quitting remain responsive while
+  `gh` requests run. Repository snapshots and deduplicated commits become
+  navigable as they arrive, with selection preserved by repository identity and
+  full commit SHA when updates reorder data.
+- A live status view showing the selected ISO date and IANA timezone,
+  repository/branch/commit progress, bounded sanitized errors, and distinct
+  complete, empty-day, no-owned-repository, incomplete-coverage, authentication,
+  missing-`gh`, permission, and rate-limit outcomes.
+- Cancellation on quit. ReviewBox stops consuming updates, signals the loader,
+  and kills and reaps an active `gh` subprocess before terminal teardown.
 
 Planned for later delivery increments, and not implemented yet:
 
-- Asynchronous loader execution and live loading/progress rendering in the
-  terminal application. The loader boundary and progress events are implemented;
-  wiring them into the interactive loop is the next delivery stage.
 - Durable review state and reviewed/unreviewed filtering.
 - Real diffs loaded from GitHub repositories.
 - Drafting, editing, persistence, and publishing of comments.
@@ -70,10 +78,10 @@ cargo run -- --date 2026-09-12 --timezone Europe/Warsaw
 
 Both options are optional; `cargo run` uses today in the detected local IANA
 timezone. Argument validation and local-zone fallback happen before the terminal
-is changed. The GitHub loader is implemented and hermetically tested, but is not
-yet started by the terminal event loop, so the live panes remain empty until the
-next asynchronous-integration increment. The standalone loader invokes only
-read-only `gh api --method GET` requests.
+is changed. The live inbox starts immediately in the background. It requires the
+`gh` executable and an existing authenticated GitHub CLI session (normally set
+up with `gh auth login`). Every request is a read-only `gh api --method GET`
+request. Press `q` or `Ctrl-c` at any time to cancel loading and exit.
 
 The demo needs no GitHub authentication. It performs no network requests or
 network writes and does not persist runtime state. All repository names, commit
@@ -169,6 +177,12 @@ coverage incomplete. Discovery errors are fatal. Diagnostics contain only a
 category, numeric scope, and optional HTTP status—not response bodies, stderr,
 repository names, branches, SHAs, or subjects.
 
+The terminal displays at most three sanitized failure details and reports how
+many more were omitted. An incomplete result is never labeled complete or as a
+truly empty day. Live navigation intentionally stops at the commit pane in this
+increment; file and diff retrieval remain planned. `--demo` retains the complete
+fictional repository/commit/file/diff experience.
+
 Implementation assumptions were checked against the official GitHub
 documentation for the [authenticated user](https://docs.github.com/en/rest/users/users#get-the-authenticated-user),
 [authenticated-user repositories](https://docs.github.com/en/rest/repos/repos#list-repositories-for-the-authenticated-user),
@@ -180,11 +194,12 @@ plus the official [`gh api` manual](https://cli.github.com/manual/gh_api).
 
 ## Terminal restoration
 
-On a normal quit or a propagated application error, ReviewBox restores the
-cursor, leaves the alternate screen, and disables raw mode in reverse setup
-order. Setup tracks acquired resources so a recoverable partial setup failure
-also restores what was already changed. Process aborts, `SIGKILL`, power loss,
-and equivalent failures cannot be guaranteed to run cleanup.
+On a normal quit or a propagated application error, ReviewBox cancels active
+live loading, restores the cursor, leaves the alternate screen, and disables raw
+mode in reverse setup order. Setup tracks acquired resources so a recoverable
+partial setup failure also restores what was already changed. Process aborts,
+`SIGKILL`, power loss, and equivalent failures cannot be guaranteed to run
+cleanup.
 
 ## Development checks
 
