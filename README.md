@@ -7,12 +7,14 @@ See [PRODUCT.md](PRODUCT.md) for the accepted requirements and delivery order.
 
 ## Status
 
-The first terminal-foundation stage is implemented. `--demo` opens an offline,
-fictional repository/commit/file/diff pane shell, redraws after terminal resize,
-uses a compact fallback on small terminals, and restores terminal state on exit.
+The demo now provides populated repository, commit, file, and diff panes backed
+by deterministic fictional fixtures. Normal-mode navigation keeps parent and
+child selections coherent, clamps movement at every boundary, redraws after a
+terminal resize, and uses a compact fallback on small terminals. Terminal state
+is restored after normal exit and propagated application errors.
 
-Pane navigation, search, keyboard help, live GitHub access, review persistence,
-real diffs, and comments remain planned work.
+Search, keyboard help, live GitHub access, review persistence, real GitHub
+diffs, and comments remain planned work.
 
 ## Run the demo
 
@@ -23,15 +25,33 @@ cargo run -- --demo
 ```
 
 The demo performs no network requests, needs no credentials, and writes no
-runtime state. Press `q` (or `Ctrl-c`) to quit. `Escape` does not quit; it is
-reserved for returning or closing transient modes in later stages.
+runtime state.
+
+Implemented normal-mode bindings:
+
+- `h` / `l`: focus the previous / next meaningful pane.
+- `j` / `k`: move the selection in a list, or scroll the focused diff.
+- `gg` / `G`: move to the first / last position in the focused pane. A lone
+  `g` waits for one more `g`; any unrelated key safely cancels the prefix before
+  performing its own action.
+- `Ctrl-d` / `Ctrl-u`: move down / up by half of the focused pane's usable
+  height, with a minimum movement of one.
+- `Enter`: descend from repository to commit to file to diff when a child is
+  available.
+- `Escape`: return to the parent pane. At the repository pane it stays put and
+  never quits unexpectedly.
+- `q` / `Ctrl-c`: quit and restore the terminal.
+
+The status line shows normal mode, a pending `g`, the focused pane, and the most
+recent action. `/` search and `?` help are planned for the next stage.
 
 Development checks for this stage are:
 
 ```sh
 cargo fmt --check
 cargo build
-cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
 ```
 
 ## Goal
