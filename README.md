@@ -4,7 +4,7 @@ A keyboard-first terminal review inbox for commits across GitHub projects.
 
 See [PRODUCT.md](PRODUCT.md) for the accepted requirements and delivery order.
 
-## Current status: terminal foundation and inbox configuration
+## Current status: terminal foundation and GitHub loader
 
 Implemented now:
 
@@ -28,10 +28,26 @@ Implemented now:
 - A selected day is the half-open interval from local midnight through (but not
   including) the following local midnight. Both boundaries are converted to UTC
   independently, so daylight-saving days can be 23 or 25 hours.
+- A read-only, UI-independent GitHub loader that invokes `gh api` directly and
+  reuses the GitHub CLI's existing authentication without requesting, reading,
+  printing, or persisting a token.
+- Explicitly paginated owned-repository, branch, and per-branch commit loading
+  at 100 items per page. Dynamic repository path segments are percent-encoded,
+  query values remain separate process arguments, and every request explicitly
+  uses `GET`.
+- Defensive local author and half-open timestamp filtering, full-SHA
+  deduplication within each repository, and stable repository, branch, and
+  newest-first commit ordering.
+- Typed incremental progress, repository snapshots, sanitized scoped failures,
+  and terminal complete/incomplete/fatal outcomes. Successful branchless and
+  empty repositories remain distinct from inaccessible enumeration; safe
+  repository- and branch-scoped failures preserve partial results.
 
 Planned for later delivery increments, and not implemented yet:
 
-- GitHub authentication, repository/commit discovery, and asynchronous loading.
+- Asynchronous loader execution and live loading/progress rendering in the
+  terminal application. The loader boundary and progress events are implemented;
+  wiring them into the interactive loop is the next delivery stage.
 - Durable review state and reviewed/unreviewed filtering.
 - Real diffs loaded from GitHub repositories.
 - Drafting, editing, persistence, and publishing of comments.
@@ -46,7 +62,7 @@ Crossterm. Launch the interactive demo with:
 cargo run -- --demo
 ```
 
-The normal launch path is reserved for the live inbox configuration:
+The normal launch path currently configures the live inbox selection:
 
 ```sh
 cargo run -- --date 2026-09-12 --timezone Europe/Warsaw
@@ -54,10 +70,10 @@ cargo run -- --date 2026-09-12 --timezone Europe/Warsaw
 
 Both options are optional; `cargo run` uses today in the detected local IANA
 timezone. Argument validation and local-zone fallback happen before the terminal
-is changed. This increment deliberately does not invoke `gh`, make network
-requests, or load live commits yet; its live panes therefore contain no fixture
-files or diffs. The next loading increment will use the configured interval and
-the installed GitHub CLI authentication.
+is changed. The GitHub loader is implemented and hermetically tested, but is not
+yet started by the terminal event loop, so the live panes remain empty until the
+next asynchronous-integration increment. The standalone loader invokes only
+read-only `gh api --method GET` requests.
 
 The demo needs no GitHub authentication. It performs no network requests or
 network writes and does not persist runtime state. All repository names, commit
@@ -123,6 +139,44 @@ Help mode:
 The status line shows the active mode, a pending `g`, the focused pane, and the
 most recent action. Search and help remain usable after a resize and fall back
 to clipped, panic-free overlays in very small terminals.
+
+## GitHub loading behavior and limitations
+
+The loader first resolves the authenticated account with `GET /user`, then
+explicitly paginates `GET /user/repos` with `affiliation=owner` and defensively
+checks each returned owner login. For every stably sorted repository it paginates
+the branch list and requests commits once per distinct branch with the selected
+UTC `since`/`until` interval and authenticated `author` login. Results are checked
+again locally against the top-level GitHub `author.login` and
+`commit.author.date`; the end instant is always excluded even if the server
+returns its inclusive boundary. Shared commits reachable from several branches
+are retained once by full SHA.
+
+This is branch coverage, not a transactional snapshot. Commits reachable only
+from deleted or inaccessible refs cannot be found, and repositories or branches
+can change during traversal. Unlinked commits whose top-level GitHub author is
+null are excluded even when commit metadata names or email addresses resemble
+the user; ReviewBox does not guess identity from those fields. The filtered time
+is Git's documented author timestamp (`commit.author.date`), not committer time,
+push time, or the contribution-calendar date. Forks owned by another account are
+excluded by the owner-only inbox definition.
+
+GitHub can return permission/not-found, authentication, rate-limit, and other
+API failures. A 403 is considered rate-limited only when response headers report
+no remaining requests or a retry interval; otherwise it remains a permission
+failure. Repository- and branch-scoped errors keep already loaded data but mark
+coverage incomplete. Discovery errors are fatal. Diagnostics contain only a
+category, numeric scope, and optional HTTP status—not response bodies, stderr,
+repository names, branches, SHAs, or subjects.
+
+Implementation assumptions were checked against the official GitHub
+documentation for the [authenticated user](https://docs.github.com/en/rest/users/users#get-the-authenticated-user),
+[authenticated-user repositories](https://docs.github.com/en/rest/repos/repos#list-repositories-for-the-authenticated-user),
+[branches](https://docs.github.com/en/rest/branches/branches#list-branches),
+[commits](https://docs.github.com/en/rest/commits/commits#list-commits),
+[pagination](https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api),
+and [rate limits](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api),
+plus the official [`gh api` manual](https://cli.github.com/manual/gh_api).
 
 ## Terminal restoration
 

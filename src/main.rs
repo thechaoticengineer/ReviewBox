@@ -3,6 +3,7 @@ mod cli;
 mod day;
 mod event;
 mod fixture;
+pub mod github;
 mod inbox;
 mod render;
 mod smoke;
