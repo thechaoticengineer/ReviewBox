@@ -7,9 +7,32 @@ See [PRODUCT.md](PRODUCT.md) for the accepted requirements and delivery order.
 
 ## Status
 
-Project initialized. This repository currently contains the project brief and
-license; the application is not implemented yet. The accepted direction is a Rust
-terminal UI with modal keyboard navigation, diff review and comment drafts.
+The first terminal-foundation stage is implemented. `--demo` opens an offline,
+fictional repository/commit/file/diff pane shell, redraws after terminal resize,
+uses a compact fallback on small terminals, and restores terminal state on exit.
+
+Pane navigation, search, keyboard help, live GitHub access, review persistence,
+real diffs, and comments remain planned work.
+
+## Run the demo
+
+Install Rust 1.88 or newer, then run:
+
+```sh
+cargo run -- --demo
+```
+
+The demo performs no network requests, needs no credentials, and writes no
+runtime state. Press `q` (or `Ctrl-c`) to quit. `Escape` does not quit; it is
+reserved for returning or closing transient modes in later stages.
+
+Development checks for this stage are:
+
+```sh
+cargo fmt --check
+cargo build
+cargo test
+```
 
 ## Goal
 
