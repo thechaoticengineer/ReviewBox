@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,13 +11,16 @@ use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 
 use crate::app::{App, AttemptSource, Input, Mode, Pane};
+use crate::cli::{self, Command};
 use crate::comment_draft::{MemoryDraftStore, SubmissionAttempt};
-use crate::event::{CommentRequester, FakeComments};
+use crate::day::LocalTimezoneDetector;
+use crate::event::{self, AppEvent, CommentRequester, EventSource, FakeComments};
 use crate::external_editor::{
     EditorCommand, EditorError, EditorOutcome, EditorProcess, EditorTempFiles, edit_draft,
 };
 use crate::fixture::DemoFixture;
 use crate::github::{CommentFailure, CommentFailureKind, PublishOutcome, RESPONSE_TRUNCATED_LABEL};
+use crate::inbox::Inbox;
 use crate::render;
 use crate::render::NO_PATCH_LABEL;
 use crate::review_state::MemoryReviewStore;
@@ -52,6 +57,33 @@ struct RecordingTerminalOps(Arc<Mutex<Vec<&'static str>>>);
 impl RecordingTerminalOps {
     fn record(&self, operation: &'static str) {
         self.0.lock().expect("smoke terminal log").push(operation);
+    }
+}
+
+struct SmokeTimezoneDetector(Result<String, String>);
+
+impl LocalTimezoneDetector for SmokeTimezoneDetector {
+    fn detect(&self) -> Result<String, String> {
+        self.0.clone()
+    }
+}
+
+struct ScriptedEvents(VecDeque<AppEvent>);
+
+impl EventSource for ScriptedEvents {
+    fn poll(&mut self, _timeout: std::time::Duration) -> io::Result<Option<AppEvent>> {
+        self.0
+            .pop_front()
+            .map(Some)
+            .ok_or_else(|| io::Error::other("smoke event script exhausted"))
+    }
+}
+
+struct NeverEditor;
+
+impl EditorProcess for NeverEditor {
+    fn run(&mut self, _command: &EditorCommand, _path: &Path) -> Result<bool, EditorError> {
+        Err(EditorError::Launch)
     }
 }
 
@@ -136,6 +168,8 @@ pub struct SmokeReport {
 }
 
 pub fn run() -> io::Result<SmokeReport> {
+    let mut frames = exercise_selected_day_presentation()?;
+
     let fixture = DemoFixture::load();
     ensure(
         fixture.repositories.len() >= 2,
@@ -154,8 +188,6 @@ pub fn run() -> io::Result<SmokeReport> {
         app.fixture().repositories.len() >= 2,
         "application must retain the demo fixture",
     )?;
-    let mut frames = 0;
-
     let initial = render_frame(&mut terminal, &mut app, &mut frames)?;
     ensure_contains(&initial, "Repository", "initial repository pane")?;
     ensure_contains(&initial, "Commit", "initial commit pane")?;
@@ -220,12 +252,29 @@ pub fn run() -> io::Result<SmokeReport> {
         "◆",
         "commit draft marker frame",
     )?;
+    input(&mut app, 'j');
+    ensure(
+        app.selected(Pane::Commit) == 1,
+        "moving away must select a different commit before reopening its draft",
+    )?;
+    input(&mut app, 'k');
+    ensure(
+        app.selected(Pane::Commit) == 0,
+        "moving back must restore the original commit selection",
+    )?;
     input(&mut app, 'c');
     ensure_contains(
         &render_frame(&mut terminal, &mut app, &mut frames)?,
         "fictional hjklq",
         "reopened commit draft frame",
     )?;
+    resize(&mut terminal, 80, 24)?;
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "EDIT comment",
+        "resized commit editor frame",
+    )?;
+    resize(&mut terminal, FULL_WIDTH, FULL_HEIGHT)?;
     app.handle_input(Input::Cancel);
     ensure(
         app.mode() == Mode::Normal && app.draft_count() == 1,
@@ -244,6 +293,37 @@ pub fn run() -> io::Result<SmokeReport> {
         &render_frame(&mut terminal, &mut app, &mut frames)?,
         "Welcome aboard",
         "opened substantial diff frame",
+    )?;
+
+    app.handle_input(Input::Escape);
+    ensure(
+        app.focus() == Pane::File,
+        "Escape must return from diff to the file pane",
+    )?;
+    app.handle_input(Input::Escape);
+    ensure(
+        app.focus() == Pane::Commit,
+        "Escape must return from files to the commit pane",
+    )?;
+    app.handle_input(Input::Escape);
+    ensure(
+        app.focus() == Pane::Repository,
+        "Escape must return from commits to the repository pane",
+    )?;
+    app.handle_input(Input::Enter);
+    ensure(
+        app.focus() == Pane::Commit,
+        "Enter must return from repository to the commit pane",
+    )?;
+    app.handle_input(Input::Enter);
+    ensure(
+        app.focus() == Pane::File,
+        "Enter must return from commit to the file pane",
+    )?;
+    app.handle_input(Input::Enter);
+    ensure(
+        app.focus() == Pane::Diff,
+        "Enter must return from file to the diff pane",
     )?;
     input(&mut app, 'c');
     ensure(
@@ -452,11 +532,46 @@ pub fn run() -> io::Result<SmokeReport> {
         "wrapped backward search frame",
     )?;
 
+    let reviewed_repository = app
+        .current_repository()
+        .expect("fixture has the selected repository")
+        .identity
+        .id;
+    let reviewed_sha = app
+        .current_commit()
+        .expect("fixture has the selected commit")
+        .sha
+        .clone();
     input(&mut app, 'm');
     ensure_contains(
         &render_frame(&mut terminal, &mut app, &mut frames)?,
         "✓",
         "reviewed marker frame",
+    )?;
+    input(&mut app, 'f');
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "Showing remaining commits only",
+        "reviewed commit remaining-filter frame",
+    )?;
+    input(&mut app, 'f');
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "✓",
+        "reviewed marker must survive returning to all commits",
+    )?;
+    ensure(
+        app.is_reviewed(reviewed_repository, &reviewed_sha),
+        "the same commit must remain reviewed after filter round-trip",
+    )?;
+    input(&mut app, 'g');
+    input(&mut app, 'g');
+    ensure(
+        app.focus() == Pane::Commit
+            && app
+                .current_commit()
+                .is_some_and(|commit| commit.sha == reviewed_sha),
+        "returning to all commits must make the reviewed commit available to unmark",
     )?;
     input(&mut app, 'm');
     let unreviewed = render_frame(&mut terminal, &mut app, &mut frames)?;
@@ -465,6 +580,12 @@ pub fn run() -> io::Result<SmokeReport> {
         &unreviewed,
         "Marked commit unreviewed",
         "unreviewed status frame",
+    )?;
+    app.handle_input(Input::Enter);
+    app.handle_input(Input::Enter);
+    ensure(
+        app.focus() == Pane::Diff,
+        "unreviewed flow must return to the diff pane",
     )?;
 
     app.handle_input(Input::Escape);
@@ -571,10 +692,134 @@ pub fn run() -> io::Result<SmokeReport> {
         "compact resize frame",
     )?;
 
-    input(&mut app, 'q');
-    ensure(app.should_quit(), "q must request a clean normal-mode exit")?;
+    exercise_event_loop_exits()?;
 
     Ok(SmokeReport { frames })
+}
+
+fn exercise_selected_day_presentation() -> io::Result<usize> {
+    let now = Utc.with_ymd_and_hms(2024, 3, 10, 12, 0, 0).unwrap();
+    let explicit = cli::parse_with(
+        ["--date", "2024-03-10", "--timezone", "America/New_York"]
+            .into_iter()
+            .map(OsString::from),
+        &SmokeTimezoneDetector(Ok("Etc/UTC".to_owned())),
+        now,
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    let Command::Live(explicit) = explicit else {
+        return Err(io::Error::other(
+            "smoke expected an explicit live day selection",
+        ));
+    };
+    let fallback = cli::parse_with(
+        std::iter::empty::<OsString>(),
+        &SmokeTimezoneDetector(Err("fictional detector unavailable".to_owned())),
+        now,
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    let Command::Live(fallback) = fallback else {
+        return Err(io::Error::other(
+            "smoke expected a fallback live day selection",
+        ));
+    };
+
+    let mut terminal =
+        Terminal::new(TestBackend::new(FULL_WIDTH, FULL_HEIGHT)).map_err(io::Error::other)?;
+    let mut frames = 0;
+    let mut app = App::with_stores(
+        Inbox::live(explicit),
+        Box::new(MemoryReviewStore::default()),
+        Box::new(MemoryDraftStore::default()),
+    );
+    let explicit_frame = render_frame(&mut terminal, &mut app, &mut frames)?;
+    ensure_contains(
+        &explicit_frame,
+        "Selected day: 2024-03-10",
+        "explicit selected-day presentation",
+    )?;
+    ensure_contains(
+        &explicit_frame,
+        "Timezone: America/New_York",
+        "explicit timezone presentation",
+    )?;
+
+    let mut fallback_app = App::with_stores(
+        Inbox::live(fallback),
+        Box::new(MemoryReviewStore::default()),
+        Box::new(MemoryDraftStore::default()),
+    );
+    let fallback_frame = render_frame(&mut terminal, &mut fallback_app, &mut frames)?;
+    ensure_contains(
+        &fallback_frame,
+        "Selected day: 2024-03-10",
+        "fallback selected-day presentation",
+    )?;
+    ensure_contains(
+        &fallback_frame,
+        "Timezone: Etc/UTC (local detection failed; UTC fallback)",
+        "fallback timezone presentation",
+    )?;
+
+    Ok(frames)
+}
+
+fn exercise_event_loop_exits() -> io::Result<()> {
+    exercise_event_loop_exit(
+        "normal q exit",
+        VecDeque::from([AppEvent::Input(Input::Character('q'))]),
+    )?;
+    exercise_event_loop_exit(
+        "search Ctrl-c exit",
+        VecDeque::from([
+            AppEvent::Input(Input::Character('/')),
+            AppEvent::Input(Input::Quit),
+        ]),
+    )
+}
+
+fn exercise_event_loop_exit(label: &str, events: VecDeque<AppEvent>) -> io::Result<()> {
+    let operation_log = Arc::new(Mutex::new(Vec::new()));
+    let mut app = App::with_stores(
+        DemoFixture::load(),
+        Box::new(MemoryReviewStore::default()),
+        Box::new(MemoryDraftStore::default()),
+    );
+    let mut events = ScriptedEvents(events);
+    let editor_log = Arc::new(Mutex::new(Vec::new()));
+    let mut temp_files = MemoryEditorFiles {
+        body: Arc::new(Mutex::new(String::new())),
+        log: editor_log,
+    };
+    let mut process = NeverEditor;
+    let lookup = |_name: &str| None::<OsString>;
+
+    crate::terminal::with_terminal_session(
+        RecordingTerminalOps(Arc::clone(&operation_log)),
+        |guard| {
+            let mut terminal = Terminal::new(TestBackend::new(FULL_WIDTH, FULL_HEIGHT))
+                .map_err(io::Error::other)?;
+            let mut editor =
+                event::ExternalEditorSession::new(guard, &mut process, &mut temp_files, &lookup);
+            event::run_with_editor(&mut terminal, &mut app, &mut events, &mut editor)?;
+            ensure(
+                app.should_quit(),
+                &format!("{label} must quit through the event loop"),
+            )
+        },
+    )?;
+    ensure(
+        *operation_log.lock().expect("smoke operation log")
+            == [
+                "enable_raw_mode",
+                "enter_alternate_screen",
+                "hide_cursor",
+                "show_cursor",
+                "leave_alternate_screen",
+                "disable_raw_mode",
+            ],
+        &format!("{label} must restore the complete terminal sequence"),
+    )
 }
 
 fn search(app: &mut App, query: &str) -> io::Result<()> {
