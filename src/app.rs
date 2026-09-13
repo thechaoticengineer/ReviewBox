@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use crate::github::{
     LoadEvent, LoadFailure, LoadProgress, LoadStatus, LoadedRepository, RepositoryCoverage,
 };
-use crate::inbox::{Commit, FileChange, Inbox, InboxSource, Repository};
+use crate::inbox::{Commit, DiffLine, FileChange, Inbox, InboxSource, Repository};
 
 pub const MIN_FULL_WIDTH: u16 = 60;
 pub const MIN_FULL_HEIGHT: u16 = 16;
@@ -286,7 +286,7 @@ impl App {
             return;
         }
 
-        let selected_repository = self.current_repository().map(|value| value.name.clone());
+        let selected_repository = self.current_repository().map(|value| value.identity.id);
         let selected_commit = self.current_commit().map(|value| value.sha.clone());
 
         let live = self.live.as_mut().expect("checked above");
@@ -432,12 +432,12 @@ impl App {
             }
         }
 
-        if let Some(name) = selected_repository
+        if let Some(id) = selected_repository
             && let Some(index) = self
                 .inbox
                 .repositories
                 .iter()
-                .position(|repository| repository.name == name)
+                .position(|repository| repository.identity.id == id)
         {
             self.repositories.selected = index;
             if let Some(sha) = selected_commit
@@ -584,7 +584,7 @@ impl App {
                 self.repositories.selected,
                 |index| {
                     self.inbox.repositories[index]
-                        .name
+                        .display_name()
                         .to_lowercase()
                         .contains(&needle)
                 },
@@ -608,6 +608,7 @@ impl App {
             Pane::Diff => {
                 find_wrapped(self.current_diff_lines().len(), self.diff_scroll, |index| {
                     self.current_diff_lines()[index]
+                        .text
                         .to_lowercase()
                         .contains(&needle)
                 })
@@ -821,9 +822,8 @@ impl App {
         self.current_files().get(self.files.selected)
     }
 
-    pub fn current_diff_lines(&self) -> &[String] {
-        self.current_file()
-            .map_or(&[], |file| file.diff_lines.as_slice())
+    pub fn current_diff_lines(&self) -> &[DiffLine] {
+        self.current_file().map_or(&[], |file| file.patch.lines())
     }
 
     pub fn mode(&self) -> Mode {
@@ -957,7 +957,7 @@ fn pane_viewport_heights(width: u16, height: u16) -> [usize; 4] {
 mod tests {
     use super::*;
     use crate::fixture::DemoFixture;
-    use crate::inbox::{ChildPane, GitHubAuthor};
+    use crate::inbox::{ChildPane, FileStatus, GitHubAuthor, RepositoryIdentity};
     use chrono::{TimeZone, Utc};
 
     fn files() -> Vec<FileChange> {
@@ -965,12 +965,12 @@ mod tests {
             .into_iter()
             .map(|path| FileChange {
                 path: path.to_owned(),
-                diff_lines: ChildPane::Available(
-                    ["one", "two", "three", "four", "five", "six"]
-                        .into_iter()
-                        .map(str::to_owned)
-                        .collect(),
-                ),
+                previous_path: None,
+                status: FileStatus::Modified,
+                additions: 0,
+                deletions: 0,
+                changes: 0,
+                patch: crate::github::parse_patch_text("one\ntwo\nthree\nfour\nfive\nsix"),
             })
             .collect()
     }
@@ -998,11 +998,21 @@ mod tests {
     fn repositories() -> Vec<Repository> {
         ["fictional/one", "fictional/two", "fictional/three"]
             .into_iter()
-            .map(|name| Repository {
-                name: name.to_owned(),
+            .enumerate()
+            .map(|(index, name)| Repository {
+                identity: repository_identity(index as u64 + 1, name),
                 commits: commits(),
             })
             .collect()
+    }
+
+    fn repository_identity(id: u64, display_name: &str) -> RepositoryIdentity {
+        let (owner, name) = display_name.split_once('/').unwrap();
+        RepositoryIdentity {
+            id,
+            owner: owner.to_owned(),
+            name: name.to_owned(),
+        }
     }
 
     fn app() -> App {
@@ -1150,17 +1160,22 @@ mod tests {
     #[test]
     fn empty_and_singleton_collections_never_underflow() {
         let one_repository = Inbox::demo(vec![Repository {
-            name: "fictional/only".to_owned(),
+            identity: repository_identity(10, "fictional/only"),
             commits: Vec::new(),
         }]);
         let one_nested_repository = Inbox::demo(vec![Repository {
-            name: "fictional/only-nested".to_owned(),
+            identity: repository_identity(11, "fictional/only-nested"),
             commits: vec![commit(
                 "0000001000000000000000000000000000000000",
                 "only",
                 vec![FileChange {
                     path: "only.rs".to_owned(),
-                    diff_lines: ChildPane::Available(vec!["only line".to_owned()]),
+                    previous_path: None,
+                    status: FileStatus::Modified,
+                    additions: 0,
+                    deletions: 0,
+                    changes: 0,
+                    patch: crate::github::parse_patch_text("only line"),
                 }],
             )],
         }]);
@@ -1201,7 +1216,7 @@ mod tests {
         .unwrap();
         let mut inbox = Inbox::live(selection);
         inbox.repositories = vec![Repository {
-            name: "owned/repository".to_owned(),
+            identity: repository_identity(12, "owned/repository"),
             commits: commits(),
         }];
         let mut app = App::new(inbox);
@@ -1392,9 +1407,10 @@ mod tests {
     }
 
     fn loaded_repository(name: &str, commits: Vec<Commit>) -> LoadedRepository {
+        let id = name.bytes().map(u64::from).sum();
         LoadedRepository {
             repository: Repository {
-                name: name.to_owned(),
+                identity: repository_identity(id, name),
                 commits,
             },
             branch_count: 2,
@@ -1440,7 +1456,10 @@ mod tests {
             repository: updated_beta,
         });
 
-        assert_eq!(app.current_repository().unwrap().name, "fixture/beta");
+        assert_eq!(
+            app.current_repository().unwrap().display_name(),
+            "fixture/beta"
+        );
         assert_eq!(app.current_commit().unwrap().sha, selected_sha);
         assert_eq!(app.selected(Pane::Commit), 2);
     }

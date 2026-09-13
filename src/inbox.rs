@@ -37,8 +37,27 @@ pub enum InboxSource {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Repository {
-    pub name: String,
+    pub identity: RepositoryIdentity,
     pub commits: Vec<Commit>,
+}
+
+impl Repository {
+    pub fn display_name(&self) -> String {
+        self.identity.display_name()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RepositoryIdentity {
+    pub id: u64,
+    pub owner: String,
+    pub name: String,
+}
+
+impl RepositoryIdentity {
+    pub fn display_name(&self) -> String {
+        format!("{}/{}", self.owner, self.name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,7 +87,79 @@ pub struct GitHubAuthor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileChange {
     pub path: String,
-    pub diff_lines: ChildPane<String>,
+    pub previous_path: Option<String>,
+    pub status: FileStatus,
+    pub additions: u64,
+    pub deletions: u64,
+    pub changes: u64,
+    pub patch: PatchContent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileStatus {
+    Added,
+    Modified,
+    Removed,
+    Renamed,
+    Copied,
+    Changed,
+    Unchanged,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PatchContent {
+    Text {
+        lines: Vec<DiffLine>,
+    },
+    Capped {
+        lines: Vec<DiffLine>,
+        omitted_lines: usize,
+        omitted_bytes: usize,
+        reason: PatchCapReason,
+    },
+    Empty,
+    Unavailable,
+}
+
+impl PatchContent {
+    pub fn lines(&self) -> &[DiffLine] {
+        match self {
+            Self::Text { lines } | Self::Capped { lines, .. } => lines,
+            Self::Empty | Self::Unavailable => &[],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PatchCapReason {
+    FileLimit,
+    CommitBudget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffLine {
+    pub kind: DiffLineKind,
+    pub old_line: Option<u32>,
+    pub new_line: Option<u32>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiffLineKind {
+    Hunk,
+    Context,
+    Addition,
+    Deletion,
+    NoNewline,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitDetail {
+    pub files: Vec<FileChange>,
+    pub omitted_files: usize,
+    pub more_files_available: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

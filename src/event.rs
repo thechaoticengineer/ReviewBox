@@ -166,7 +166,7 @@ mod tests {
         FailureCategory, FailureScope, LoadFailure, LoadProgress, LoadStatus, LoadedRepository,
         RepositoryCoverage,
     };
-    use crate::inbox::{ChildPane, Commit, GitHubAuthor, Inbox, Repository};
+    use crate::inbox::{ChildPane, Commit, GitHubAuthor, Inbox, Repository, RepositoryIdentity};
     use chrono::{TimeZone, Utc};
     use ratatui::backend::TestBackend;
     use ratatui::{TerminalOptions, Viewport};
@@ -213,9 +213,14 @@ mod tests {
     }
 
     fn loaded(name: &str, sha: &str, subject: &str) -> LoadedRepository {
+        let (owner, repository_name) = name.split_once('/').unwrap();
         LoadedRepository {
             repository: Repository {
-                name: name.to_owned(),
+                identity: RepositoryIdentity {
+                    id: name.bytes().map(u64::from).sum(),
+                    owner: owner.to_owned(),
+                    name: repository_name.to_owned(),
+                },
                 commits: vec![Commit {
                     sha: sha.to_owned(),
                     subject: subject.to_owned(),

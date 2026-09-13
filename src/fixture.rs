@@ -1,6 +1,10 @@
 use chrono::{TimeZone, Utc};
 
-use crate::inbox::{ChildPane, Commit, FileChange, GitHubAuthor, Inbox, Repository};
+use crate::github::parse_patch_text;
+use crate::inbox::{
+    ChildPane, Commit, DiffLineKind, FileChange, FileStatus, GitHubAuthor, Inbox, PatchContent,
+    Repository, RepositoryIdentity,
+};
 
 /// Builds the fictional, fully populated inbox used by `--demo` and tests.
 /// The application-facing types are owned so live data can use the same panes.
@@ -9,19 +13,53 @@ pub struct DemoFixture;
 impl DemoFixture {
     pub fn load() -> Inbox {
         Inbox::demo(vec![
-            repository("fictional-labs/orbit-notes-demo", primary_commits()),
-            repository("fictional-studio/pixel-garden-demo", secondary_commits()),
-            repository("fictional-co/clockwork-api-demo", single_commit()),
-            repository("fictional-works/lantern-map-demo", secondary_commits()),
-            repository("fictional-lab/paper-comet-demo", single_commit()),
-            repository("fictional-foundry/quiet-signal-demo", primary_commits()),
+            repository(
+                9_000_001,
+                "fictional-labs",
+                "orbit-notes-demo",
+                primary_commits(),
+            ),
+            repository(
+                9_000_002,
+                "fictional-studio",
+                "pixel-garden-demo",
+                secondary_commits(),
+            ),
+            repository(
+                9_000_003,
+                "fictional-co",
+                "clockwork-api-demo",
+                single_commit(),
+            ),
+            repository(
+                9_000_004,
+                "fictional-works",
+                "lantern-map-demo",
+                secondary_commits(),
+            ),
+            repository(
+                9_000_005,
+                "fictional-lab",
+                "paper-comet-demo",
+                single_commit(),
+            ),
+            repository(
+                9_000_006,
+                "fictional-foundry",
+                "quiet-signal-demo",
+                primary_commits(),
+            ),
         ])
     }
 }
 
-fn repository(name: &str, commits: Vec<Commit>) -> Repository {
+fn repository(id: u64, owner: &str, name: &str, commits: Vec<Commit>) -> Repository {
     Repository {
-        name: name.to_owned(),
+        identity: RepositoryIdentity {
+            id,
+            owner: owner.to_owned(),
+            name: name.to_owned(),
+        },
         commits,
     }
 }
@@ -115,9 +153,29 @@ fn small_files() -> Vec<FileChange> {
 }
 
 fn file(path: &str, lines: &[&str]) -> FileChange {
+    let patch = if lines.is_empty() {
+        PatchContent::Empty
+    } else {
+        parse_patch_text(&lines.join("\n"))
+    };
+    let additions = patch
+        .lines()
+        .iter()
+        .filter(|line| line.kind == DiffLineKind::Addition)
+        .count() as u64;
+    let deletions = patch
+        .lines()
+        .iter()
+        .filter(|line| line.kind == DiffLineKind::Deletion)
+        .count() as u64;
     FileChange {
         path: path.to_owned(),
-        diff_lines: ChildPane::Available(lines.iter().map(|line| (*line).to_owned()).collect()),
+        previous_path: None,
+        status: FileStatus::Modified,
+        additions,
+        deletions,
+        changes: additions + deletions,
+        patch,
     }
 }
 

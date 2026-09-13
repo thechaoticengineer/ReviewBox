@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use crate::app::{App, HELP_BINDINGS, LivePhase, MIN_FULL_HEIGHT, MIN_FULL_WIDTH, Mode, Pane};
 use crate::day::TimezoneSource;
 use crate::github::FailureCategory;
-use crate::inbox::InboxSource;
+use crate::inbox::{DiffLineKind, InboxSource};
 
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
@@ -53,7 +53,7 @@ fn draw_demo_panes(frame: &mut Frame<'_>, area: Rect, app: &App) {
         app.inbox()
             .repositories
             .iter()
-            .map(|repository| repository.name.to_owned())
+            .map(|repository| repository.display_name())
             .collect(),
         "repositories",
     );
@@ -100,7 +100,7 @@ fn draw_live_panes(frame: &mut Frame<'_>, area: Rect, app: &App) {
         app.inbox()
             .repositories
             .iter()
-            .map(|repository| repository.name.to_owned())
+            .map(|repository| repository.display_name())
             .collect(),
         "repositories yet",
     );
@@ -265,6 +265,7 @@ fn failure_category_label(category: FailureCategory) -> &'static str {
         FailureCategory::RateLimit => "GitHub API rate limit reached",
         FailureCategory::MalformedResponse => "unreadable GitHub response",
         FailureCategory::MalformedJson => "malformed GitHub JSON",
+        FailureCategory::Offline => "offline",
         FailureCategory::Transport => "GitHub transport failure",
         FailureCategory::Command => "GitHub CLI request failure",
         FailureCategory::Api => "GitHub API failure",
@@ -331,21 +332,18 @@ fn draw_diff_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .enumerate()
             .skip(app.scroll(Pane::Diff))
             .map(|(index, content)| {
-                let color = if content.starts_with("@@") {
-                    Color::Cyan
-                } else if content.starts_with('+') {
-                    Color::Green
-                } else if content.starts_with('-') {
-                    Color::Red
-                } else {
-                    Color::Reset
+                let color = match content.kind {
+                    DiffLineKind::Hunk => Color::Cyan,
+                    DiffLineKind::Addition => Color::Green,
+                    DiffLineKind::Deletion => Color::Red,
+                    _ => Color::Reset,
                 };
                 Line::from(vec![
                     Span::styled(
                         format!("{:>4} ", index + 1),
                         Style::default().fg(Color::DarkGray),
                     ),
-                    Span::styled((*content).to_owned(), Style::default().fg(color)),
+                    Span::styled(content.text.clone(), Style::default().fg(color)),
                 ])
             })
             .collect()
@@ -494,7 +492,7 @@ mod tests {
         FailureScope, LoadEvent, LoadFailure, LoadProgress, LoadStatus, LoadedRepository,
         RepositoryCoverage,
     };
-    use crate::inbox::{Inbox, Repository};
+    use crate::inbox::{Inbox, Repository, RepositoryIdentity};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -665,7 +663,11 @@ mod tests {
             repository_index: 0,
             repository: LoadedRepository {
                 repository: Repository {
-                    name: "fixture/empty".to_owned(),
+                    identity: RepositoryIdentity {
+                        id: 1,
+                        owner: "fixture".to_owned(),
+                        name: "empty".to_owned(),
+                    },
                     commits: Vec::new(),
                 },
                 branch_count: 1,
@@ -694,7 +696,11 @@ mod tests {
             repository_index: 0,
             repository: LoadedRepository {
                 repository: Repository {
-                    name: "fixture/partial".to_owned(),
+                    identity: RepositoryIdentity {
+                        id: 2,
+                        owner: "fixture".to_owned(),
+                        name: "partial".to_owned(),
+                    },
                     commits: Vec::new(),
                 },
                 branch_count: 2,

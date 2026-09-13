@@ -18,11 +18,19 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::day::DaySelection;
-use crate::inbox::{ChildPane, Commit, GitHubAuthor, Repository};
+use crate::inbox::{
+    ChildPane, Commit, CommitDetail, DiffLine, DiffLineKind, FileChange, FileStatus, GitHubAuthor,
+    PatchCapReason, PatchContent, Repository, RepositoryIdentity,
+};
 
 const PAGE_SIZE: usize = 100;
 const MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 8 * 1024;
+pub const MAX_DETAIL_FILES: usize = 300;
+pub const MAX_FILE_PATCH_BYTES: usize = 256 * 1024;
+pub const MAX_FILE_PATCH_LINES: usize = 5_000;
+pub const MAX_DIFF_LINE_CHARS: usize = 2_000;
+pub const MAX_COMMIT_PATCH_BYTES: usize = 2 * 1024 * 1024;
 
 /// A bounded byte buffer returned by a process runner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +197,7 @@ pub enum FailureCategory {
     RateLimit,
     MalformedResponse,
     MalformedJson,
+    Offline,
     Transport,
     Command,
     Api,
@@ -206,6 +215,7 @@ pub enum FailureScope {
         repository_index: usize,
         branch_index: usize,
     },
+    CommitDetail,
 }
 
 /// Sanitized error information. It never retains response bodies, stderr,
@@ -228,6 +238,7 @@ impl fmt::Display for LoadFailure {
             FailureCategory::RateLimit => "GitHub API rate limit was reached",
             FailureCategory::MalformedResponse => "GitHub returned an unreadable response",
             FailureCategory::MalformedJson => "GitHub returned malformed JSON",
+            FailureCategory::Offline => "GitHub appears to be offline",
             FailureCategory::Transport => "GitHub CLI transport failed",
             FailureCategory::Command => "GitHub CLI request failed",
             FailureCategory::Api => "GitHub API request failed",
@@ -250,6 +261,7 @@ impl fmt::Display for LoadFailure {
                 branch_index + 1,
                 repository_index + 1
             ),
+            FailureScope::CommitDetail => " while loading commit details".to_owned(),
         };
         write!(formatter, "{category}{scope}")?;
         if let Some(status) = self.http_status {
@@ -260,6 +272,33 @@ impl fmt::Display for LoadFailure {
 }
 
 impl std::error::Error for LoadFailure {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetailFailure {
+    ResponseTruncated,
+    Load(LoadFailure),
+}
+
+impl fmt::Display for DetailFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResponseTruncated => {
+                formatter.write_str("GitHub commit response exceeded the local size limit")
+            }
+            Self::Load(failure) => failure.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for DetailFailure {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetailState {
+    NotRequested,
+    Loading,
+    Ready(Arc<CommitDetail>),
+    Failed(DetailFailure),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepositoryCoverage {
@@ -437,7 +476,7 @@ impl<R: ProcessRunner> GitHubLoader<R> {
                         progress.repositories_processed += 1;
                         let partial = LoadedRepository {
                             repository: Repository {
-                                name: repository.full_name(),
+                                identity: repository.identity(),
                                 commits: Vec::new(),
                             },
                             branch_count: 0,
@@ -498,7 +537,7 @@ impl<R: ProcessRunner> GitHubLoader<R> {
                     repository_index,
                     repository: LoadedRepository {
                         repository: Repository {
-                            name: repository.full_name(),
+                            identity: repository.identity(),
                             commits: snapshot_commits,
                         },
                         branch_count: branches.len(),
@@ -527,7 +566,7 @@ impl<R: ProcessRunner> GitHubLoader<R> {
             };
             let partial = LoadedRepository {
                 repository: Repository {
-                    name: repository.full_name(),
+                    identity: repository.identity(),
                     commits,
                 },
                 branch_count: branches.len(),
@@ -706,6 +745,41 @@ impl<R: ProcessRunner> GitHubLoader<R> {
         Ok(accepted)
     }
 
+    /// Load one commit's changed files on demand. The SHA must be a complete
+    /// lowercase hexadecimal Git object id, so invalid identities never reach
+    /// the process boundary.
+    pub fn load_commit_detail(
+        &self,
+        repository: &RepositoryIdentity,
+        sha: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<CommitDetail, DetailFailure> {
+        if !valid_full_sha(sha) {
+            return Err(DetailFailure::Load(LoadFailure {
+                category: FailureCategory::MalformedResponse,
+                scope: FailureScope::CommitDetail,
+                http_status: None,
+            }));
+        }
+
+        let endpoint = format!(
+            "/repos/{}/{}/commits/{}",
+            encode_path_segment(&repository.owner),
+            encode_path_segment(&repository.name),
+            encode_path_segment(sha)
+        );
+        let output = self
+            .run_get(&endpoint, &[], FailureScope::CommitDetail, cancellation)
+            .map_err(DetailFailure::Load)?;
+        if output.stdout.truncated {
+            return Err(DetailFailure::ResponseTruncated);
+        }
+        let response: JsonResponse<ApiCommitDetail> = self
+            .decode_json_output(output, FailureScope::CommitDetail)
+            .map_err(DetailFailure::Load)?;
+        Ok(commit_detail_from_api(response.value, &response.headers))
+    }
+
     fn get_json<T: DeserializeOwned>(
         &self,
         endpoint: &str,
@@ -713,6 +787,25 @@ impl<R: ProcessRunner> GitHubLoader<R> {
         scope: FailureScope,
         cancellation: &CancellationToken,
     ) -> Result<T, LoadFailure> {
+        let output = self.run_get(endpoint, fields, scope, cancellation)?;
+        if output.stdout.truncated {
+            return Err(LoadFailure {
+                category: FailureCategory::MalformedResponse,
+                scope,
+                http_status: None,
+            });
+        }
+        self.decode_json_output(output, scope)
+            .map(|response| response.value)
+    }
+
+    fn run_get(
+        &self,
+        endpoint: &str,
+        fields: &[(&str, String)],
+        scope: FailureScope,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, LoadFailure> {
         let mut arguments = vec![
             OsString::from("api"),
             OsString::from("--method"),
@@ -725,8 +818,7 @@ impl<R: ProcessRunner> GitHubLoader<R> {
             arguments.push(OsString::from(format!("{name}={value}")));
         }
 
-        let output = self
-            .runner
+        self.runner
             .run_cancellable(&self.executable, &arguments, cancellation)
             .map_err(|error| LoadFailure {
                 category: match error {
@@ -736,15 +828,14 @@ impl<R: ProcessRunner> GitHubLoader<R> {
                 },
                 scope,
                 http_status: None,
-            })?;
-        if output.stdout.truncated {
-            return Err(LoadFailure {
-                category: FailureCategory::MalformedResponse,
-                scope,
-                http_status: None,
-            });
-        }
+            })
+    }
 
+    fn decode_json_output<T: DeserializeOwned>(
+        &self,
+        output: ProcessOutput,
+        scope: FailureScope,
+    ) -> Result<JsonResponse<T>, LoadFailure> {
         let envelope = parse_http_envelope(&output.stdout.bytes);
         if !output.success {
             let status = envelope
@@ -758,6 +849,11 @@ impl<R: ProcessRunner> GitHubLoader<R> {
                 && stderr_indicates_missing_authentication(&output.stderr.bytes)
             {
                 FailureCategory::Authentication
+            } else if status.is_none()
+                && scope == FailureScope::CommitDetail
+                && stderr_indicates_offline(&output.stderr.bytes)
+            {
+                FailureCategory::Offline
             } else {
                 classify_failure(status, headers)
             };
@@ -780,12 +876,252 @@ impl<R: ProcessRunner> GitHubLoader<R> {
                 http_status: Some(envelope.status),
             });
         }
-        serde_json::from_slice(envelope.body).map_err(|_| LoadFailure {
+        let value = serde_json::from_slice(envelope.body).map_err(|_| LoadFailure {
             category: FailureCategory::MalformedJson,
             scope,
             http_status: Some(envelope.status),
+        })?;
+        Ok(JsonResponse {
+            value,
+            headers: envelope.headers,
         })
     }
+}
+
+struct JsonResponse<T> {
+    value: T,
+    headers: HashMap<String, String>,
+}
+
+fn valid_full_sha(sha: &str) -> bool {
+    matches!(sha.len(), 40 | 64)
+        && sha
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn commit_detail_from_api(
+    detail: ApiCommitDetail,
+    headers: &HashMap<String, String>,
+) -> CommitDetail {
+    let total_files = detail.files.len();
+    let omitted_files = total_files.saturating_sub(MAX_DETAIL_FILES);
+    let mut retained_bytes = 0_usize;
+    let mut commit_budget_exhausted = false;
+    let files = detail
+        .files
+        .into_iter()
+        .take(MAX_DETAIL_FILES)
+        .map(|file| {
+            let patch = match file.patch {
+                Some(patch) if patch.is_empty() => PatchContent::Empty,
+                Some(patch) if commit_budget_exhausted => commit_budget_cap(&patch),
+                Some(patch) => {
+                    let parsed = parse_patch_text(&patch);
+                    let patch_bytes = retained_patch_bytes(&parsed);
+                    if retained_bytes.saturating_add(patch_bytes) > MAX_COMMIT_PATCH_BYTES {
+                        commit_budget_exhausted = true;
+                        commit_budget_cap(&patch)
+                    } else {
+                        retained_bytes += patch_bytes;
+                        parsed
+                    }
+                }
+                None if file.changes == 0 => PatchContent::Empty,
+                None => PatchContent::Unavailable,
+            };
+            FileChange {
+                path: sanitize_api_text(&file.filename),
+                previous_path: file.previous_filename.as_deref().map(sanitize_api_text),
+                status: FileStatus::from_api(&file.status),
+                additions: file.additions,
+                deletions: file.deletions,
+                changes: file.changes,
+                patch,
+            }
+        })
+        .collect();
+    CommitDetail {
+        files,
+        omitted_files,
+        more_files_available: omitted_files > 0
+            || headers
+                .get("link")
+                .is_some_and(|value| link_has_next(value)),
+    }
+}
+
+fn commit_budget_cap(patch: &str) -> PatchContent {
+    PatchContent::Capped {
+        lines: Vec::new(),
+        omitted_lines: patch_line_count(patch),
+        omitted_bytes: patch.len(),
+        reason: PatchCapReason::CommitBudget,
+    }
+}
+
+fn retained_patch_bytes(patch: &PatchContent) -> usize {
+    patch.lines().iter().map(|line| line.text.len()).sum()
+}
+
+fn patch_line_count(patch: &str) -> usize {
+    if patch.is_empty() {
+        0
+    } else {
+        patch.split_terminator('\n').count()
+    }
+}
+
+fn link_has_next(value: &str) -> bool {
+    value
+        .split(',')
+        .any(|link| link.split(';').any(|part| part.trim() == "rel=\"next\""))
+}
+
+impl FileStatus {
+    fn from_api(status: &str) -> Self {
+        match status {
+            "added" => Self::Added,
+            "modified" => Self::Modified,
+            "removed" => Self::Removed,
+            "renamed" => Self::Renamed,
+            "copied" => Self::Copied,
+            "changed" => Self::Changed,
+            "unchanged" => Self::Unchanged,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Convert a GitHub patch into bounded, numbered, terminal-safe logical lines.
+/// The demo fixture uses this same parser as live commit details.
+pub(crate) fn parse_patch_text(patch: &str) -> PatchContent {
+    if patch.is_empty() {
+        return PatchContent::Empty;
+    }
+
+    let raw_lines = patch.split_terminator('\n').collect::<Vec<_>>();
+    let mut lines = Vec::with_capacity(raw_lines.len().min(MAX_FILE_PATCH_LINES));
+    let mut retained_bytes = 0_usize;
+    let mut omitted_lines = 0_usize;
+    let mut omitted_bytes = 0_usize;
+    let mut capped = false;
+    let mut old_line = None;
+    let mut new_line = None;
+
+    for (index, raw_line) in raw_lines.iter().enumerate() {
+        if lines.len() >= MAX_FILE_PATCH_LINES {
+            capped = true;
+            omitted_lines += raw_lines.len() - index;
+            omitted_bytes += raw_lines[index..]
+                .iter()
+                .map(|line| line.len())
+                .sum::<usize>();
+            break;
+        }
+
+        let sanitized = sanitize_api_text(raw_line);
+        let (text, line_omitted_bytes) = cap_line_text(&sanitized);
+        if retained_bytes.saturating_add(text.len()) > MAX_FILE_PATCH_BYTES {
+            capped = true;
+            omitted_lines += raw_lines.len() - index;
+            omitted_bytes += raw_lines[index..]
+                .iter()
+                .map(|line| line.len())
+                .sum::<usize>();
+            break;
+        }
+        capped |= line_omitted_bytes > 0;
+        omitted_bytes += line_omitted_bytes;
+        retained_bytes += text.len();
+
+        let (kind, numbered_old, numbered_new) = if let Some((old, new)) = parse_hunk_header(&text)
+        {
+            old_line = Some(old);
+            new_line = Some(new);
+            (DiffLineKind::Hunk, None, None)
+        } else if text.starts_with("@@") {
+            old_line = None;
+            new_line = None;
+            (DiffLineKind::Other, None, None)
+        } else if text.starts_with("\\ No newline") {
+            (DiffLineKind::NoNewline, None, None)
+        } else if text.starts_with(' ') {
+            let values = (old_line, new_line);
+            old_line = old_line.and_then(|line| line.checked_add(1));
+            new_line = new_line.and_then(|line| line.checked_add(1));
+            (DiffLineKind::Context, values.0, values.1)
+        } else if text.starts_with('+') {
+            let value = new_line;
+            new_line = new_line.and_then(|line| line.checked_add(1));
+            (DiffLineKind::Addition, None, value)
+        } else if text.starts_with('-') {
+            let value = old_line;
+            old_line = old_line.and_then(|line| line.checked_add(1));
+            (DiffLineKind::Deletion, value, None)
+        } else {
+            (DiffLineKind::Other, None, None)
+        };
+        lines.push(DiffLine {
+            kind,
+            old_line: numbered_old,
+            new_line: numbered_new,
+            text,
+        });
+    }
+
+    if capped {
+        PatchContent::Capped {
+            lines,
+            omitted_lines,
+            omitted_bytes,
+            reason: PatchCapReason::FileLimit,
+        }
+    } else {
+        PatchContent::Text { lines }
+    }
+}
+
+fn cap_line_text(value: &str) -> (String, usize) {
+    if value.chars().count() <= MAX_DIFF_LINE_CHARS {
+        return (value.to_owned(), 0);
+    }
+    let prefix = value
+        .chars()
+        .take(MAX_DIFF_LINE_CHARS.saturating_sub(1))
+        .collect::<String>();
+    let omitted_bytes = value.len().saturating_sub(prefix.len());
+    (format!("{prefix}…"), omitted_bytes)
+}
+
+fn sanitize_api_text(value: &str) -> String {
+    let value = value.strip_suffix('\r').unwrap_or(value);
+    let mut sanitized = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character == '\t' {
+            sanitized.push_str("    ");
+        } else if character.is_control() {
+            sanitized.push('\u{fffd}');
+        } else {
+            sanitized.push(character);
+        }
+    }
+    sanitized
+}
+
+fn parse_hunk_header(line: &str) -> Option<(u32, u32)> {
+    let remainder = line.strip_prefix("@@ -")?;
+    let (old, remainder) = remainder.split_once(' ')?;
+    let remainder = remainder.strip_prefix('+')?;
+    let (new, suffix) = remainder.split_once(' ')?;
+    if !suffix.starts_with("@@") {
+        return None;
+    }
+    Some((parse_range_start(old)?, parse_range_start(new)?))
+}
+
+fn parse_range_start(value: &str) -> Option<u32> {
+    value.split(',').next()?.parse().ok()
 }
 
 fn page_fields(page: usize) -> String {
@@ -899,6 +1235,19 @@ fn stderr_indicates_missing_authentication(stderr: &[u8]) -> bool {
     .any(|marker| stderr.contains(marker))
 }
 
+fn stderr_indicates_offline(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    [
+        "error connecting to",
+        "dial tcp",
+        "no such host",
+        "could not resolve",
+        "network is unreachable",
+    ]
+    .iter()
+    .any(|marker| stderr.contains(marker))
+}
+
 fn classify_failure(
     status: Option<u16>,
     headers: Option<&HashMap<String, String>>,
@@ -926,6 +1275,7 @@ struct ApiUser {
 
 #[derive(Debug, Deserialize)]
 struct ApiRepository {
+    id: u64,
     name: String,
     owner: ApiUser,
 }
@@ -933,6 +1283,14 @@ struct ApiRepository {
 impl ApiRepository {
     fn full_name(&self) -> String {
         format!("{}/{}", self.owner.login, self.name)
+    }
+
+    fn identity(&self) -> RepositoryIdentity {
+        RepositoryIdentity {
+            id: self.id,
+            owner: self.owner.login.clone(),
+            name: self.name.clone(),
+        }
     }
 }
 
@@ -957,6 +1315,22 @@ struct ApiCommitData {
 #[derive(Debug, Deserialize)]
 struct ApiCommitAuthor {
     date: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiCommitDetail {
+    files: Vec<ApiFileChange>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiFileChange {
+    filename: String,
+    previous_filename: Option<String>,
+    status: String,
+    additions: u64,
+    deletions: u64,
+    changes: u64,
+    patch: Option<String>,
 }
 
 #[cfg(test)]
@@ -1160,7 +1534,7 @@ mod tests {
     #[test]
     fn paginates_discovery_filters_ownership_and_encodes_unusual_repository_names() {
         let mut first_page = (0..PAGE_SIZE)
-            .map(|index| json!({"name": format!("foreign-{index:03}"), "owner": {"login": "Else"}}))
+            .map(|index| json!({"id": index, "name": format!("foreign-{index:03}"), "owner": {"login": "Else"}}))
             .collect::<Vec<_>>();
         first_page.reverse();
         let steps = vec![
@@ -1174,8 +1548,8 @@ mod tests {
                 "/user/repos",
                 fields(&[("affiliation", "owner"), ("per_page", "100"), ("page", "2")]),
                 json!([
-                    {"name": "z-last", "owner": {"login": "octo"}},
-                    {"name": "odd repo?#%", "owner": {"login": "OCTO"}}
+                    {"id": 202, "name": "z-last", "owner": {"login": "octo"}},
+                    {"id": 101, "name": "odd repo?#%", "owner": {"login": "OCTO"}}
                 ]),
             ),
             json_step(
@@ -1196,9 +1570,15 @@ mod tests {
             report
                 .repositories
                 .iter()
-                .map(|value| value.repository.name.as_str())
+                .map(|value| value.repository.display_name())
                 .collect::<Vec<_>>(),
-            ["OCTO/odd repo?#%", "octo/z-last"]
+            ["OCTO/odd repo?#%".to_owned(), "octo/z-last".to_owned()]
+        );
+        assert_eq!(report.repositories[0].repository.identity.id, 101);
+        assert_eq!(report.repositories[0].repository.identity.owner, "OCTO");
+        assert_eq!(
+            report.repositories[0].repository.identity.name,
+            "odd repo?#%"
         );
         assert!(report.repositories.iter().all(|value| {
             value.branch_count == 0 && value.coverage == RepositoryCoverage::Complete
@@ -1213,7 +1593,7 @@ mod tests {
 
     #[test]
     fn paginates_branches_and_commits_with_safe_fields_and_deterministic_results() {
-        let repository = json!([{"name": "daily", "owner": {"login": "Octo"}}]);
+        let repository = json!([{"id": 301, "name": "daily", "owner": {"login": "Octo"}}]);
         let mut first_branch_page = (0..PAGE_SIZE)
             .rev()
             .map(|index| json!({"name": format!("branch-{index:03}")}))
@@ -1347,7 +1727,7 @@ mod tests {
     fn applies_exact_half_open_boundary_and_authenticated_author_checks() {
         let steps = vec![
             user_step(),
-            repos_step(json!([{"name": "boundaries", "owner": {"login": "Octo"}}])),
+            repos_step(json!([{"id": 401, "name": "boundaries", "owner": {"login": "Octo"}}])),
             json_step(
                 "/repos/Octo/boundaries/branches",
                 branch_fields(1),
@@ -1387,8 +1767,8 @@ mod tests {
         let steps = vec![
             user_step(),
             repos_step(json!([
-                {"name": "branchless", "owner": {"login": "Octo"}},
-                {"name": "empty-day", "owner": {"login": "Octo"}}
+                {"id": 501, "name": "branchless", "owner": {"login": "Octo"}},
+                {"id": 502, "name": "empty-day", "owner": {"login": "Octo"}}
             ])),
             json_step(
                 "/repos/Octo/branchless/branches",
@@ -1437,8 +1817,8 @@ mod tests {
         let steps = vec![
             user_step(),
             repos_step(json!([
-                {"name": "alpha-private", "owner": {"login": "Octo"}},
-                {"name": "beta-private", "owner": {"login": "Octo"}}
+                {"id": 601, "name": "alpha-private", "owner": {"login": "Octo"}},
+                {"id": 602, "name": "beta-private", "owner": {"login": "Octo"}}
             ])),
             failure_step(
                 "/repos/Octo/alpha-private/branches",
@@ -1702,6 +2082,463 @@ mod tests {
             }));
         }
         runner.assert_finished();
+    }
+
+    fn detail_identity() -> RepositoryIdentity {
+        RepositoryIdentity {
+            id: 7_654_321,
+            owner: "Ow ner".to_owned(),
+            name: "repo#one".to_owned(),
+        }
+    }
+
+    fn detail_sha() -> &'static str {
+        "abcdef0123456789abcdef0123456789abcdef01"
+    }
+
+    fn detail_endpoint() -> String {
+        format!("/repos/Ow%20ner/repo%23one/commits/{}", detail_sha())
+    }
+
+    fn api_file(filename: &str, changes: u64, patch: Option<&str>) -> Value {
+        json!({
+            "filename": filename,
+            "previous_filename": null,
+            "status": "modified",
+            "additions": changes,
+            "deletions": 0,
+            "changes": changes,
+            "patch": patch,
+        })
+    }
+
+    #[test]
+    fn commit_detail_uses_encoded_get_and_preserves_order_metadata_and_numbered_lines() {
+        let patch = "@@ -10,2 +20,3 @@ heading\n-old\n+new\tvalue\u{1b}\n context\n\\ No newline at end of file";
+        let runner = ScriptedRunner::new(vec![json_step(
+            detail_endpoint(),
+            vec![],
+            json!({
+                "files": [
+                    {
+                        "filename": "src/\u{1b}first\t.rs\r",
+                        "previous_filename": "src/old\t.rs\r",
+                        "status": "renamed",
+                        "additions": 2,
+                        "deletions": 1,
+                        "changes": 3,
+                        "patch": patch
+                    },
+                    {
+                        "filename": "second.bin",
+                        "previous_filename": null,
+                        "status": "modified",
+                        "additions": 0,
+                        "deletions": 0,
+                        "changes": 0
+                    },
+                    {
+                        "filename": "third.bin",
+                        "previous_filename": null,
+                        "status": "removed",
+                        "additions": 0,
+                        "deletions": 4,
+                        "changes": 4
+                    }
+                ]
+            }),
+        )]);
+
+        let detail = GitHubLoader::new(&runner)
+            .load_commit_detail(
+                &detail_identity(),
+                detail_sha(),
+                &CancellationToken::default(),
+            )
+            .unwrap();
+
+        assert_eq!(detail.files.len(), 3);
+        assert_eq!(detail.files[0].path, "src/�first    .rs");
+        assert_eq!(
+            detail.files[0].previous_path.as_deref(),
+            Some("src/old    .rs")
+        );
+        assert_eq!(detail.files[0].status, FileStatus::Renamed);
+        assert_eq!(
+            (detail.files[0].additions, detail.files[0].deletions),
+            (2, 1)
+        );
+        let lines = detail.files[0].patch.lines();
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0].kind, DiffLineKind::Hunk);
+        assert_eq!((lines[1].old_line, lines[1].new_line), (Some(10), None));
+        assert_eq!((lines[2].old_line, lines[2].new_line), (None, Some(20)));
+        assert_eq!(lines[2].text, "+new    value�");
+        assert_eq!((lines[3].old_line, lines[3].new_line), (Some(11), Some(21)));
+        assert_eq!(lines[4].kind, DiffLineKind::NoNewline);
+        assert_eq!(detail.files[1].patch, PatchContent::Empty);
+        assert_eq!(detail.files[2].patch, PatchContent::Unavailable);
+        assert!(!detail.more_files_available);
+        assert_eq!(detail.omitted_files, 0);
+        assert_eq!(runner.calls().len(), 1);
+        runner.assert_finished();
+    }
+
+    #[test]
+    fn malformed_hunks_and_unknown_statuses_are_explicit_non_panicking_data() {
+        let runner = ScriptedRunner::new(vec![json_step(
+            detail_endpoint(),
+            vec![],
+            json!({"files": [{
+                "filename": "odd.txt",
+                "previous_filename": null,
+                "status": "future-status",
+                "additions": 1,
+                "deletions": 0,
+                "changes": 1,
+                "patch": "@@ malformed\n+still readable"
+            }]}),
+        )]);
+
+        let detail = GitHubLoader::new(&runner)
+            .load_commit_detail(
+                &detail_identity(),
+                detail_sha(),
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert_eq!(detail.files[0].status, FileStatus::Unknown);
+        assert_eq!(detail.files[0].patch.lines()[0].kind, DiffLineKind::Other);
+        assert_eq!(
+            detail.files[0].patch.lines()[1].kind,
+            DiffLineKind::Addition
+        );
+        assert_eq!(detail.files[0].patch.lines()[1].new_line, None);
+        runner.assert_finished();
+    }
+
+    #[test]
+    fn file_limits_bound_line_count_bytes_and_individual_line_length() {
+        let oversized_line = format!("+{}", "x".repeat(MAX_DIFF_LINE_CHARS + 50));
+        let many_lines = std::iter::repeat_n("+x", MAX_FILE_PATCH_LINES + 3)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let byte_heavy = std::iter::repeat_n(format!("+{}", "y".repeat(1_998)), 140)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let runner = ScriptedRunner::new(vec![json_step(
+            detail_endpoint(),
+            vec![],
+            json!({"files": [
+                api_file("long.txt", 1, Some(&oversized_line)),
+                api_file("many.txt", 1, Some(&many_lines)),
+                api_file("bytes.txt", 1, Some(&byte_heavy))
+            ]}),
+        )]);
+
+        let detail = GitHubLoader::new(&runner)
+            .load_commit_detail(
+                &detail_identity(),
+                detail_sha(),
+                &CancellationToken::default(),
+            )
+            .unwrap();
+
+        for file in &detail.files {
+            let PatchContent::Capped {
+                lines,
+                omitted_bytes,
+                reason,
+                ..
+            } = &file.patch
+            else {
+                panic!("expected a locally capped patch");
+            };
+            assert_eq!(*reason, PatchCapReason::FileLimit);
+            assert!(*omitted_bytes > 0);
+            assert!(lines.len() <= MAX_FILE_PATCH_LINES);
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| line.text.chars().count() <= MAX_DIFF_LINE_CHARS)
+            );
+            assert!(
+                lines.iter().map(|line| line.text.len()).sum::<usize>() <= MAX_FILE_PATCH_BYTES
+            );
+        }
+        assert!(detail.files[0].patch.lines()[0].text.ends_with('…'));
+        let PatchContent::Capped { omitted_lines, .. } = detail.files[1].patch else {
+            unreachable!();
+        };
+        assert_eq!(omitted_lines, 3);
+        runner.assert_finished();
+    }
+
+    #[test]
+    fn commit_budget_stops_retaining_later_patch_text() {
+        let patch = std::iter::repeat_n(format!("+{}", "z".repeat(1_998)), 130)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let files = (0..9)
+            .map(|index| api_file(&format!("file-{index}.txt"), 1, Some(&patch)))
+            .collect::<Vec<_>>();
+        let runner = ScriptedRunner::new(vec![json_step(
+            detail_endpoint(),
+            vec![],
+            json!({"files": files}),
+        )]);
+
+        let detail = GitHubLoader::new(&runner)
+            .load_commit_detail(
+                &detail_identity(),
+                detail_sha(),
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        let retained = detail
+            .files
+            .iter()
+            .flat_map(|file| file.patch.lines())
+            .map(|line| line.text.len())
+            .sum::<usize>();
+        assert!(retained <= MAX_COMMIT_PATCH_BYTES);
+        assert!(matches!(
+            detail.files[8].patch,
+            PatchContent::Capped {
+                ref lines,
+                reason: PatchCapReason::CommitBudget,
+                ..
+            } if lines.is_empty()
+        ));
+        runner.assert_finished();
+    }
+
+    #[test]
+    fn file_cap_and_link_header_disclose_incomplete_file_lists() {
+        let files = (0..=MAX_DETAIL_FILES)
+            .map(|index| api_file(&format!("file-{index}.txt"), 0, None))
+            .collect::<Vec<_>>();
+        let runner = ScriptedRunner::new(vec![Step {
+            endpoint: detail_endpoint(),
+            fields: vec![],
+            result: ScriptResult::Output(http_output(
+                200,
+                &[("Link", "<https://api.invalid/next>; rel=\"next\"")],
+                json!({"files": files}).to_string().as_bytes(),
+                true,
+            )),
+        }]);
+
+        let detail = GitHubLoader::new(&runner)
+            .load_commit_detail(
+                &detail_identity(),
+                detail_sha(),
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert_eq!(detail.files.len(), MAX_DETAIL_FILES);
+        assert_eq!(detail.omitted_files, 1);
+        assert!(detail.more_files_available);
+        assert_eq!(detail.files[0].path, "file-0.txt");
+        assert_eq!(detail.files[MAX_DETAIL_FILES - 1].path, "file-299.txt");
+        runner.assert_finished();
+
+        let runner = ScriptedRunner::new(vec![Step {
+            endpoint: detail_endpoint(),
+            fields: vec![],
+            result: ScriptResult::Output(http_output(
+                200,
+                &[("link", "<https://api.invalid/next>; rel=\"next\"")],
+                json!({"files": [api_file("only.txt", 0, None)]})
+                    .to_string()
+                    .as_bytes(),
+                true,
+            )),
+        }]);
+        let detail = GitHubLoader::new(&runner)
+            .load_commit_detail(
+                &detail_identity(),
+                detail_sha(),
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert_eq!(detail.files.len(), 1);
+        assert_eq!(detail.omitted_files, 0);
+        assert!(detail.more_files_available);
+        runner.assert_finished();
+    }
+
+    #[test]
+    fn accepts_complete_lowercase_sha256_object_ids() {
+        let sha = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let runner = ScriptedRunner::new(vec![json_step(
+            format!("/repos/Ow%20ner/repo%23one/commits/{sha}"),
+            vec![],
+            json!({"files": []}),
+        )]);
+
+        let detail = GitHubLoader::new(&runner)
+            .load_commit_detail(&detail_identity(), sha, &CancellationToken::default())
+            .unwrap();
+        assert!(detail.files.is_empty());
+        runner.assert_finished();
+    }
+
+    #[test]
+    fn response_truncation_and_malformed_detail_json_are_distinct() {
+        let mut truncated = http_output(200, &[], br#"{"files":[]}"#, true);
+        truncated.stdout.truncated = true;
+        let cases = [
+            (
+                Step {
+                    endpoint: detail_endpoint(),
+                    fields: vec![],
+                    result: ScriptResult::Output(truncated),
+                },
+                DetailFailure::ResponseTruncated,
+            ),
+            (
+                Step {
+                    endpoint: detail_endpoint(),
+                    fields: vec![],
+                    result: ScriptResult::Output(http_output(200, &[], b"not json", true)),
+                },
+                DetailFailure::Load(LoadFailure {
+                    category: FailureCategory::MalformedJson,
+                    scope: FailureScope::CommitDetail,
+                    http_status: Some(200),
+                }),
+            ),
+            (
+                json_step(
+                    detail_endpoint(),
+                    vec![],
+                    json!({"files": [{"filename": 1}]}),
+                ),
+                DetailFailure::Load(LoadFailure {
+                    category: FailureCategory::MalformedJson,
+                    scope: FailureScope::CommitDetail,
+                    http_status: Some(200),
+                }),
+            ),
+        ];
+
+        for (step, expected) in cases {
+            let runner = ScriptedRunner::new(vec![step]);
+            let failure = GitHubLoader::new(&runner)
+                .load_commit_detail(
+                    &detail_identity(),
+                    detail_sha(),
+                    &CancellationToken::default(),
+                )
+                .unwrap_err();
+            assert_eq!(failure, expected);
+            runner.assert_finished();
+        }
+    }
+
+    #[test]
+    fn detail_failures_are_categorized_and_never_disclose_request_data() {
+        let private_owner = "private owner";
+        let private_name = "secret#repository";
+        let private_sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let identity = RepositoryIdentity {
+            id: 991,
+            owner: private_owner.to_owned(),
+            name: private_name.to_owned(),
+        };
+        let endpoint = "/repos/private%20owner/secret%23repository/commits/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let cases = [
+            (
+                failure_step(endpoint, vec![], 401, &[], b"secret stderr"),
+                FailureCategory::Authentication,
+            ),
+            (
+                failure_step(endpoint, vec![], 403, &[], b"secret stderr"),
+                FailureCategory::PermissionOrNotFound,
+            ),
+            (
+                failure_step(endpoint, vec![], 404, &[], b"secret stderr"),
+                FailureCategory::PermissionOrNotFound,
+            ),
+            (
+                failure_step(
+                    endpoint,
+                    vec![],
+                    403,
+                    &[("x-ratelimit-remaining", "0")],
+                    b"secret stderr",
+                ),
+                FailureCategory::RateLimit,
+            ),
+            (
+                Step {
+                    endpoint: endpoint.to_owned(),
+                    fields: vec![],
+                    result: ScriptResult::Output(ProcessOutput {
+                        success: false,
+                        exit_code: Some(1),
+                        stdout: BoundedBytes {
+                            bytes: Vec::new(),
+                            truncated: false,
+                        },
+                        stderr: BoundedBytes {
+                            bytes: b"dial tcp secret.internal: no such host".to_vec(),
+                            truncated: false,
+                        },
+                    }),
+                },
+                FailureCategory::Offline,
+            ),
+        ];
+
+        for (step, expected_category) in cases {
+            let runner = ScriptedRunner::new(vec![step]);
+            let failure = GitHubLoader::new(&runner)
+                .load_commit_detail(&identity, private_sha, &CancellationToken::default())
+                .unwrap_err();
+            let DetailFailure::Load(failure) = failure else {
+                panic!("expected a categorized load failure");
+            };
+            assert_eq!(failure.category, expected_category);
+            assert_eq!(failure.scope, FailureScope::CommitDetail);
+            let displayed = failure.to_string();
+            for secret in [private_owner, private_name, private_sha, "secret.internal"] {
+                assert!(!displayed.contains(secret));
+            }
+            runner.assert_finished();
+        }
+    }
+
+    #[test]
+    fn invalid_and_pre_cancelled_detail_requests_never_invoke_the_runner() {
+        for sha in [
+            "short",
+            "ABCDEF0123456789abcdef0123456789abcdef01",
+            "zbcdef0123456789abcdef0123456789abcdef01",
+        ] {
+            let runner = ScriptedRunner::new(Vec::new());
+            let failure = GitHubLoader::new(&runner)
+                .load_commit_detail(&detail_identity(), sha, &CancellationToken::default())
+                .unwrap_err();
+            assert!(matches!(failure, DetailFailure::Load(_)));
+            assert!(runner.calls().is_empty());
+        }
+
+        let runner = ScriptedRunner::new(Vec::new());
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let failure = GitHubLoader::new(&runner)
+            .load_commit_detail(&detail_identity(), detail_sha(), &cancellation)
+            .unwrap_err();
+        assert!(matches!(
+            failure,
+            DetailFailure::Load(LoadFailure {
+                category: FailureCategory::Cancelled,
+                ..
+            })
+        ));
+        assert!(runner.calls().is_empty());
     }
 
     #[test]

@@ -18,9 +18,10 @@ Implemented now:
   application errors, and recoverable partial setup failures.
 - An executable, noninteractive smoke workflow rendered through Ratatui's
   in-memory test backend.
-- Owned inbox, repository, commit, author, file, and diff models shared by the
-  fictional demo and future live data. Commits retain their complete SHA,
-  subject, GitHub login, and author timestamp; the UI displays only a short SHA.
+- Owned inbox, repository, commit, author, file, and typed diff models shared by
+  the fictional demo and live data. Repositories retain GitHub's numeric ID as
+  their stable identity. Commits retain their complete SHA, subject, GitHub
+  login, and author timestamp; the UI displays only a short SHA.
 - Live launch configuration: no arguments selects today's calendar day in the
   detected local IANA timezone. `--date YYYY-MM-DD` and `--timezone IANA_NAME`
   override those values before terminal setup. If local-zone detection is not
@@ -31,6 +32,16 @@ Implemented now:
 - A read-only, UI-independent GitHub loader that invokes `gh api` directly and
   reuses the GitHub CLI's existing authentication without requesting, reading,
   printing, or persisting a token.
+- A read-only, on-demand commit-detail loader for one selected repository and
+  complete SHA. It preserves API file order and metadata, parses text patches
+  into typed, numbered lines, and explicitly represents empty, unavailable,
+  locally capped, response-truncated, loading, and sanitized failure outcomes.
+- Commit-detail retention is bounded to 300 files, 256 KiB and 5,000 lines per
+  file, 2,000 characters per line, and 2 MiB of patch text per commit. A
+  response over the existing 16 MiB command-output limit is reported as
+  truncated rather than malformed. File paths and patch lines have terminal
+  control characters replaced, tabs expanded, and trailing carriage returns
+  removed.
 - Explicitly paginated owned-repository, branch, and per-branch commit loading
   at 100 items per page. Dynamic repository path segments are percent-encoded,
   query values remain separate process arguments, and every request explicitly
@@ -57,7 +68,8 @@ Implemented now:
 Planned for later delivery increments, and not implemented yet:
 
 - Durable review state and reviewed/unreviewed filtering.
-- Real diffs loaded from GitHub repositories.
+- Wiring live repository/commit/file navigation to the on-demand detail loader
+  and rendering its real GitHub diffs.
 - Drafting, editing, persistence, and publishing of comments.
 - Repeated-match navigation with `n` / `N`.
 
@@ -198,19 +210,20 @@ filtered time is Git's author timestamp (`commit.author.date`), not committer
 time, push time, or the contribution-calendar date. Forks owned by another
 account are excluded by the owner-only inbox definition.
 
-GitHub can return permission/not-found, authentication, rate-limit, and other
-API failures. A 403 is considered rate-limited only when response headers report
-no remaining requests or a retry interval; otherwise it remains a permission
-failure. Repository- and branch-scoped errors keep already loaded data but mark
-coverage incomplete. Discovery errors are fatal. Diagnostics contain only a
-category, numeric scope, and optional HTTP status—not response bodies, stderr,
-repository names, branches, SHAs, or subjects.
+GitHub can return permission/not-found, authentication, rate-limit, offline, and
+other API failures. A 403 is considered rate-limited only when response headers
+report no remaining requests or a retry interval; otherwise it remains a
+permission failure. Repository- and branch-scoped errors keep already loaded
+data but mark coverage incomplete. Discovery errors are fatal. Diagnostics
+contain only a category, numeric scope, and optional HTTP status—not response
+bodies, stderr, repository names, branches, SHAs, or subjects.
 
 The terminal displays at most three sanitized failure details and reports how
 many more were omitted. An incomplete result is never labeled complete or as a
 truly empty day. Live navigation intentionally stops at the commit pane in this
-increment; file and diff retrieval remain planned. `--demo` retains the complete
-fictional repository/commit/file/diff experience.
+increment; the on-demand detail boundary is implemented and tested but is not
+yet connected to terminal navigation. `--demo` retains the complete fictional
+repository/commit/file/diff experience and uses the same typed patch parser.
 
 Implementation assumptions were checked against the official GitHub
 documentation for the [authenticated user](https://docs.github.com/en/rest/users/users#get-the-authenticated-user),
