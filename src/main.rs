@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod day;
+mod detail;
 mod event;
 mod fixture;
 pub mod github;
@@ -16,13 +17,15 @@ use std::process::ExitCode;
 
 use app::App;
 use cli::Command;
-use event::CrosstermEventSource;
+use detail::DetailSession;
+use event::{CrosstermEventSource, DetailRequester};
 use fixture::DemoFixture;
 use inbox::Inbox;
 use inbox::InboxSource;
 use loader::LoaderSession;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use review_state::{FileReviewStore, ReviewStore};
 use terminal::{CrosstermOps, with_terminal};
 
 fn main() -> ExitCode {
@@ -67,17 +70,32 @@ fn run_inbox(inbox: Inbox) -> io::Result<()> {
         InboxSource::Live { selection } => Some(selection.clone()),
         InboxSource::Demo => None,
     };
+    let mut app = match &inbox.source {
+        InboxSource::Live { .. } => App::with_review_store_result(
+            inbox,
+            FileReviewStore::from_process_env()
+                .map(|store| Box::new(store) as Box<dyn ReviewStore>),
+        ),
+        InboxSource::Demo => App::new(inbox),
+    };
     with_terminal(CrosstermOps, || {
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
 
-        let mut app = App::new(inbox);
         let mut events = CrosstermEventSource;
         if let Some(selection) = selection {
             let mut loader = LoaderSession::start(selection);
-            let result = event::run_with_loader(&mut terminal, &mut app, &mut events, &mut loader);
+            let mut details = DetailSession::new();
+            let result = event::run_with_loader(
+                &mut terminal,
+                &mut app,
+                &mut events,
+                &mut loader,
+                &mut details,
+            );
             loader.shutdown();
+            details.shutdown();
             result
         } else {
             event::run(&mut terminal, &mut app, &mut events)

@@ -79,32 +79,32 @@ fn commit(sha: &str, subject: &str, files: Vec<FileChange>) -> Commit {
 fn primary_commits() -> Vec<Commit> {
     vec![
         commit(
-            "a1b2c3d00000000000000000000000000000000",
+            "a1b2c3d000000000000000000000000000000000",
             "Refine fictional launch screen",
             primary_files(),
         ),
         commit(
-            "b2c3d4e00000000000000000000000000000000",
+            "b2c3d4e000000000000000000000000000000000",
             "Tune sample twilight palette",
             small_files(),
         ),
         commit(
-            "c3d4e5f00000000000000000000000000000000",
+            "c3d4e5f000000000000000000000000000000000",
             "Add imaginary planet routes",
             primary_files(),
         ),
         commit(
-            "d4e5f6a00000000000000000000000000000000",
+            "d4e5f6a000000000000000000000000000000000",
             "Document offline fixture mode",
             small_files(),
         ),
         commit(
-            "e5f6a7b00000000000000000000000000000000",
+            "e5f6a7b000000000000000000000000000000000",
             "Cover made-up route examples",
             primary_files(),
         ),
         commit(
-            "f6a7b8c00000000000000000000000000000000",
+            "f6a7b8c000000000000000000000000000000000",
             "Polish demonstration labels",
             small_files(),
         ),
@@ -114,12 +114,12 @@ fn primary_commits() -> Vec<Commit> {
 fn secondary_commits() -> Vec<Commit> {
     vec![
         commit(
-            "13579bd00000000000000000000000000000000",
+            "13579bd000000000000000000000000000000000",
             "Plant fictional color seeds",
             small_files(),
         ),
         commit(
-            "2468ace00000000000000000000000000000000",
+            "2468ace000000000000000000000000000000000",
             "Arrange sample garden tiles",
             primary_files(),
         ),
@@ -128,7 +128,7 @@ fn secondary_commits() -> Vec<Commit> {
 
 fn single_commit() -> Vec<Commit> {
     vec![commit(
-        "0decafe00000000000000000000000000000000",
+        "0decafe000000000000000000000000000000000",
         "Calibrate imaginary clockwork",
         small_files(),
     )]
@@ -269,7 +269,8 @@ mod tests {
                 .iter()
                 .flat_map(|repo| &repo.commits)
                 .all(|commit| {
-                    !commit.sha.is_empty()
+                    commit.sha.len() == 40
+                        && commit.sha.bytes().all(|byte| byte.is_ascii_hexdigit())
                         && !commit.subject.is_empty()
                         && !commit.files.as_slice().is_empty()
                 })

@@ -371,7 +371,14 @@ mod tests {
                 progress_sent: false,
                 cancelled: loader_cancelled,
             };
-            crate::event::run_with_loader(&mut terminal, &mut app, &mut events, &mut loader)
+            let mut details = crate::event::NoDetails;
+            crate::event::run_with_loader(
+                &mut terminal,
+                &mut app,
+                &mut events,
+                &mut loader,
+                &mut details,
+            )
         })
         .expect("quit succeeds");
 

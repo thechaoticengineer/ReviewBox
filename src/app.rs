@@ -1,9 +1,16 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::Arc;
 
 use crate::github::{
-    LoadEvent, LoadFailure, LoadProgress, LoadStatus, LoadedRepository, RepositoryCoverage,
+    DetailFailure, DetailState, FailureCategory, LoadEvent, LoadFailure, LoadProgress, LoadStatus,
+    LoadedRepository, RepositoryCoverage,
 };
-use crate::inbox::{Commit, DiffLine, FileChange, Inbox, InboxSource, Repository};
+use crate::inbox::{
+    Commit, CommitDetail, DiffLine, FileChange, Inbox, InboxSource, Repository, RepositoryIdentity,
+};
+use crate::review_state::{
+    MemoryReviewStore, ReviewKey, ReviewMarks, ReviewStateError, ReviewStore,
+};
 
 pub const MIN_FULL_WIDTH: u16 = 60;
 pub const MIN_FULL_HEIGHT: u16 = 16;
@@ -74,6 +81,8 @@ pub enum Command {
     HalfPageUp,
     Open,
     Back,
+    ToggleReviewed,
+    ToggleRemaining,
     Unrelated,
 }
 
@@ -121,6 +130,14 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
         action: "search the focused pane",
     },
     HelpBinding {
+        keys: "m",
+        action: "mark commit reviewed / unreviewed",
+    },
+    HelpBinding {
+        keys: "f",
+        action: "show remaining / all commits",
+    },
+    HelpBinding {
         keys: "?",
         action: "open this help",
     },
@@ -149,6 +166,50 @@ struct ListPosition {
 }
 
 const MAX_VISIBLE_FAILURES: usize = 3;
+const DETAIL_CACHE_CAPACITY: usize = 16;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DetailKey {
+    pub repository_id: u64,
+    pub sha: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum DetailEffect {
+    Request {
+        request_id: u64,
+        key: DetailKey,
+        repository: RepositoryIdentity,
+    },
+    Cancel {
+        request_id: u64,
+    },
+}
+
+#[derive(Debug)]
+pub struct DetailResult {
+    pub request_id: u64,
+    pub key: DetailKey,
+    pub outcome: Result<CommitDetail, DetailFailure>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveDetailRequest {
+    request_id: u64,
+    key: DetailKey,
+}
+
+#[derive(Debug, Clone)]
+struct VisibleRepository {
+    inbox_index: usize,
+    commit_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct SelectionIdentity {
+    repository_id: Option<u64>,
+    commit_sha: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LivePhase {
@@ -244,10 +305,46 @@ pub struct App {
     status: String,
     should_quit: bool,
     live: Option<LiveInboxState>,
+    review_store: Option<Box<dyn ReviewStore>>,
+    review_marks: ReviewMarks,
+    review_warning: Option<String>,
+    remaining_only: bool,
+    visible: Vec<VisibleRepository>,
+    detail_cache: HashMap<DetailKey, DetailState>,
+    detail_lru: VecDeque<DetailKey>,
+    active_request: Option<ActiveDetailRequest>,
+    next_request_id: u64,
+    effects: VecDeque<DetailEffect>,
 }
 
 impl App {
     pub fn new(inbox: Inbox) -> Self {
+        Self::with_review_store(inbox, Box::new(MemoryReviewStore::default()))
+    }
+
+    pub fn with_review_store(inbox: Inbox, store: Box<dyn ReviewStore>) -> Self {
+        match store.load() {
+            Ok(marks) => Self::build(inbox, Some(store), marks, None),
+            Err(error) => Self::build(inbox, None, ReviewMarks::default(), Some(error.to_string())),
+        }
+    }
+
+    pub fn with_review_store_result(
+        inbox: Inbox,
+        store: Result<Box<dyn ReviewStore>, ReviewStateError>,
+    ) -> Self {
+        match store {
+            Ok(store) => Self::with_review_store(inbox, store),
+            Err(error) => Self::build(inbox, None, ReviewMarks::default(), Some(error.to_string())),
+        }
+    }
+
+    fn build(
+        inbox: Inbox,
+        review_store: Option<Box<dyn ReviewStore>>,
+        review_marks: ReviewMarks,
+        review_warning: Option<String>,
+    ) -> Self {
         let status = match &inbox.source {
             InboxSource::Demo => "Offline fictional demo".to_owned(),
             InboxSource::Live { .. } => "GitHub loading started".to_owned(),
@@ -269,7 +366,18 @@ impl App {
             status,
             should_quit: false,
             live,
+            review_store,
+            review_marks,
+            review_warning,
+            remaining_only: false,
+            visible: Vec::new(),
+            detail_cache: HashMap::new(),
+            detail_lru: VecDeque::new(),
+            active_request: None,
+            next_request_id: 1,
+            effects: VecDeque::new(),
         };
+        app.rebuild_projection(None);
         app.normalize();
         app
     }
@@ -286,8 +394,7 @@ impl App {
             return;
         }
 
-        let selected_repository = self.current_repository().map(|value| value.identity.id);
-        let selected_commit = self.current_commit().map(|value| value.sha.clone());
+        let selection = self.selection_identity();
 
         let live = self.live.as_mut().expect("checked above");
         match event {
@@ -432,23 +539,8 @@ impl App {
             }
         }
 
-        if let Some(id) = selected_repository
-            && let Some(index) = self
-                .inbox
-                .repositories
-                .iter()
-                .position(|repository| repository.identity.id == id)
-        {
-            self.repositories.selected = index;
-            if let Some(sha) = selected_commit
-                && let Some(index) = self.inbox.repositories[index]
-                    .commits
-                    .iter()
-                    .position(|commit| commit.sha == sha)
-            {
-                self.commits.selected = index;
-            }
-        }
+        self.rebuild_projection(Some(selection));
+        self.cancel_detail_if_selection_changed();
         self.normalize();
     }
 
@@ -512,6 +604,8 @@ impl App {
             Input::Character('l') => Command::FocusNext,
             Input::Character('g') => Command::GPrefix,
             Input::Character('G') => Command::Last,
+            Input::Character('m') => Command::ToggleReviewed,
+            Input::Character('f') => Command::ToggleRemaining,
             Input::Enter => Command::Open,
             Input::Escape => Command::Back,
             Input::HalfPageDown => Command::HalfPageDown,
@@ -552,6 +646,7 @@ impl App {
     fn apply_normal(&mut self, command: Command) {
         match command {
             Command::Quit => {
+                self.cancel_active_detail();
                 self.should_quit = true;
                 self.status = "Closing ReviewBox".to_owned();
             }
@@ -563,10 +658,156 @@ impl App {
             Command::Last => self.move_to_last(),
             Command::HalfPageDown => self.move_active(false, self.half_page_step()),
             Command::HalfPageUp => self.move_active(true, self.half_page_step()),
-            Command::Open => self.focus_next("Opened selected item"),
+            Command::Open => self.open_selected(),
             Command::Back => self.focus_previous("Returned to parent pane"),
+            Command::ToggleReviewed => self.toggle_reviewed(),
+            Command::ToggleRemaining => self.toggle_remaining(),
             Command::Unrelated => self.status = "Key has no action in normal mode".to_owned(),
         }
+    }
+
+    fn open_selected(&mut self) {
+        if matches!(self.inbox.source, InboxSource::Live { .. }) && self.focus == Pane::Commit {
+            self.open_live_commit();
+        } else {
+            self.focus_next("Opened selected item");
+        }
+    }
+
+    fn open_live_commit(&mut self) {
+        let Some((key, repository)) = self.current_detail_target() else {
+            self.status = "No openable commit is selected".to_owned();
+            return;
+        };
+
+        match self.detail_cache.get(&key) {
+            Some(DetailState::Loading) => {
+                self.focus = Pane::File;
+                self.status = "Commit details are still loading".to_owned();
+                return;
+            }
+            Some(DetailState::Ready(_)) => {
+                self.touch_detail(&key);
+                self.focus = Pane::File;
+                self.status = "Opened cached commit details".to_owned();
+                return;
+            }
+            Some(DetailState::NotRequested) | Some(DetailState::Failed(_)) | None => {}
+        }
+
+        self.cancel_active_detail();
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        self.detail_cache.insert(key.clone(), DetailState::Loading);
+        self.touch_detail(&key);
+        self.active_request = Some(ActiveDetailRequest {
+            request_id,
+            key: key.clone(),
+        });
+        self.effects.push_back(DetailEffect::Request {
+            request_id,
+            key,
+            repository,
+        });
+        self.focus = Pane::File;
+        self.status = "Loading commit details".to_owned();
+    }
+
+    fn toggle_reviewed(&mut self) {
+        if self.focus == Pane::Repository {
+            self.status = "Open a commit before changing review progress".to_owned();
+            return;
+        }
+        let Some((repository_id, sha)) = self
+            .current_repository()
+            .zip(self.current_commit())
+            .map(|(repository, commit)| (repository.identity.id, commit.sha.clone()))
+        else {
+            self.status = "No commit selected; review progress unchanged".to_owned();
+            return;
+        };
+        let Ok(key) = ReviewKey::new(repository_id, &sha) else {
+            self.status =
+                "Selected commit identity is invalid; review progress unchanged".to_owned();
+            return;
+        };
+        let Some(store) = self.review_store.as_ref() else {
+            self.status = "Review progress is unavailable; mark unchanged".to_owned();
+            return;
+        };
+        let reviewed = !self.review_marks.is_reviewed(&key);
+        match store.set_reviewed(&key, reviewed) {
+            Ok(marks) => {
+                let selection = self.selection_identity();
+                self.review_marks = marks;
+                self.rebuild_projection(Some(selection));
+                self.cancel_detail_if_selection_changed();
+                self.status = if reviewed {
+                    "Marked commit reviewed".to_owned()
+                } else {
+                    "Marked commit unreviewed".to_owned()
+                };
+            }
+            Err(error) => {
+                self.status = format!("Review mark unchanged: {error}");
+            }
+        }
+    }
+
+    fn toggle_remaining(&mut self) {
+        let before = self.current_detail_key();
+        let selection = self.selection_identity();
+        self.remaining_only = !self.remaining_only;
+        self.rebuild_projection(Some(selection));
+        if self.focus > Pane::Commit && before != self.current_detail_key() {
+            self.focus = Pane::Commit;
+        }
+        self.cancel_detail_if_selection_changed();
+        self.status = if self.remaining_only {
+            "Showing remaining commits only".to_owned()
+        } else {
+            "Showing all commits".to_owned()
+        };
+    }
+
+    pub fn apply_detail_result(&mut self, result: DetailResult) {
+        let is_current = self.active_request.as_ref().is_some_and(|active| {
+            active.request_id == result.request_id && active.key == result.key
+        });
+        if !is_current {
+            return;
+        }
+        self.active_request = None;
+
+        match result.outcome {
+            Ok(detail) => {
+                let file_count = detail.files.len();
+                self.detail_cache
+                    .insert(result.key.clone(), DetailState::Ready(Arc::new(detail)));
+                self.touch_detail(&result.key);
+                self.status = if file_count == 0 {
+                    "Commit details loaded; no changed files were returned".to_owned()
+                } else {
+                    format!("Commit details loaded ({file_count} files)")
+                };
+            }
+            Err(DetailFailure::Load(failure)) if failure.category == FailureCategory::Cancelled => {
+                self.detail_cache.remove(&result.key);
+                self.remove_detail_lru(&result.key);
+                self.status = "Commit detail request cancelled".to_owned();
+            }
+            Err(failure) => {
+                self.detail_cache
+                    .insert(result.key.clone(), DetailState::Failed(failure));
+                self.touch_detail(&result.key);
+                self.status = "Commit detail request failed".to_owned();
+            }
+        }
+        self.normalize();
+    }
+
+    pub fn take_detail_effects(&mut self) -> Vec<DetailEffect> {
+        self.effects.drain(..).collect()
     }
 
     fn apply_search(&mut self, target: Pane) {
@@ -579,16 +820,14 @@ impl App {
 
         let needle = query.to_lowercase();
         let found = match target {
-            Pane::Repository => find_wrapped(
-                self.inbox.repositories.len(),
-                self.repositories.selected,
-                |index| {
-                    self.inbox.repositories[index]
+            Pane::Repository => {
+                find_wrapped(self.visible.len(), self.repositories.selected, |index| {
+                    self.visible_repositories()[index]
                         .display_name()
                         .to_lowercase()
                         .contains(&needle)
-                },
-            ),
+                })
+            }
             Pane::Commit => find_wrapped(
                 self.current_commits().len(),
                 self.commits.selected,
@@ -643,6 +882,10 @@ impl App {
     }
 
     fn focus_next(&mut self, status: &'static str) {
+        if matches!(self.inbox.source, InboxSource::Live { .. }) && self.focus == Pane::Commit {
+            self.open_live_commit();
+            return;
+        }
         if let Some(next) = self.focus.next()
             && next <= self.deepest_meaningful_pane()
         {
@@ -658,7 +901,7 @@ impl App {
             Pane::Repository => {
                 let selected = moved_index(
                     self.repositories.selected,
-                    self.inbox.repositories.len(),
+                    self.visible.len(),
                     upward,
                     amount,
                 );
@@ -706,7 +949,7 @@ impl App {
     fn move_to_last(&mut self) {
         match self.focus {
             Pane::Repository => {
-                self.select_repository(self.inbox.repositories.len().saturating_sub(1));
+                self.select_repository(self.visible.len().saturating_sub(1));
             }
             Pane::Commit => {
                 self.select_commit(self.current_commits().len().saturating_sub(1));
@@ -729,6 +972,7 @@ impl App {
             self.commits = ListPosition::default();
             self.files = ListPosition::default();
             self.diff_scroll = 0;
+            self.cancel_detail_if_selection_changed();
         }
     }
 
@@ -737,6 +981,7 @@ impl App {
             self.commits.selected = selected;
             self.files = ListPosition::default();
             self.diff_scroll = 0;
+            self.cancel_detail_if_selection_changed();
         }
     }
 
@@ -750,7 +995,7 @@ impl App {
     fn normalize(&mut self) {
         normalize_list(
             &mut self.repositories,
-            self.inbox.repositories.len(),
+            self.visible.len(),
             self.viewport_heights[Pane::Repository.index()],
         );
 
@@ -773,9 +1018,16 @@ impl App {
     }
 
     fn deepest_meaningful_pane(&self) -> Pane {
-        if self.inbox.repositories.is_empty() || self.current_commits().is_empty() {
+        if self.visible.is_empty() || self.current_commits().is_empty() {
             Pane::Repository
-        } else if !self.inbox.child_panes_available() || self.current_files().is_empty() {
+        } else if matches!(self.inbox.source, InboxSource::Live { .. }) {
+            match self.current_detail_state() {
+                Some(DetailState::Loading | DetailState::Ready(_) | DetailState::Failed(_)) => {
+                    Pane::Diff
+                }
+                Some(DetailState::NotRequested) | None => Pane::Commit,
+            }
+        } else if self.current_files().is_empty() {
             Pane::Commit
         } else {
             Pane::Diff
@@ -797,16 +1049,33 @@ impl App {
     }
 
     pub fn current_repository(&self) -> Option<&Repository> {
-        self.inbox.repositories.get(self.repositories.selected)
+        let visible = self.visible.get(self.repositories.selected)?;
+        self.inbox.repositories.get(visible.inbox_index)
     }
 
-    pub fn current_commits(&self) -> &[Commit] {
-        self.current_repository()
-            .map_or(&[], |repository| repository.commits.as_slice())
+    pub fn visible_repositories(&self) -> Vec<&Repository> {
+        self.visible
+            .iter()
+            .filter_map(|visible| self.inbox.repositories.get(visible.inbox_index))
+            .collect()
+    }
+
+    pub fn current_commits(&self) -> Vec<&Commit> {
+        let Some(visible) = self.visible.get(self.repositories.selected) else {
+            return Vec::new();
+        };
+        let Some(repository) = self.inbox.repositories.get(visible.inbox_index) else {
+            return Vec::new();
+        };
+        visible
+            .commit_indices
+            .iter()
+            .filter_map(|index| repository.commits.get(*index))
+            .collect()
     }
 
     pub fn current_commit(&self) -> Option<&Commit> {
-        self.current_commits().get(self.commits.selected)
+        self.current_commits().get(self.commits.selected).copied()
     }
 
     pub fn current_files(&self) -> &[FileChange] {
@@ -814,7 +1083,10 @@ impl App {
             self.current_commit()
                 .map_or(&[], |commit| commit.files.as_slice())
         } else {
-            &[]
+            match self.current_detail_state() {
+                Some(DetailState::Ready(detail)) => &detail.files,
+                _ => &[],
+            }
         }
     }
 
@@ -881,9 +1153,188 @@ impl App {
         self.live.as_ref()
     }
 
+    pub fn current_detail_state(&self) -> Option<&DetailState> {
+        self.detail_cache.get(&self.current_detail_key()?)
+    }
+
+    pub fn is_reviewed(&self, repository_id: u64, sha: &str) -> bool {
+        ReviewKey::new(repository_id, sha)
+            .ok()
+            .is_some_and(|key| self.review_marks.is_reviewed(&key))
+    }
+
+    pub fn remaining_only(&self) -> bool {
+        self.remaining_only
+    }
+
+    pub fn all_reviewed_empty(&self) -> bool {
+        self.remaining_only
+            && self.visible.is_empty()
+            && self
+                .inbox
+                .repositories
+                .iter()
+                .any(|repository| !repository.commits.is_empty())
+    }
+
+    pub fn review_warning(&self) -> Option<&str> {
+        self.review_warning.as_deref()
+    }
+
+    #[cfg(test)]
+    pub fn detail_cache_len(&self) -> usize {
+        self.detail_cache.len()
+    }
+
+    fn selection_identity(&self) -> SelectionIdentity {
+        SelectionIdentity {
+            repository_id: self
+                .current_repository()
+                .map(|repository| repository.identity.id),
+            commit_sha: self.current_commit().map(|commit| commit.sha.clone()),
+        }
+    }
+
+    fn rebuild_projection(&mut self, preferred: Option<SelectionIdentity>) {
+        let visible = self
+            .inbox
+            .repositories
+            .iter()
+            .enumerate()
+            .filter_map(|(inbox_index, repository)| {
+                let commit_indices: Vec<_> = repository
+                    .commits
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(commit_index, commit)| {
+                        (!self.remaining_only
+                            || !self.is_reviewed(repository.identity.id, &commit.sha))
+                        .then_some(commit_index)
+                    })
+                    .collect();
+                (!self.remaining_only || !commit_indices.is_empty()).then_some(VisibleRepository {
+                    inbox_index,
+                    commit_indices,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.visible = visible;
+
+        if let Some(preferred) = preferred {
+            if let Some(repository_id) = preferred.repository_id
+                && let Some(visible_index) = self.visible.iter().position(|visible| {
+                    self.inbox.repositories[visible.inbox_index].identity.id == repository_id
+                })
+            {
+                self.repositories.selected = visible_index;
+            }
+            if let Some(sha) = preferred.commit_sha.as_deref()
+                && let Some(visible_repository) = self.visible.get(self.repositories.selected)
+                && let Some(commit_index) =
+                    visible_repository
+                        .commit_indices
+                        .iter()
+                        .position(|raw_index| {
+                            self.inbox.repositories[visible_repository.inbox_index].commits
+                                [*raw_index]
+                                .sha
+                                == sha
+                        })
+            {
+                self.commits.selected = commit_index;
+            }
+        }
+        normalize_list(
+            &mut self.repositories,
+            self.visible.len(),
+            self.viewport_heights[Pane::Repository.index()],
+        );
+        let commit_len = self.current_commits().len();
+        normalize_list(
+            &mut self.commits,
+            commit_len,
+            self.viewport_heights[Pane::Commit.index()],
+        );
+    }
+
+    fn current_detail_key(&self) -> Option<DetailKey> {
+        let repository = self.current_repository()?;
+        let commit = self.current_commit()?;
+        Some(DetailKey {
+            repository_id: repository.identity.id,
+            sha: commit.sha.clone(),
+        })
+    }
+
+    fn current_detail_target(&self) -> Option<(DetailKey, RepositoryIdentity)> {
+        let repository = self.current_repository()?;
+        let commit = self.current_commit()?;
+        let review_key = ReviewKey::new(repository.identity.id, &commit.sha).ok()?;
+        let key = DetailKey {
+            repository_id: repository.identity.id,
+            sha: review_key.sha().to_owned(),
+        };
+        Some((key, repository.identity.clone()))
+    }
+
+    fn cancel_detail_if_selection_changed(&mut self) {
+        let selected = self.current_detail_key();
+        if self
+            .active_request
+            .as_ref()
+            .is_some_and(|active| Some(&active.key) != selected.as_ref())
+        {
+            self.cancel_active_detail();
+        }
+    }
+
+    fn cancel_active_detail(&mut self) {
+        let Some(active) = self.active_request.take() else {
+            return;
+        };
+        if matches!(
+            self.detail_cache.get(&active.key),
+            Some(DetailState::Loading)
+        ) {
+            self.detail_cache.remove(&active.key);
+            self.remove_detail_lru(&active.key);
+        }
+        self.effects.push_back(DetailEffect::Cancel {
+            request_id: active.request_id,
+        });
+    }
+
+    fn touch_detail(&mut self, key: &DetailKey) {
+        self.remove_detail_lru(key);
+        self.detail_lru.push_back(key.clone());
+        while self.detail_cache.len() > DETAIL_CACHE_CAPACITY {
+            let active_key = self.active_request.as_ref().map(|active| &active.key);
+            let Some(position) = self
+                .detail_lru
+                .iter()
+                .position(|candidate| Some(candidate) != active_key)
+            else {
+                break;
+            };
+            if let Some(evicted) = self.detail_lru.remove(position) {
+                self.detail_cache.remove(&evicted);
+            }
+        }
+    }
+
+    fn remove_detail_lru(&mut self, key: &DetailKey) {
+        if let Some(position) = self
+            .detail_lru
+            .iter()
+            .position(|candidate| candidate == key)
+        {
+            self.detail_lru.remove(position);
+        }
+    }
+
     fn dataset_len(&self, pane: Pane) -> usize {
         match pane {
-            Pane::Repository => self.inbox.repositories.len(),
+            Pane::Repository => self.visible.len(),
             Pane::Commit => self.current_commits().len(),
             Pane::File => self.current_files().len(),
             Pane::Diff => self.current_diff_lines().len(),
@@ -957,8 +1408,15 @@ fn pane_viewport_heights(width: u16, height: u16) -> [usize; 4] {
 mod tests {
     use super::*;
     use crate::fixture::DemoFixture;
+    use crate::github::{DetailFailure, FailureCategory, FailureScope};
     use crate::inbox::{ChildPane, FileStatus, GitHubAuthor, RepositoryIdentity};
+    use crate::review_state::{FileReviewStore, ReviewStateError, ReviewStore};
     use chrono::{TimeZone, Utc};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_STATE_TEST: AtomicU64 = AtomicU64::new(0);
 
     fn files() -> Vec<FileChange> {
         ["one.rs", "two.rs", "three.rs"]
@@ -1207,7 +1665,7 @@ mod tests {
     }
 
     #[test]
-    fn live_inbox_does_not_open_fixture_child_panes() {
+    fn live_inbox_open_starts_on_demand_detail_loading() {
         let selection = crate::day::select_day(
             crate::day::parse_date("2024-01-15").unwrap(),
             crate::day::parse_timezone("Etc/UTC").unwrap(),
@@ -1220,11 +1678,19 @@ mod tests {
             commits: commits(),
         }];
         let mut app = App::new(inbox);
-        app.apply(Command::Open);
+        app.apply(Command::FocusNext);
         assert_eq!(app.focus(), Pane::Commit);
-        app.apply(Command::Open);
-        assert_eq!(app.focus(), Pane::Commit);
+        app.apply(Command::FocusNext);
+        assert_eq!(app.focus(), Pane::File);
         assert!(app.current_files().is_empty());
+        assert!(matches!(
+            app.current_detail_state(),
+            Some(DetailState::Loading)
+        ));
+        assert!(matches!(
+            app.take_detail_effects().as_slice(),
+            [DetailEffect::Request { .. }]
+        ));
     }
 
     #[test]
@@ -1406,6 +1872,77 @@ mod tests {
         App::new(Inbox::live(selection))
     }
 
+    fn live_app_with(repositories: Vec<Repository>) -> App {
+        let mut app = live_app();
+        for (repository_index, repository) in repositories.into_iter().enumerate() {
+            app.apply_load_event(LoadEvent::RepositorySnapshot {
+                repository_index,
+                repository: LoadedRepository {
+                    repository,
+                    branch_count: 1,
+                    coverage: RepositoryCoverage::Complete,
+                },
+            });
+        }
+        app
+    }
+
+    fn detail() -> CommitDetail {
+        CommitDetail {
+            files: files(),
+            omitted_files: 0,
+            more_files_available: false,
+        }
+    }
+
+    fn take_request(app: &mut App) -> (u64, DetailKey) {
+        let effects = app.take_detail_effects();
+        let [
+            DetailEffect::Request {
+                request_id, key, ..
+            },
+        ] = effects.as_slice()
+        else {
+            panic!("expected exactly one detail request, got {effects:?}");
+        };
+        (*request_id, key.clone())
+    }
+
+    fn detail_failure(category: FailureCategory) -> DetailFailure {
+        DetailFailure::Load(LoadFailure {
+            category,
+            scope: FailureScope::CommitDetail,
+            http_status: None,
+        })
+    }
+
+    #[derive(Debug)]
+    struct FailingReviewStore;
+
+    impl ReviewStore for FailingReviewStore {
+        fn load(&self) -> Result<ReviewMarks, ReviewStateError> {
+            Ok(ReviewMarks::default())
+        }
+
+        fn set_reviewed(
+            &self,
+            _key: &ReviewKey,
+            _reviewed: bool,
+        ) -> Result<ReviewMarks, ReviewStateError> {
+            Err(ReviewStateError::Write(
+                std::io::ErrorKind::PermissionDenied,
+            ))
+        }
+    }
+
+    fn state_test_path() -> PathBuf {
+        let sequence = NEXT_STATE_TEST.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "reviewbox-app-state-{}-{sequence}.json",
+            std::process::id()
+        ))
+    }
+
     fn loaded_repository(name: &str, commits: Vec<Commit>) -> LoadedRepository {
         let id = name.bytes().map(u64::from).sum();
         LoadedRepository {
@@ -1500,5 +2037,270 @@ mod tests {
         assert_eq!(app.selected(Pane::Commit), 0);
         assert_eq!(app.live_state().unwrap().failures().len(), 3);
         assert_eq!(app.live_state().unwrap().omitted_failures(), 2);
+    }
+
+    #[test]
+    fn live_detail_open_is_single_inflight_and_success_populates_files() {
+        let mut app = live_app_with(vec![Repository {
+            identity: repository_identity(41, "fixture/details"),
+            commits: commits(),
+        }]);
+        app.apply(Command::Open);
+        app.apply(Command::Open);
+        let (request_id, key) = take_request(&mut app);
+
+        app.apply(Command::Back);
+        app.apply(Command::Open);
+        assert!(app.take_detail_effects().is_empty());
+
+        app.apply_detail_result(DetailResult {
+            request_id,
+            key,
+            outcome: Ok(detail()),
+        });
+        assert_eq!(app.current_files().len(), 3);
+        assert!(matches!(
+            app.current_detail_state(),
+            Some(DetailState::Ready(_))
+        ));
+    }
+
+    #[test]
+    fn switching_commits_cancels_loading_and_stale_results_are_ignored() {
+        let mut app = live_app_with(vec![Repository {
+            identity: repository_identity(42, "fixture/stale"),
+            commits: commits(),
+        }]);
+        app.apply(Command::Open);
+        app.apply(Command::Open);
+        let (old_id, old_key) = take_request(&mut app);
+        app.apply(Command::Back);
+        app.apply(Command::MoveDown);
+        let effects = app.take_detail_effects();
+        assert!(matches!(
+            effects.as_slice(),
+            [DetailEffect::Cancel { request_id }] if *request_id == old_id
+        ));
+
+        app.apply(Command::Open);
+        let (new_id, new_key) = take_request(&mut app);
+        app.apply_detail_result(DetailResult {
+            request_id: old_id,
+            key: old_key.clone(),
+            outcome: Ok(detail()),
+        });
+        assert!(!app.detail_cache.contains_key(&old_key));
+        assert!(matches!(
+            app.detail_cache.get(&new_key),
+            Some(DetailState::Loading)
+        ));
+
+        app.apply_detail_result(DetailResult {
+            request_id: new_id,
+            key: new_key,
+            outcome: Ok(detail()),
+        });
+        assert_eq!(app.current_files().len(), 3);
+    }
+
+    #[test]
+    fn failed_details_can_retry_and_current_cancellation_returns_to_not_requested() {
+        let mut app = live_app_with(vec![Repository {
+            identity: repository_identity(43, "fixture/retry"),
+            commits: commits(),
+        }]);
+        app.apply(Command::Open);
+        app.apply(Command::Open);
+        let (failed_id, key) = take_request(&mut app);
+        app.apply_detail_result(DetailResult {
+            request_id: failed_id,
+            key: key.clone(),
+            outcome: Err(DetailFailure::ResponseTruncated),
+        });
+        assert!(matches!(
+            app.current_detail_state(),
+            Some(DetailState::Failed(_))
+        ));
+
+        app.apply(Command::Back);
+        app.apply(Command::Open);
+        let (retry_id, retry_key) = take_request(&mut app);
+        assert_ne!(retry_id, failed_id);
+        app.apply_detail_result(DetailResult {
+            request_id: retry_id,
+            key: retry_key,
+            outcome: Err(detail_failure(FailureCategory::Cancelled)),
+        });
+        assert!(app.current_detail_state().is_none());
+        assert_eq!(app.focus(), Pane::Commit);
+    }
+
+    #[test]
+    fn detail_cache_evicts_least_recent_entries_beyond_sixteen() {
+        let many_commits = (0..17)
+            .map(|index| {
+                commit(
+                    &format!("{index:040x}"),
+                    &format!("commit {index}"),
+                    Vec::new(),
+                )
+            })
+            .collect();
+        let mut app = live_app_with(vec![Repository {
+            identity: repository_identity(44, "fixture/cache"),
+            commits: many_commits,
+        }]);
+        app.apply(Command::Open);
+        let first_key = app.current_detail_key().unwrap();
+        for index in 0..17 {
+            app.select_commit(index);
+            app.apply(Command::Open);
+            let (request_id, key) = take_request(&mut app);
+            app.apply_detail_result(DetailResult {
+                request_id,
+                key,
+                outcome: Ok(detail()),
+            });
+            app.apply(Command::Back);
+        }
+
+        assert_eq!(app.detail_cache_len(), DETAIL_CACHE_CAPACITY);
+        assert!(!app.detail_cache.contains_key(&first_key));
+    }
+
+    #[test]
+    fn review_toggle_persists_in_memory_and_failed_save_keeps_mark_unchanged() {
+        let repository = Repository {
+            identity: repository_identity(51, "fixture/marks"),
+            commits: commits(),
+        };
+        let mut app = live_app_with(vec![repository.clone()]);
+        app.apply(Command::Open);
+        app.apply(Command::ToggleReviewed);
+        let commit = app.current_commit().unwrap();
+        assert!(app.is_reviewed(51, &commit.sha));
+        assert_eq!(app.status(), "Marked commit reviewed");
+        app.apply(Command::ToggleReviewed);
+        assert!(!app.is_reviewed(51, &app.current_commit().unwrap().sha));
+
+        let mut failed = App::with_review_store(
+            {
+                let mut inbox = app.inbox.clone();
+                inbox.repositories = vec![repository];
+                inbox
+            },
+            Box::new(FailingReviewStore),
+        );
+        failed.rebuild_projection(None);
+        failed.apply(Command::Open);
+        failed.apply(Command::ToggleReviewed);
+        assert!(!failed.is_reviewed(51, &failed.current_commit().unwrap().sha));
+        assert!(failed.status().contains("mark unchanged"));
+    }
+
+    #[test]
+    fn unavailable_store_rejects_marks_without_creating_demo_state() {
+        let mut inbox = live_app().inbox;
+        inbox.repositories = vec![Repository {
+            identity: repository_identity(52, "fixture/unavailable"),
+            commits: commits(),
+        }];
+        let mut app = App::with_review_store_result(inbox, Err(ReviewStateError::Unavailable));
+        app.apply(Command::Open);
+        app.apply(Command::ToggleReviewed);
+
+        assert!(app.review_warning().unwrap().contains("unavailable"));
+        assert!(app.status().contains("mark unchanged"));
+        assert!(!app.is_reviewed(52, &app.current_commit().unwrap().sha));
+    }
+
+    #[test]
+    fn remaining_filter_hides_reviewed_commits_and_empty_repositories() {
+        let mut app = live_app_with(vec![
+            Repository {
+                identity: repository_identity(61, "fixture/first"),
+                commits: vec![commits().remove(0)],
+            },
+            Repository {
+                identity: repository_identity(62, "fixture/second"),
+                commits: vec![commits().remove(1)],
+            },
+        ]);
+        app.apply(Command::Open);
+        app.apply(Command::ToggleReviewed);
+        app.apply(Command::ToggleRemaining);
+
+        assert_eq!(app.visible_repositories().len(), 1);
+        assert_eq!(app.current_repository().unwrap().identity.id, 62);
+        assert_eq!(app.current_commits().len(), 1);
+
+        app.apply(Command::ToggleReviewed);
+        assert!(app.all_reviewed_empty());
+        assert!(app.visible_repositories().is_empty());
+        assert_eq!(app.focus(), Pane::Repository);
+    }
+
+    #[test]
+    fn filtered_selection_survives_incremental_snapshot_reordering_by_identity() {
+        let mut app = live_app();
+        let mut repository = loaded_repository("fixture/reorder", commits());
+        let repository_id = repository.repository.identity.id;
+        app.apply_load_event(LoadEvent::RepositorySnapshot {
+            repository_index: 0,
+            repository: repository.clone(),
+        });
+        app.apply(Command::Open);
+        app.apply(Command::ToggleReviewed);
+        app.apply(Command::ToggleRemaining);
+        app.apply(Command::MoveDown);
+        let selected_sha = app.current_commit().unwrap().sha.clone();
+
+        repository.repository.commits.reverse();
+        app.apply_load_event(LoadEvent::RepositorySnapshot {
+            repository_index: 0,
+            repository,
+        });
+
+        assert_eq!(app.current_repository().unwrap().identity.id, repository_id);
+        assert_eq!(app.current_commit().unwrap().sha, selected_sha);
+    }
+
+    #[test]
+    fn file_store_marks_are_loaded_by_a_fresh_app_instance() {
+        let path = state_test_path();
+        let repository = Repository {
+            identity: repository_identity(71, "fixture/restart"),
+            commits: commits(),
+        };
+        let mut inbox = live_app().inbox;
+        inbox.repositories = vec![repository.clone()];
+        let mut first =
+            App::with_review_store(inbox, Box::new(FileReviewStore::at(&path).unwrap()));
+        first.apply(Command::Open);
+        first.apply(Command::ToggleReviewed);
+        assert!(path.exists());
+
+        let mut restarted = App::with_review_store(
+            live_app().inbox,
+            Box::new(FileReviewStore::at(&path).unwrap()),
+        );
+        restarted.apply(Command::ToggleRemaining);
+        restarted.apply_load_event(LoadEvent::RepositorySnapshot {
+            repository_index: 0,
+            repository: LoadedRepository {
+                repository,
+                branch_count: 1,
+                coverage: RepositoryCoverage::Complete,
+            },
+        });
+        assert_eq!(restarted.current_commits().len(), 2);
+        assert!(
+            !restarted
+                .current_commits()
+                .iter()
+                .any(|commit| commit.sha.starts_with("1111111"))
+        );
+
+        let _ = fs::remove_file(&path);
     }
 }

@@ -8,12 +8,13 @@ use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 
-use crate::app::{App, Input};
+use crate::app::{App, DetailEffect, DetailResult, Input};
 use crate::github::LoadEvent;
 use crate::render;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_LOADER_EVENTS_PER_TICK: usize = 32;
+const MAX_DETAIL_RESULTS_PER_TICK: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppEvent {
@@ -58,6 +59,25 @@ impl LoaderEventSource for NoLoaderEvents {
     }
 }
 
+pub trait DetailRequester {
+    fn request(&mut self, effect: DetailEffect);
+    fn cancel(&mut self, request_id: u64);
+    fn try_next(&mut self) -> Option<DetailResult>;
+    fn shutdown(&mut self);
+}
+
+#[derive(Default)]
+pub struct NoDetails;
+
+impl DetailRequester for NoDetails {
+    fn request(&mut self, _effect: DetailEffect) {}
+    fn cancel(&mut self, _request_id: u64) {}
+    fn try_next(&mut self) -> Option<DetailResult> {
+        None
+    }
+    fn shutdown(&mut self) {}
+}
+
 pub struct CrosstermEventSource;
 
 impl EventSource for CrosstermEventSource {
@@ -82,28 +102,32 @@ where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
     let mut loader = NoLoaderEvents;
-    run_with_loader(terminal, app, events, &mut loader)
+    let mut details = NoDetails;
+    run_with_loader(terminal, app, events, &mut loader, &mut details)
 }
 
-pub fn run_with_loader<B: Backend, E: EventSource, L: LoaderEventSource>(
+pub fn run_with_loader<B: Backend, E: EventSource, L: LoaderEventSource, D: DetailRequester>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     events: &mut E,
     loader: &mut L,
+    details: &mut D,
 ) -> io::Result<()>
 where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    let result = run_loop(terminal, app, events, loader);
+    let result = run_loop(terminal, app, events, loader, details);
     loader.cancel();
+    details.shutdown();
     result
 }
 
-fn run_loop<B: Backend, E: EventSource, L: LoaderEventSource>(
+fn run_loop<B: Backend, E: EventSource, L: LoaderEventSource, D: DetailRequester>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     events: &mut E,
     loader: &mut L,
+    details: &mut D,
 ) -> io::Result<()>
 where
     B::Error: std::error::Error + Send + Sync + 'static,
@@ -123,6 +147,8 @@ where
             }
         }
 
+        apply_detail_effects(app, details);
+
         if app.should_quit() {
             break;
         }
@@ -133,11 +159,28 @@ where
             };
             app.apply_load_event(event);
         }
+        apply_detail_effects(app, details);
+
+        for _ in 0..MAX_DETAIL_RESULTS_PER_TICK {
+            let Some(result) = details.try_next() else {
+                break;
+            };
+            app.apply_detail_result(result);
+        }
 
         draw(terminal, app)?;
     }
 
     Ok(())
+}
+
+fn apply_detail_effects<D: DetailRequester>(app: &mut App, details: &mut D) {
+    for effect in app.take_detail_effects() {
+        match effect {
+            request @ DetailEffect::Request { .. } => details.request(request),
+            DetailEffect::Cancel { request_id } => details.cancel(request_id),
+        }
+    }
 }
 
 fn draw<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()>
@@ -166,7 +209,10 @@ mod tests {
         FailureCategory, FailureScope, LoadFailure, LoadProgress, LoadStatus, LoadedRepository,
         RepositoryCoverage,
     };
-    use crate::inbox::{ChildPane, Commit, GitHubAuthor, Inbox, Repository, RepositoryIdentity};
+    use crate::inbox::{
+        ChildPane, Commit, CommitDetail, FileChange, FileStatus, GitHubAuthor, Inbox, Repository,
+        RepositoryIdentity,
+    };
     use chrono::{TimeZone, Utc};
     use ratatui::backend::TestBackend;
     use ratatui::{TerminalOptions, Viewport};
@@ -199,6 +245,58 @@ mod tests {
 
         fn cancel(&mut self) {
             self.cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    #[derive(Default)]
+    struct ScriptedDetails {
+        requests: Vec<u64>,
+        cancellations: Vec<u64>,
+        results: VecDeque<DetailResult>,
+        auto_succeed: bool,
+        shutdown: bool,
+    }
+
+    impl DetailRequester for ScriptedDetails {
+        fn request(&mut self, effect: DetailEffect) {
+            let DetailEffect::Request {
+                request_id, key, ..
+            } = effect
+            else {
+                return;
+            };
+            self.requests.push(request_id);
+            if self.auto_succeed {
+                self.results.push_back(DetailResult {
+                    request_id,
+                    key,
+                    outcome: Ok(CommitDetail {
+                        files: vec![FileChange {
+                            path: "src/live.rs".to_owned(),
+                            previous_path: None,
+                            status: FileStatus::Modified,
+                            additions: 1,
+                            deletions: 0,
+                            changes: 1,
+                            patch: crate::github::parse_patch_text("@@ -1 +1 @@\n+live details"),
+                        }],
+                        omitted_files: 0,
+                        more_files_available: false,
+                    }),
+                });
+            }
+        }
+
+        fn cancel(&mut self, request_id: u64) {
+            self.cancellations.push(request_id);
+        }
+
+        fn try_next(&mut self) -> Option<DetailResult> {
+            self.results.pop_front()
+        }
+
+        fn shutdown(&mut self) {
+            self.shutdown = true;
         }
     }
 
@@ -377,9 +475,16 @@ mod tests {
             Ok(None),
             Err(io::Error::other("stop after progress frame")),
         ]));
+        let mut details = NoDetails;
 
-        let error = run_with_loader(&mut terminal, &mut app, &mut events, &mut loader)
-            .expect_err("script stops loop");
+        let error = run_with_loader(
+            &mut terminal,
+            &mut app,
+            &mut events,
+            &mut loader,
+            &mut details,
+        )
+        .expect_err("script stops loop");
 
         assert_eq!(error.to_string(), "stop after progress frame");
         assert!(cancelled.load(Ordering::Acquire));
@@ -465,9 +570,16 @@ mod tests {
             Ok(Some(AppEvent::Resize(80, 20))),
             Ok(Some(AppEvent::Input(Input::Character('q')))),
         ]));
+        let mut details = NoDetails;
 
-        run_with_loader(&mut terminal, &mut app, &mut events, &mut loader)
-            .expect("event loop succeeds");
+        run_with_loader(
+            &mut terminal,
+            &mut app,
+            &mut events,
+            &mut loader,
+            &mut details,
+        )
+        .expect("event loop succeeds");
 
         assert!(cancelled.load(Ordering::Acquire));
         assert_eq!((app.terminal_width, app.terminal_height), (80, 20));
@@ -482,5 +594,105 @@ mod tests {
         assert!(output.contains("HTTP 403"));
         assert!(output.contains("browsable partial"));
         assert!(!output.contains("COMPLETE — daily inbox loaded"));
+    }
+
+    #[test]
+    fn event_loop_dispatches_one_detail_request_and_renders_the_result() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = live_app();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut loader = ScriptedLoader {
+            events: VecDeque::from([
+                Some(LoadEvent::RepositorySnapshot {
+                    repository_index: 0,
+                    repository: loaded(
+                        "fixture/details",
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "responsive details",
+                    ),
+                }),
+                None,
+            ]),
+            cancelled: Arc::clone(&cancelled),
+        };
+        let mut details = ScriptedDetails {
+            auto_succeed: true,
+            ..ScriptedDetails::default()
+        };
+        let mut events = ScriptedEvents(VecDeque::from([
+            Ok(None),
+            Ok(Some(AppEvent::Input(Input::Character('l')))),
+            Ok(Some(AppEvent::Input(Input::Enter))),
+            Ok(Some(AppEvent::Input(Input::Escape))),
+            Ok(Some(AppEvent::Input(Input::Enter))),
+            Ok(Some(AppEvent::Input(Input::Character('q')))),
+        ]));
+
+        run_with_loader(
+            &mut terminal,
+            &mut app,
+            &mut events,
+            &mut loader,
+            &mut details,
+        )
+        .expect("detail workflow succeeds");
+
+        assert_eq!(
+            details.requests.len(),
+            1,
+            "cached re-open must not duplicate"
+        );
+        assert!(details.cancellations.is_empty());
+        assert!(details.shutdown);
+        assert!(cancelled.load(Ordering::Acquire));
+        assert_eq!(
+            app.current_file().map(|file| file.path.as_str()),
+            Some("src/live.rs")
+        );
+        assert!(buffer_text(&terminal).contains("src/live.rs"));
+    }
+
+    #[test]
+    fn quitting_cancels_and_shuts_down_active_detail_work() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = live_app();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut loader = ScriptedLoader {
+            events: VecDeque::from([
+                Some(LoadEvent::RepositorySnapshot {
+                    repository_index: 0,
+                    repository: loaded(
+                        "fixture/cancel",
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "cancel details",
+                    ),
+                }),
+                None,
+            ]),
+            cancelled: Arc::clone(&cancelled),
+        };
+        let mut details = ScriptedDetails::default();
+        let mut events = ScriptedEvents(VecDeque::from([
+            Ok(None),
+            Ok(Some(AppEvent::Input(Input::Character('l')))),
+            Ok(Some(AppEvent::Input(Input::Enter))),
+            Ok(Some(AppEvent::Input(Input::Character('q')))),
+        ]));
+
+        run_with_loader(
+            &mut terminal,
+            &mut app,
+            &mut events,
+            &mut loader,
+            &mut details,
+        )
+        .expect("quit succeeds");
+
+        assert_eq!(details.requests.len(), 1);
+        assert_eq!(details.cancellations, details.requests);
+        assert!(details.shutdown);
+        assert!(cancelled.load(Ordering::Acquire));
     }
 }

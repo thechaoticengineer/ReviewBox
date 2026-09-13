@@ -6,8 +6,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::app::{App, HELP_BINDINGS, LivePhase, MIN_FULL_HEIGHT, MIN_FULL_WIDTH, Mode, Pane};
 use crate::day::TimezoneSource;
-use crate::github::FailureCategory;
-use crate::inbox::{DiffLineKind, InboxSource};
+use crate::github::{DetailFailure, DetailState, FailureCategory};
+use crate::inbox::{DiffLineKind, InboxSource, PatchContent};
 
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
@@ -24,17 +24,14 @@ fn draw_panes(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(8), Constraint::Length(1)])
         .split(area);
-    match app.inbox().source {
-        InboxSource::Demo => draw_demo_panes(frame, rows[0], app),
-        InboxSource::Live { .. } => draw_live_panes(frame, rows[0], app),
-    }
+    draw_review_panes(frame, rows[0], app);
     draw_status(frame, rows[1], app);
 }
 
-fn draw_demo_panes(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_review_panes(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
         .split(area);
     let left = Layout::default()
         .direction(Direction::Vertical)
@@ -50,12 +47,15 @@ fn draw_demo_panes(frame: &mut Frame<'_>, area: Rect, app: &App) {
         left[0],
         Pane::Repository,
         app,
-        app.inbox()
-            .repositories
+        app.visible_repositories()
             .iter()
-            .map(|repository| repository.display_name())
+            .map(|repository| sanitize_display_text(&repository.display_name()))
             .collect(),
-        "repositories",
+        if app.all_reviewed_empty() {
+            "remaining commits — ALL REVIEWED"
+        } else {
+            "repositories"
+        },
     );
     draw_list_pane(
         frame,
@@ -64,7 +64,13 @@ fn draw_demo_panes(frame: &mut Frame<'_>, area: Rect, app: &App) {
         app,
         app.current_commits()
             .iter()
-            .map(|commit| commit.label())
+            .map(|commit| {
+                let reviewed = app
+                    .current_repository()
+                    .is_some_and(|repository| app.is_reviewed(repository.identity.id, &commit.sha));
+                let marker = if reviewed { "✓ " } else { "  " };
+                format!("{marker}{}", sanitize_display_text(&commit.label()))
+            })
             .collect(),
         "commits",
     );
@@ -75,47 +81,11 @@ fn draw_demo_panes(frame: &mut Frame<'_>, area: Rect, app: &App) {
         app,
         app.current_files()
             .iter()
-            .map(|file| file.path.to_owned())
+            .map(|file| sanitize_display_text(&file.path))
             .collect(),
         "files",
     );
     draw_diff_pane(frame, columns[1], app);
-}
-
-fn draw_live_panes(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
-        .split(area);
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(columns[0]);
-
-    draw_list_pane(
-        frame,
-        left[0],
-        Pane::Repository,
-        app,
-        app.inbox()
-            .repositories
-            .iter()
-            .map(|repository| repository.display_name())
-            .collect(),
-        "repositories yet",
-    );
-    draw_list_pane(
-        frame,
-        left[1],
-        Pane::Commit,
-        app,
-        app.current_commits()
-            .iter()
-            .map(|commit| commit.label())
-            .collect(),
-        "commits for this repository",
-    );
-    draw_live_summary(frame, columns[1], app);
 }
 
 fn draw_live_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -203,6 +173,17 @@ fn draw_live_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(Color::Yellow),
         ));
     }
+    if let Some(warning) = app.review_warning() {
+        lines.push(Line::styled(
+            format!("Review progress warning: {warning}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    lines.push(Line::raw(if app.remaining_only() {
+        "Inbox filter: remaining commits only"
+    } else {
+        "Inbox filter: all commits"
+    }));
     if !state.failures().is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
@@ -222,19 +203,11 @@ fn draw_live_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
             )));
         }
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "Live file and diff loading is not available yet.",
-        Style::default().fg(Color::DarkGray),
-    ));
-
     frame.render_widget(
         Paragraph::new(lines)
             .block(
-                Block::default()
-                    .title(" GitHub daily inbox ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
+                pane_block(Pane::Diff, app.focus() == Pane::Diff, app)
+                    .title(" Diff — GitHub daily inbox "),
             )
             .wrap(Wrap { trim: true }),
         area,
@@ -316,43 +289,135 @@ fn draw_list_pane(
 }
 
 fn draw_diff_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let lines = if app.current_diff_lines().is_empty() {
-        let unavailable = !app.inbox().child_panes_available();
+    if matches!(app.inbox().source, InboxSource::Live { .. })
+        && app.current_detail_state().is_none()
+    {
+        draw_live_summary(frame, area, app);
+        return;
+    }
+
+    let lines = if matches!(app.current_detail_state(), Some(DetailState::Loading)) {
         vec![Line::styled(
-            if unavailable {
-                "  (file and diff content are unavailable for the live inbox)"
-            } else {
-                "  (no diff content in this fixture)"
-            },
+            "  Loading commit details…",
+            Style::default().fg(Color::Cyan),
+        )]
+    } else if let Some(DetailState::Failed(failure)) = app.current_detail_state() {
+        let label = match failure {
+            DetailFailure::ResponseTruncated => {
+                "ResponseTruncated — commit response exceeded the local size limit".to_owned()
+            }
+            DetailFailure::Load(failure) => format!("Failed — {failure}"),
+        };
+        vec![Line::styled(
+            format!("  {label}"),
+            Style::default().fg(Color::Red),
+        )]
+    } else if let Some(file) = app.current_file() {
+        match &file.patch {
+            PatchContent::Empty => vec![Line::styled(
+                "  Empty patch — GitHub returned no diff lines",
+                Style::default().fg(Color::DarkGray),
+            )],
+            PatchContent::Unavailable => vec![Line::styled(
+                "  Unavailable — binary or API-omitted patch",
+                Style::default().fg(Color::Yellow),
+            )],
+            PatchContent::Text { .. } | PatchContent::Capped { .. } => diff_lines(app),
+        }
+    } else if matches!(app.current_detail_state(), Some(DetailState::Ready(_))) {
+        vec![Line::styled(
+            "  (no changed files returned for this commit)",
+            Style::default().fg(Color::DarkGray),
+        )]
+    } else if app.current_diff_lines().is_empty() {
+        vec![Line::styled(
+            "  (no diff content in this fixture)",
             Style::default().fg(Color::DarkGray),
         )]
     } else {
-        app.current_diff_lines()
-            .iter()
-            .enumerate()
-            .skip(app.scroll(Pane::Diff))
-            .map(|(index, content)| {
-                let color = match content.kind {
-                    DiffLineKind::Hunk => Color::Cyan,
-                    DiffLineKind::Addition => Color::Green,
-                    DiffLineKind::Deletion => Color::Red,
-                    _ => Color::Reset,
-                };
-                Line::from(vec![
-                    Span::styled(
-                        format!("{:>4} ", index + 1),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(content.text.clone(), Style::default().fg(color)),
-                ])
-            })
-            .collect()
+        diff_lines(app)
     };
 
     frame.render_widget(
         Paragraph::new(lines).block(pane_block(Pane::Diff, app.focus() == Pane::Diff, app)),
         area,
     );
+}
+
+fn diff_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines: Vec<_> = app
+        .current_diff_lines()
+        .iter()
+        .enumerate()
+        .skip(app.scroll(Pane::Diff))
+        .map(|(index, content)| {
+            let color = match content.kind {
+                DiffLineKind::Hunk => Color::Cyan,
+                DiffLineKind::Addition => Color::Green,
+                DiffLineKind::Deletion => Color::Red,
+                _ => Color::Reset,
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!("{:>4} ", index + 1),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(content.text.clone(), Style::default().fg(color)),
+            ])
+        })
+        .collect();
+    if let Some(file) = app.current_file()
+        && let PatchContent::Capped {
+            omitted_lines,
+            omitted_bytes,
+            ..
+        } = &file.patch
+    {
+        lines.insert(
+            0,
+            Line::styled(
+                format!(
+                    "… locally truncated: {omitted_lines} lines and {omitted_bytes} bytes omitted"
+                ),
+                Style::default().fg(Color::Yellow),
+            ),
+        );
+    }
+    if let Some(DetailState::Ready(detail)) = app.current_detail_state()
+        && (detail.omitted_files > 0 || detail.more_files_available)
+    {
+        let suffix = if detail.more_files_available {
+            "; additional GitHub pages are unavailable"
+        } else {
+            ""
+        };
+        lines.insert(
+            0,
+            Line::styled(
+                format!(
+                    "… incomplete file list: {} files omitted{suffix}",
+                    detail.omitted_files
+                ),
+                Style::default().fg(Color::Yellow),
+            ),
+        );
+    }
+    lines
+}
+
+fn sanitize_display_text(value: &str) -> String {
+    let value = value.strip_suffix('\r').unwrap_or(value);
+    let mut sanitized = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character == '\t' {
+            sanitized.push_str("    ");
+        } else if character.is_control() {
+            sanitized.push('\u{fffd}');
+        } else {
+            sanitized.push(character);
+        }
+    }
+    sanitized
 }
 
 fn pane_block<'a>(pane: Pane, focused: bool, app: &App) -> Block<'a> {
@@ -377,17 +442,21 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Mode::SearchEntry { .. } => " SEARCH ",
         Mode::Help { .. } => " HELP ",
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(mode, Style::default().fg(Color::Black).bg(Color::Cyan)),
-            Span::raw(format!(
-                " {} • {} • h/l focus • j/k move • gg/G ends • ^d/^u half • / search • ? help • q quit",
-                app.focus().title(),
-                app.status()
-            )),
-        ])),
-        area,
-    );
+    let mut spans = vec![
+        Span::styled(mode, Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Span::raw(format!(
+            " {} • {} • h/l focus • j/k move • m reviewed • f remaining • / search • ? help • q quit",
+            app.focus().title(),
+            app.status()
+        )),
+    ];
+    if let Some(warning) = app.review_warning() {
+        spans.push(Span::styled(
+            format!(" • REVIEW STATE WARNING: {warning}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_compact(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -400,9 +469,13 @@ fn draw_compact(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Mode::SearchEntry { .. } => "SEARCH",
         Mode::Help { .. } => "HELP",
     };
+    let warning = app
+        .review_warning()
+        .map(|warning| format!("\nREVIEW STATE WARNING: {warning}"))
+        .unwrap_or_default();
     let message = Paragraph::new(format!(
-        "{mode} • {}\nterminal too small for panes\nresize to at least 60×16\n/ search • ? help • Esc back • q quit",
-        app.focus().title()
+        "{mode} • {}\nterminal too small for panes\nresize to at least 60×16\nm reviewed • f remaining • / search • ? help • q quit{warning}",
+        app.focus().title(),
     ))
     .block(block)
     .wrap(Wrap { trim: true });
@@ -486,13 +559,18 @@ fn centered_rect(area: Rect, desired_width: u16, desired_height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{Command, Input};
+    use crate::app::{Command, DetailEffect, DetailResult, Input};
     use crate::fixture::DemoFixture;
     use crate::github::{
         FailureScope, LoadEvent, LoadFailure, LoadProgress, LoadStatus, LoadedRepository,
         RepositoryCoverage,
     };
-    use crate::inbox::{Inbox, Repository, RepositoryIdentity};
+    use crate::inbox::{
+        ChildPane, Commit, CommitDetail, FileChange, FileStatus, GitHubAuthor, Inbox, PatchContent,
+        Repository, RepositoryIdentity,
+    };
+    use crate::review_state::ReviewStateError;
+    use chrono::{TimeZone, Utc};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -533,6 +611,47 @@ mod tests {
             progress: LoadProgress::default(),
         });
         app
+    }
+
+    fn live_commit_app() -> App {
+        let mut app = live_app();
+        app.apply_load_event(LoadEvent::RepositorySnapshot {
+            repository_index: 0,
+            repository: LoadedRepository {
+                repository: Repository {
+                    identity: RepositoryIdentity {
+                        id: 88,
+                        owner: "fixture".to_owned(),
+                        name: "details".to_owned(),
+                    },
+                    commits: vec![Commit {
+                        sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                        subject: "render live detail".to_owned(),
+                        author: GitHubAuthor {
+                            login: "fixture-user".to_owned(),
+                        },
+                        authored_at: Utc.with_ymd_and_hms(2024, 1, 15, 12, 0, 0).unwrap(),
+                        files: ChildPane::Unavailable,
+                    }],
+                },
+                branch_count: 1,
+                coverage: RepositoryCoverage::Complete,
+            },
+        });
+        app
+    }
+
+    fn request_identity(app: &mut App) -> (u64, crate::app::DetailKey) {
+        let effects = app.take_detail_effects();
+        let [
+            DetailEffect::Request {
+                request_id, key, ..
+            },
+        ] = effects.as_slice()
+        else {
+            panic!("expected detail request");
+        };
+        (*request_id, key.clone())
     }
 
     #[test]
@@ -732,5 +851,66 @@ mod tests {
         assert!(output.contains("incomplete coverage"));
         assert!(!output.contains("COMPLETE — daily inbox loaded"));
         assert!(!output.contains("EMPTY DAY"));
+    }
+
+    #[test]
+    fn live_detail_states_are_explicit_in_the_unified_four_pane_layout() {
+        let mut app = live_commit_app();
+        app.apply(Command::Open);
+        app.apply(Command::Open);
+        let (request_id, key) = request_identity(&mut app);
+        let loading = rendered_text(&mut app, 120, 32);
+        for pane in ["Repository", "Commit", "File", "Diff"] {
+            assert!(loading.contains(pane), "missing {pane}");
+        }
+        assert!(loading.contains("Loading commit details"));
+
+        app.apply_detail_result(DetailResult {
+            request_id,
+            key,
+            outcome: Err(DetailFailure::ResponseTruncated),
+        });
+        assert!(rendered_text(&mut app, 120, 32).contains("ResponseTruncated"));
+
+        app.apply(Command::Back);
+        app.apply(Command::Open);
+        let (request_id, key) = request_identity(&mut app);
+        app.apply_detail_result(DetailResult {
+            request_id,
+            key,
+            outcome: Ok(CommitDetail {
+                files: vec![FileChange {
+                    path: "assets/image.bin".to_owned(),
+                    previous_path: None,
+                    status: FileStatus::Modified,
+                    additions: 0,
+                    deletions: 0,
+                    changes: 0,
+                    patch: PatchContent::Unavailable,
+                }],
+                omitted_files: 0,
+                more_files_available: false,
+            }),
+        });
+        let unavailable = rendered_text(&mut app, 120, 32);
+        assert!(unavailable.contains("assets/image.bin"));
+        assert!(unavailable.contains("Unavailable"));
+    }
+
+    #[test]
+    fn reviewed_marker_filter_empty_state_and_store_warning_are_visible() {
+        let mut app = live_commit_app();
+        app.apply(Command::Open);
+        app.apply(Command::ToggleReviewed);
+        assert!(rendered_text(&mut app, 120, 32).contains("✓"));
+        app.apply(Command::ToggleRemaining);
+        assert!(rendered_text(&mut app, 120, 32).contains("ALL REVIEWED"));
+
+        let inbox = live_app().inbox().clone();
+        let mut unavailable =
+            App::with_review_store_result(inbox, Err(ReviewStateError::Unavailable));
+        let output = rendered_text(&mut unavailable, 160, 32);
+        assert!(output.contains("REVIEW STATE WARNING"));
+        assert!(output.contains("Selected day: 2024-01-15"));
     }
 }

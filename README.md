@@ -4,7 +4,7 @@ A keyboard-first terminal review inbox for commits across GitHub projects.
 
 See [PRODUCT.md](PRODUCT.md) for the accepted requirements and delivery order.
 
-## Current status: asynchronous daily GitHub inbox
+## Current status: live diff review workflow
 
 Implemented now:
 
@@ -64,23 +64,29 @@ Implemented now:
   missing-`gh`, permission, and rate-limit outcomes.
 - Cancellation on quit. ReviewBox stops consuming updates, signals the loader,
   and kills and reaps an active `gh` subprocess before terminal teardown.
-- A focused review-progress store is implemented and tested. It records only
+- Live commits open into file and diff panes through an asynchronous, on-demand
+  detail request. Repeated opens share the active or cached result, changing the
+  selection rejects stale results, and a 16-commit session cache bounds retained
+  details. Loading, request failure, response truncation, unavailable/binary
+  patches, empty patches, locally capped patches, and incomplete file lists are
+  shown explicitly.
+- Reviewed marks are active in the live UI. The review-progress store records only
   GitHub numeric repository IDs and complete lowercase commit SHAs in a
   deterministic, versioned JSON file at
   `$XDG_DATA_HOME/reviewbox/review-state.json`, or
   `$HOME/.local/share/reviewbox/review-state.json` when XDG data home is not an
   absolute path. Updates use same-directory atomic replacement and refuse to
-  overwrite malformed or unsupported state. The live UI does not construct this
-  store until the next workflow-wiring increment.
+  overwrite malformed or unsupported state. Marks load before the terminal UI,
+  remain visible in the unfiltered inbox, and a failed save leaves the displayed
+  mark unchanged with an error. The remaining-only view hides reviewed commits
+  and repositories without remaining work and reports an explicit all-reviewed
+  state.
 
 Planned for later delivery increments, and not implemented yet:
 
-- Reviewed/unreviewed controls, saved-state restoration in the live UI, and the
-  remaining-commits filter.
-- Wiring live repository/commit/file navigation to the on-demand detail loader
-  and rendering its real GitHub diffs.
 - Drafting, editing, persistence, and publishing of comments.
 - Repeated-match navigation with `n` / `N`.
+- Soft-wrapped diff layout and polished repeated-match navigation.
 
 ## Launch configuration and demo
 
@@ -123,8 +129,9 @@ read-only `gh api --method GET` request. Press `q` or `Ctrl-c` at any time to
 cancel loading and exit.
 
 The demo needs no GitHub authentication. It performs no network requests or
-network writes and does not persist runtime state. All repository names, commit
-IDs, files, and diff-like content are fictional.
+network writes and does not persist runtime state; reviewed marks exist only in
+memory for that process. All repository names, commit IDs, files, and diff-like
+content are fictional.
 
 Run the same fixture/state/rendering integration noninteractively with:
 
@@ -155,7 +162,8 @@ Normal mode:
 - `Ctrl-d` / `Ctrl-u`: move down / up by half of the focused pane's usable
   height, with a minimum movement of one.
 - `Enter`: descend from repository to commit to file to diff when a child is
-  available.
+  available. Opening a live commit starts its detail request without blocking
+  input; a failed request can be retried with `Enter`.
 - `Escape`: return to the parent pane. At the repository pane it stays put and
   never quits unexpectedly.
 - `/`: enter search-entry mode for the focused pane. Typed characters—including
@@ -165,6 +173,10 @@ Normal mode:
   unchanged and report their result in the status line.
 - `?`: open contextual keyboard help. `Escape` closes it and restores the prior
   pane focus.
+- `m`: toggle the selected commit reviewed/unreviewed from the commit, file, or
+  diff pane. Live changes are reported only after the state file is saved.
+- `f`: toggle between all commits and remaining commits. This view preference is
+  intentionally not persisted.
 - `q`: quit from normal mode and restore the terminal.
 - `Ctrl-c`: quit globally, including from search or help, and restore the
   terminal.
@@ -229,10 +241,11 @@ bodies, stderr, repository names, branches, SHAs, or subjects.
 
 The terminal displays at most three sanitized failure details and reports how
 many more were omitted. An incomplete result is never labeled complete or as a
-truly empty day. Live navigation intentionally stops at the commit pane in this
-increment; the on-demand detail boundary is implemented and tested but is not
-yet connected to terminal navigation. `--demo` retains the complete fictional
-repository/commit/file/diff experience and uses the same typed patch parser.
+truly empty day. Live and demo modes use the same four-pane
+repository/commit/file/diff workflow and typed patch model. Commit details are
+requested only when a live commit is explicitly opened; file lists beyond 300
+entries and command responses beyond 16 MiB are disclosed as incomplete rather
+than presented as complete.
 
 Implementation assumptions were checked against the official GitHub
 documentation for the [authenticated user](https://docs.github.com/en/rest/users/users#get-the-authenticated-user),
