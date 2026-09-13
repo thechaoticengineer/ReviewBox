@@ -1,8 +1,9 @@
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 
 use crate::app::{
     App, CommentListState, HELP_BINDINGS, LivePhase, MIN_FULL_HEIGHT, MIN_FULL_WIDTH, Mode, Pane,
@@ -1076,12 +1077,11 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let narrow = inner.width < 28;
     let header_rows = u16::from(!narrow && inner.height > 0);
-    let footer_rows = if narrow {
+    let mut footer_rows = if narrow {
         inner.height.min(2)
     } else {
         u16::from(inner.height > 1)
     };
-    let content_height = inner.height.saturating_sub(header_rows + footer_rows);
     frame.render_widget(
         Paragraph::new("Normal bindings first; prefixed modes isolate their keys")
             .style(Style::default().add_modifier(Modifier::BOLD)),
@@ -1105,31 +1105,77 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ])
         })
         .collect::<Vec<_>>();
+    let content_height = inner.height.saturating_sub(header_rows + footer_rows);
+    let needs_larger_terminal = content_height > 0
+        && lines
+            .iter()
+            .any(|line| help_line_overflows(line, inner.width, content_height));
+    if needs_larger_terminal {
+        footer_rows = u16::from(inner.height > header_rows);
+    }
+    let content_height = inner.height.saturating_sub(header_rows + footer_rows);
 
     if content_height > 0 {
-        frame.render_widget(
-            Paragraph::new(lines)
-                .scroll((u16::try_from(app.help_scroll()).unwrap_or(u16::MAX), 0))
-                .wrap(Wrap { trim: false }),
-            Rect::new(
-                inner.x,
-                inner.y.saturating_add(header_rows),
-                inner.width,
-                content_height,
-            ),
+        let content = Rect::new(
+            inner.x,
+            inner.y.saturating_add(header_rows),
+            inner.width,
+            content_height,
         );
+        if needs_larger_terminal {
+            frame.render_widget(
+                Paragraph::new("Enlarge terminal\nto read help")
+                    .style(Style::default().fg(Color::Yellow)),
+                content,
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(
+                    lines
+                        .into_iter()
+                        .skip(app.help_scroll())
+                        .collect::<Vec<_>>(),
+                )
+                .wrap(Wrap { trim: false }),
+                content,
+            );
+        }
     }
     if footer_rows > 0 {
-        let footer = if footer_rows == 2 {
+        let footer = if needs_larger_terminal {
+            vec![Line::raw("Esc close")]
+        } else if footer_rows == 2 {
             vec![Line::raw("j/k scroll"), Line::raw("Esc close")]
         } else {
             vec![Line::raw("j/k scroll • Esc close")]
         };
         frame.render_widget(
             Paragraph::new(footer).style(Style::default().fg(Color::Cyan)),
-            Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+            Rect::new(
+                inner.x,
+                inner.bottom().saturating_sub(footer_rows),
+                inner.width,
+                footer_rows,
+            ),
         );
     }
+}
+
+fn help_line_overflows(line: &Line<'_>, width: u16, height: u16) -> bool {
+    if width == 0 || height == 0 {
+        return true;
+    }
+
+    let area = Rect::new(0, 0, width, 1);
+    let mut buffer = Buffer::empty(area);
+    Widget::render(
+        Paragraph::new(line.clone())
+            .wrap(Wrap { trim: false })
+            .scroll((height, 0)),
+        area,
+        &mut buffer,
+    );
+    buffer.content.iter().any(|cell| cell.symbol() != " ")
 }
 
 fn modal_block<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
@@ -1471,29 +1517,48 @@ mod tests {
     }
 
     #[test]
-    fn help_remains_complete_and_scrollable_at_minimum_supported_size() {
+    fn help_remains_complete_and_scrollable_at_boundary_sizes() {
+        fn searchable_text(text: &str) -> String {
+            text.chars()
+                .filter(|character| {
+                    !character.is_whitespace() && !('\u{2500}'..='\u{257f}').contains(character)
+                })
+                .collect()
+        }
+
+        for (width, height) in [(MIN_FULL_WIDTH, MIN_FULL_HEIGHT), (40, 8), (29, 10)] {
+            let mut app = App::new(DemoFixture::load());
+            app.handle_input(Input::Character('?'));
+            let mut frames = Vec::new();
+
+            for _ in 0..HELP_BINDINGS.len() {
+                frames.push(searchable_text(&rendered_text(&mut app, width, height)));
+                app.handle_input(Input::Character('j'));
+            }
+
+            for binding in HELP_BINDINGS {
+                let keys = searchable_text(binding.keys);
+                let action = searchable_text(binding.action);
+                assert!(
+                    frames
+                        .iter()
+                        .any(|frame| frame.contains(&keys) && frame.contains(&action)),
+                    "help at {width}x{height} never shows complete binding {:?} / {:?}",
+                    binding.keys,
+                    binding.action
+                );
+            }
+            let visited = frames.concat();
+            assert!(visited.contains(&searchable_text("j/k scroll")));
+            assert!(visited.contains(&searchable_text("Esc close")));
+            assert!(matches!(app.mode(), Mode::Help { .. }));
+        }
+
         let mut app = App::new(DemoFixture::load());
         app.handle_input(Input::Character('?'));
-        let mut visited = String::new();
-
-        for _ in 0..HELP_BINDINGS.len() {
-            visited.push_str(&rendered_text(&mut app, MIN_FULL_WIDTH, MIN_FULL_HEIGHT));
-            app.handle_input(Input::Character('j'));
-        }
-
-        for binding in HELP_BINDINGS {
-            assert!(
-                visited.contains(binding.keys),
-                "minimum-size help is missing {}",
-                binding.keys
-            );
-            assert!(
-                visited.contains(binding.action),
-                "minimum-size help is missing {}",
-                binding.action
-            );
-        }
-        assert!(visited.contains("j/k scroll"));
+        let output = searchable_text(&rendered_text(&mut app, 20, 5));
+        assert!(output.contains(&searchable_text("Enlarge terminal to read help")));
+        assert!(output.contains(&searchable_text("Esc close")));
         assert!(matches!(app.mode(), Mode::Help { .. }));
     }
 
@@ -1526,7 +1591,7 @@ mod tests {
         for (name, expected) in [
             ("normal", "terminal too small"),
             ("search", "Enter"),
-            ("help", "j/k"),
+            ("help", "Esc close"),
             ("edit", "Esc"),
             ("comments", "j/k"),
             ("publish", "Press y"),
@@ -1544,6 +1609,12 @@ mod tests {
                     output.contains(expected),
                     "{name} at {width}x{height} lost {expected:?}"
                 );
+                if name == "help" {
+                    assert!(
+                        output.contains("Esc close"),
+                        "help at {width}x{height} lost the close hint"
+                    );
+                }
             }
         }
     }
