@@ -539,6 +539,7 @@ mod tests {
         RepositoryIdentity,
     };
     use crate::review_state::MemoryReviewStore;
+    use crate::terminal::{TerminalOps, with_terminal_session};
     use chrono::{TimeZone, Utc};
     use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
     use ratatui::buffer::Cell;
@@ -609,6 +610,70 @@ mod tests {
 
         fn flush(&mut self) -> Result<(), Self::Error> {
             self.inner.flush()
+        }
+    }
+
+    struct FailingDrawBackend {
+        inner: TestBackend,
+    }
+
+    fn impossible_backend_error(error: Infallible) -> io::Error {
+        match error {}
+    }
+
+    impl Backend for FailingDrawBackend {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, _content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            Err(io::Error::other("forced draw failure"))
+        }
+
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.hide_cursor().map_err(impossible_backend_error)
+        }
+
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.show_cursor().map_err(impossible_backend_error)
+        }
+
+        fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+            self.inner
+                .get_cursor_position()
+                .map_err(impossible_backend_error)
+        }
+
+        fn set_cursor_position<P: Into<Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), Self::Error> {
+            self.inner
+                .set_cursor_position(position)
+                .map_err(impossible_backend_error)
+        }
+
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            self.inner.clear().map_err(impossible_backend_error)
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Self::Error> {
+            self.inner
+                .clear_region(clear_type)
+                .map_err(impossible_backend_error)
+        }
+
+        fn size(&self) -> Result<Size, Self::Error> {
+            self.inner.size().map_err(impossible_backend_error)
+        }
+
+        fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+            self.inner.window_size().map_err(impossible_backend_error)
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.inner.flush().map_err(impossible_backend_error)
         }
     }
 
@@ -736,6 +801,146 @@ mod tests {
         cancelled: Arc<AtomicBool>,
     }
 
+    #[derive(Clone)]
+    struct LoopTerminalOps(Arc<Mutex<Vec<&'static str>>>);
+
+    impl TerminalOps for LoopTerminalOps {
+        fn enable_raw_mode(&mut self) -> io::Result<()> {
+            self.0.lock().unwrap().push("enable_raw");
+            Ok(())
+        }
+        fn enter_alternate_screen(&mut self) -> io::Result<()> {
+            self.0.lock().unwrap().push("enter_screen");
+            Ok(())
+        }
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            self.0.lock().unwrap().push("hide_cursor");
+            Ok(())
+        }
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.0.lock().unwrap().push("show_cursor");
+            Ok(())
+        }
+        fn leave_alternate_screen(&mut self) -> io::Result<()> {
+            self.0.lock().unwrap().push("leave_screen");
+            Ok(())
+        }
+        fn disable_raw_mode(&mut self) -> io::Result<()> {
+            self.0.lock().unwrap().push("disable_raw");
+            Ok(())
+        }
+    }
+
+    struct ResumeFailLoopOps {
+        log: Arc<Mutex<Vec<&'static str>>>,
+        raw_enable_count: usize,
+    }
+
+    impl ResumeFailLoopOps {
+        fn record(&mut self, operation: &'static str) -> io::Result<()> {
+            self.log.lock().unwrap().push(operation);
+            if operation == "enable_raw" {
+                self.raw_enable_count += 1;
+                if self.raw_enable_count == 2 {
+                    return Err(io::Error::other("forced editor resume failure"));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl TerminalOps for ResumeFailLoopOps {
+        fn enable_raw_mode(&mut self) -> io::Result<()> {
+            self.record("enable_raw")
+        }
+        fn enter_alternate_screen(&mut self) -> io::Result<()> {
+            self.record("enter_screen")
+        }
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            self.record("hide_cursor")
+        }
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.record("show_cursor")
+        }
+        fn leave_alternate_screen(&mut self) -> io::Result<()> {
+            self.record("leave_screen")
+        }
+        fn disable_raw_mode(&mut self) -> io::Result<()> {
+            self.record("disable_raw")
+        }
+    }
+
+    #[derive(Default)]
+    struct LifecycleDetails {
+        requested: usize,
+        active: usize,
+        cancelled: usize,
+        shutdown: bool,
+    }
+
+    impl DetailRequester for LifecycleDetails {
+        fn request(&mut self, effect: DetailEffect) {
+            if matches!(effect, DetailEffect::Request { .. }) {
+                self.requested += 1;
+                self.active += 1;
+            }
+        }
+
+        fn cancel(&mut self, _request_id: u64) {
+            if self.active > 0 {
+                self.active -= 1;
+                self.cancelled += 1;
+            }
+        }
+
+        fn try_next(&mut self) -> Option<DetailResult> {
+            None
+        }
+
+        fn shutdown(&mut self) {
+            self.cancelled += self.active;
+            self.active = 0;
+            self.shutdown = true;
+        }
+    }
+
+    #[derive(Default)]
+    struct LifecycleComments {
+        requested: usize,
+        active: usize,
+        cancelled: usize,
+        shutdown: bool,
+    }
+
+    impl CommentRequester for LifecycleComments {
+        fn request(&mut self, effect: CommentEffect) {
+            if matches!(
+                effect,
+                CommentEffect::Load { .. } | CommentEffect::Publish { .. }
+            ) {
+                self.requested += 1;
+                self.active += 1;
+            }
+        }
+
+        fn cancel(&mut self, _request_id: u64) {
+            if self.active > 0 {
+                self.active -= 1;
+                self.cancelled += 1;
+            }
+        }
+
+        fn try_next(&mut self) -> Option<CommentResult> {
+            None
+        }
+
+        fn shutdown(&mut self) {
+            self.cancelled += self.active;
+            self.active = 0;
+            self.shutdown = true;
+        }
+    }
+
     impl LoaderEventSource for ScriptedLoader {
         fn try_next(&mut self) -> Option<LoadEvent> {
             self.events.pop_front().flatten()
@@ -831,6 +1036,78 @@ mod tests {
             branch_count: 1,
             coverage: RepositoryCoverage::Complete,
         }
+    }
+
+    fn run_lifecycle_script(
+        scripted_events: VecDeque<io::Result<Option<AppEvent>>>,
+    ) -> (
+        io::Result<()>,
+        bool,
+        LifecycleDetails,
+        LifecycleComments,
+        Vec<&'static str>,
+        bool,
+    ) {
+        let terminal_log = Arc::new(Mutex::new(Vec::new()));
+        let ops = LoopTerminalOps(Arc::clone(&terminal_log));
+        let loader_cancelled = Arc::new(AtomicBool::new(false));
+        let mut loader = ScriptedLoader {
+            events: VecDeque::from([
+                Some(LoadEvent::RepositorySnapshot {
+                    repository_index: 0,
+                    repository: loaded(
+                        "fixture/lifecycle",
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "lifecycle fixture",
+                    ),
+                }),
+                None,
+            ]),
+            cancelled: Arc::clone(&loader_cancelled),
+        };
+        let mut details = LifecycleDetails::default();
+        let mut comments = LifecycleComments::default();
+        let mut app = live_app();
+        let mut events = ScriptedEvents(scripted_events);
+        let mut process = ScriptedEditorProcess {
+            log: Arc::clone(&terminal_log),
+            result: Ok(false),
+        };
+        let mut temp_files = ScriptedTempFiles {
+            create: Ok(PathBuf::from("/private/unused.md")),
+            read: Ok(String::new()),
+            cleaned: false,
+        };
+        let missing_editor = |_name: &str| None;
+
+        let result = with_terminal_session(ops, |terminal_session| {
+            let backend = TestBackend::new(80, 24);
+            let mut terminal = Terminal::new(backend).map_err(io::Error::other)?;
+            let mut editor = ExternalEditorSession::new(
+                terminal_session,
+                &mut process,
+                &mut temp_files,
+                &missing_editor,
+            );
+            run_with_services_and_editor(
+                &mut terminal,
+                &mut app,
+                &mut events,
+                &mut loader,
+                &mut details,
+                &mut comments,
+                &mut editor,
+            )
+        });
+        let terminal_calls = terminal_log.lock().unwrap().clone();
+        (
+            result,
+            loader_cancelled.load(Ordering::Acquire),
+            details,
+            comments,
+            terminal_calls,
+            app.should_quit(),
+        )
     }
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
@@ -1390,6 +1667,213 @@ mod tests {
         assert_eq!(details.cancellations, details.requests);
         assert!(details.shutdown);
         assert!(cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn normal_q_and_global_ctrl_c_cancel_all_workers_and_restore_terminal() {
+        for (name, tail) in [
+            (
+                "normal q",
+                vec![
+                    Ok(Some(AppEvent::Input(Input::Escape))),
+                    Ok(Some(AppEvent::Input(Input::Character('q')))),
+                ],
+            ),
+            (
+                "global Ctrl-c",
+                vec![Ok(Some(AppEvent::Input(Input::Quit)))],
+            ),
+        ] {
+            let mut events = VecDeque::from([
+                Ok(None),
+                Ok(Some(AppEvent::Input(Input::Character('l')))),
+                Ok(Some(AppEvent::Input(Input::Enter))),
+                Ok(Some(AppEvent::Input(Input::Character('C')))),
+            ]);
+            events.extend(tail);
+            let (result, loader_cancelled, details, comments, terminal_calls, quit) =
+                run_lifecycle_script(events);
+
+            result.unwrap_or_else(|error| panic!("{name} failed: {error}"));
+            assert!(quit, "{name} did not set the quit state");
+            assert!(loader_cancelled, "{name} did not cancel the loader");
+            assert_eq!((details.requested, details.cancelled), (1, 1), "{name}");
+            assert_eq!((comments.requested, comments.cancelled), (1, 1), "{name}");
+            assert!(details.shutdown && comments.shutdown, "{name}");
+            assert_eq!(
+                terminal_calls,
+                [
+                    "enable_raw",
+                    "enter_screen",
+                    "hide_cursor",
+                    "show_cursor",
+                    "leave_screen",
+                    "disable_raw",
+                ],
+                "{name} restored the terminal out of order"
+            );
+        }
+    }
+
+    #[test]
+    fn poll_error_cancels_all_workers_and_restores_terminal() {
+        let events = VecDeque::from([
+            Ok(None),
+            Ok(Some(AppEvent::Input(Input::Character('l')))),
+            Ok(Some(AppEvent::Input(Input::Enter))),
+            Ok(Some(AppEvent::Input(Input::Character('C')))),
+            Err(io::Error::other("forced poll failure")),
+        ]);
+        let (result, loader_cancelled, details, comments, terminal_calls, quit) =
+            run_lifecycle_script(events);
+
+        assert_eq!(result.unwrap_err().to_string(), "forced poll failure");
+        assert!(!quit);
+        assert!(loader_cancelled);
+        assert_eq!((details.requested, details.cancelled), (1, 1));
+        assert_eq!((comments.requested, comments.cancelled), (1, 1));
+        assert!(details.shutdown && comments.shutdown);
+        assert_eq!(
+            terminal_calls,
+            [
+                "enable_raw",
+                "enter_screen",
+                "hide_cursor",
+                "show_cursor",
+                "leave_screen",
+                "disable_raw",
+            ]
+        );
+    }
+
+    #[test]
+    fn draw_error_shuts_down_services_and_restores_terminal() {
+        let terminal_log = Arc::new(Mutex::new(Vec::new()));
+        let ops = LoopTerminalOps(Arc::clone(&terminal_log));
+        let loader_cancelled = Arc::new(AtomicBool::new(false));
+        let mut loader = ScriptedLoader {
+            events: VecDeque::new(),
+            cancelled: Arc::clone(&loader_cancelled),
+        };
+        let mut details = LifecycleDetails::default();
+        let mut comments = LifecycleComments::default();
+        let mut app = live_app();
+        let mut events = ScriptedEvents(VecDeque::new());
+        let mut process = ScriptedEditorProcess {
+            log: Arc::clone(&terminal_log),
+            result: Ok(false),
+        };
+        let mut temp_files = ScriptedTempFiles {
+            create: Ok(PathBuf::from("/private/unused.md")),
+            read: Ok(String::new()),
+            cleaned: false,
+        };
+        let missing_editor = |_name: &str| None;
+
+        let result = with_terminal_session(ops, |terminal_session| {
+            let backend = FailingDrawBackend {
+                inner: TestBackend::new(80, 24),
+            };
+            let mut terminal = Terminal::new(backend).map_err(io::Error::other)?;
+            let mut editor = ExternalEditorSession::new(
+                terminal_session,
+                &mut process,
+                &mut temp_files,
+                &missing_editor,
+            );
+            run_with_services_and_editor(
+                &mut terminal,
+                &mut app,
+                &mut events,
+                &mut loader,
+                &mut details,
+                &mut comments,
+                &mut editor,
+            )
+        });
+
+        assert_eq!(result.unwrap_err().to_string(), "forced draw failure");
+        assert!(loader_cancelled.load(Ordering::Acquire));
+        assert!(details.shutdown && comments.shutdown);
+        assert_eq!(
+            terminal_log.lock().unwrap().as_slice(),
+            [
+                "enable_raw",
+                "enter_screen",
+                "hide_cursor",
+                "show_cursor",
+                "leave_screen",
+                "disable_raw",
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_editor_resume_exits_with_raw_mode_disabled() {
+        let terminal_log = Arc::new(Mutex::new(Vec::new()));
+        let ops = ResumeFailLoopOps {
+            log: Arc::clone(&terminal_log),
+            raw_enable_count: 0,
+        };
+        let mut loader = NoLoaderEvents;
+        let mut details = NoDetails;
+        let mut comments = FakeComments::default();
+        let mut app = App::new(DemoFixture::load());
+        let mut events = ScriptedEvents(VecDeque::from([
+            Ok(Some(AppEvent::Input(Input::Character('l')))),
+            Ok(Some(AppEvent::Input(Input::Character('E')))),
+        ]));
+        let mut process = ScriptedEditorProcess {
+            log: Arc::clone(&terminal_log),
+            result: Ok(true),
+        };
+        let mut temp_files = ScriptedTempFiles {
+            create: Ok(PathBuf::from("/private/draft.md")),
+            read: Ok("fictional replacement".to_owned()),
+            cleaned: false,
+        };
+        let editor_lookup = |name: &str| (name == "VISUAL").then(|| OsString::from("nvim -f"));
+
+        let result = with_terminal_session(ops, |terminal_session| {
+            let backend = TestBackend::new(80, 24);
+            let mut terminal = Terminal::new(backend).map_err(io::Error::other)?;
+            let mut editor = ExternalEditorSession::new(
+                terminal_session,
+                &mut process,
+                &mut temp_files,
+                &editor_lookup,
+            );
+            run_with_services_and_editor(
+                &mut terminal,
+                &mut app,
+                &mut events,
+                &mut loader,
+                &mut details,
+                &mut comments,
+                &mut editor,
+            )
+        });
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "external editor terminal restoration failed"
+        );
+        assert!(temp_files.cleaned);
+        assert_eq!(app.draft_count(), 1);
+        assert_eq!(
+            terminal_log.lock().unwrap().as_slice(),
+            [
+                "enable_raw",
+                "enter_screen",
+                "hide_cursor",
+                "show_cursor",
+                "leave_screen",
+                "disable_raw",
+                "launch",
+                "enable_raw",
+            ],
+            "the failed resume must leave raw mode and the alternate screen disabled"
+        );
     }
 
     #[derive(Default)]

@@ -10,7 +10,8 @@ use crate::app::{
 use crate::comment_draft::CommentAnchor;
 use crate::day::TimezoneSource;
 use crate::github::{
-    DetailFailure, DetailState, ExistingCommentAnchor, FailureCategory, RESPONSE_TRUNCATED_LABEL,
+    CommentFailureKind, DetailFailure, DetailState, ExistingCommentAnchor, FailureCategory,
+    RESPONSE_TRUNCATED_LABEL,
 };
 use crate::inbox::{DiffLineKind, InboxSource, PatchContent};
 use crate::ui_layout::{ReviewPaneLayout, wrap_text};
@@ -46,7 +47,7 @@ fn draw_review_panes(frame: &mut Frame<'_>, layout: ReviewPaneLayout, app: &App)
             .map(|repository| sanitize_display_text(&repository.display_name()))
             .collect(),
         if app.all_reviewed_empty() {
-            "remaining commits — ALL REVIEWED"
+            "ALL REVIEWED — press f to show all commits"
         } else {
             "repositories"
         },
@@ -111,47 +112,74 @@ fn draw_live_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         ""
     };
-    let phase = match state.phase {
-        LivePhase::Authenticating => "Loading: checking gh authentication".to_owned(),
+    let (phase, action) = match state.phase {
+        LivePhase::Authenticating => (
+            "Loading: checking gh authentication".to_owned(),
+            "Ctrl-c cancels loading and exits".to_owned(),
+        ),
         LivePhase::Discovering {
             page,
             owned_repositories,
-        } => format!("Discovering repositories: page {page}, {owned_repositories} owned found"),
-        LivePhase::LoadingRepository { repository, total } => {
-            format!("Loading repository {repository}/{total}")
-        }
+        } => (
+            format!("Discovering repositories: page {page}, {owned_repositories} owned found"),
+            "Partial results appear as they arrive; Ctrl-c cancels and exits".to_owned(),
+        ),
+        LivePhase::LoadingRepository { repository, total } => (
+            format!("Loading repository {repository}/{total}"),
+            "Partial results remain browsable; Ctrl-c cancels and exits".to_owned(),
+        ),
         LivePhase::LoadingBranches {
             repository,
             page,
             branches,
-        } => {
-            format!("Discovering branches: repository {repository}, page {page}, {branches} found")
-        }
+        } => (
+            format!("Discovering branches: repository {repository}, page {page}, {branches} found"),
+            "Partial results remain browsable; Ctrl-c cancels and exits".to_owned(),
+        ),
         LivePhase::LoadingCommits {
             repository,
             branch,
             branches,
             page,
             accepted_commits,
-        } => format!(
-            "Loading commits: repository {repository}, branch {branch}/{branches}, page {}, {} accepted",
-            page.max(1),
-            accepted_commits
+        } => (
+            format!(
+                "Loading commits: repository {repository}, branch {branch}/{branches}, page {}, {} accepted",
+                page.max(1),
+                accepted_commits
+            ),
+            "Partial results remain browsable; Ctrl-c cancels and exits".to_owned(),
         ),
-        LivePhase::Complete => "COMPLETE — daily inbox loaded".to_owned(),
-        LivePhase::EmptyDay => "EMPTY DAY — no matching commits".to_owned(),
-        LivePhase::NoOwnedRepositories => {
-            "NO OWNED REPOSITORIES — nothing available to scan".to_owned()
+        LivePhase::Complete => (
+            "COMPLETE — daily inbox loaded".to_owned(),
+            "Use h/l and Enter to browse; q exits".to_owned(),
+        ),
+        LivePhase::EmptyDay => (
+            "EMPTY DAY — no matching commits".to_owned(),
+            "Choose another date at launch, or press q to exit".to_owned(),
+        ),
+        LivePhase::NoOwnedRepositories => (
+            "NO OWNED REPOSITORIES — nothing available to scan".to_owned(),
+            "Check account access, then relaunch; q exits".to_owned(),
+        ),
+        LivePhase::Incomplete => (
+            "INCOMPLETE RESULTS — partial data remains usable".to_owned(),
+            "Browse available commits with Enter; relaunch to retry missing data".to_owned(),
+        ),
+        LivePhase::Fatal => {
+            let category = state.failures().first().map(|failure| failure.category);
+            (
+                format!(
+                    "LOAD FAILED — {}",
+                    category
+                        .map(failure_category_label)
+                        .unwrap_or("unknown GitHub failure")
+                ),
+                category
+                    .map_or("Quit and relaunch to retry", inbox_failure_action)
+                    .to_owned(),
+            )
         }
-        LivePhase::Incomplete => "INCOMPLETE RESULTS — partial data remains usable".to_owned(),
-        LivePhase::Fatal => format!(
-            "LOAD FAILED — {}",
-            state
-                .failures()
-                .first()
-                .map(|failure| failure_category_label(failure.category))
-                .unwrap_or("unknown GitHub failure")
-        ),
     };
 
     let progress = &state.progress;
@@ -163,6 +191,7 @@ fn draw_live_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Line::raw(format!("Timezone: {}{fallback}", selection.timezone_name)),
         Line::raw(""),
         Line::styled(phase, Style::default().fg(phase_color(&state.phase))),
+        Line::styled(action, Style::default().fg(Color::Cyan)),
         Line::raw(format!(
             "Repositories: {}/{} processed",
             progress.repositories_processed, progress.repositories_discovered
@@ -262,6 +291,62 @@ fn failure_category_label(category: FailureCategory) -> &'static str {
     }
 }
 
+fn inbox_failure_action(category: FailureCategory) -> &'static str {
+    match category {
+        FailureCategory::Authentication => "Run `gh auth login`, then relaunch",
+        FailureCategory::MissingGh => "Install GitHub CLI (`gh`), then relaunch",
+        FailureCategory::PermissionOrNotFound => "Check GitHub access, then relaunch",
+        FailureCategory::RateLimit => "Wait for the rate-limit reset, then relaunch",
+        FailureCategory::Offline | FailureCategory::Transport => {
+            "Check the network connection, then relaunch"
+        }
+        FailureCategory::Cancelled => "Loading was cancelled; relaunch to retry",
+        FailureCategory::MalformedResponse
+        | FailureCategory::MalformedJson
+        | FailureCategory::Command
+        | FailureCategory::Api => "Quit and relaunch to retry",
+    }
+}
+
+fn detail_failure_action(failure: &DetailFailure) -> &'static str {
+    match failure {
+        DetailFailure::ResponseTruncated => "Press Esc to choose another commit",
+        DetailFailure::Load(failure) => match failure.category {
+            FailureCategory::Authentication => "Run `gh auth login`, then press Enter to retry",
+            FailureCategory::MissingGh => "Install GitHub CLI (`gh`), then press Enter to retry",
+            FailureCategory::PermissionOrNotFound => {
+                "Check GitHub access, then press Enter to retry"
+            }
+            FailureCategory::RateLimit => {
+                "Wait for the rate-limit reset, then press Enter to retry"
+            }
+            FailureCategory::Offline | FailureCategory::Transport => {
+                "Check the network, then press Enter to retry"
+            }
+            FailureCategory::Cancelled
+            | FailureCategory::MalformedResponse
+            | FailureCategory::MalformedJson
+            | FailureCategory::Command
+            | FailureCategory::Api => "Press Enter to retry",
+        },
+    }
+}
+
+fn comment_failure_action(kind: CommentFailureKind) -> &'static str {
+    match kind {
+        CommentFailureKind::Authentication => "Run `gh auth login`, then press r to retry",
+        CommentFailureKind::MissingGh => "Install GitHub CLI (`gh`), then press r to retry",
+        CommentFailureKind::PermissionOrNotFound => "Check GitHub access, then press r to retry",
+        CommentFailureKind::RateLimit => "Wait for the rate-limit reset, then press r to retry",
+        CommentFailureKind::Offline | CommentFailureKind::Transport => {
+            "Check the network, then press r to retry"
+        }
+        CommentFailureKind::Malformed | CommentFailureKind::Api | CommentFailureKind::Cancelled => {
+            "Press r to retry"
+        }
+    }
+}
+
 fn draw_list_pane(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -305,6 +390,19 @@ fn draw_list_pane(
 }
 
 fn draw_diff_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if app.all_reviewed_empty() {
+        frame.render_widget(
+            Paragraph::new(diff_message(
+                app,
+                area,
+                "ALL REVIEWED — press f to show all commits",
+                Style::default().fg(Color::Green),
+            ))
+            .block(pane_block(Pane::Diff, app.focus() == Pane::Diff, app)),
+            area,
+        );
+        return;
+    }
     if matches!(app.inbox().source, InboxSource::Live { .. })
         && app.current_detail_state().is_none()
     {
@@ -316,7 +414,7 @@ fn draw_diff_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
         diff_message(
             app,
             area,
-            "Loading commit details…",
+            "Loading commit details… Ctrl-c cancels and exits",
             Style::default().fg(Color::Cyan),
         )
     } else if let Some(DetailState::Failed(failure)) = app.current_detail_state() {
@@ -327,19 +425,19 @@ fn draw_diff_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 failure_category_label(failure.category)
             ),
         };
-        diff_message(app, area, &label, Style::default().fg(Color::Red))
+        let message = format!("{label} — {}", detail_failure_action(failure));
+        diff_message(app, area, &message, Style::default().fg(Color::Red))
     } else if matches!(app.inbox().source, InboxSource::Demo)
         && matches!(
             app.current_commit().map(|commit| &commit.files),
             Some(crate::inbox::ChildPane::ResponseTruncated)
         )
     {
-        diff_message(
-            app,
-            area,
-            RESPONSE_TRUNCATED_LABEL,
-            Style::default().fg(Color::Red),
-        )
+        let message = format!(
+            "{RESPONSE_TRUNCATED_LABEL} — {}",
+            detail_failure_action(&DetailFailure::ResponseTruncated)
+        );
+        diff_message(app, area, &message, Style::default().fg(Color::Red))
     } else if matches!(app.inbox().source, InboxSource::Demo)
         && matches!(
             app.current_commit().map(|commit| &commit.files),
@@ -600,9 +698,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(Color::Yellow),
         ));
     }
-    spans.push(Span::raw(
-        " • c edit • P publish • C comments • h/l focus • j/k move • m review • f filter • / search • ? help • q quit",
-    ));
+    spans.push(Span::raw(" • ? help • q quit"));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -629,9 +725,12 @@ fn draw_compact(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .unwrap_or_default();
     let (reviewed, total) = app.review_progress();
     let message = Paragraph::new(format!(
-        "{mode} • {} • {} {reviewed}/{total} reviewed\nterminal too small for panes\nresize to at least 60×16\nc comment • m review • f filter • / search • n/N match • ? help • q quit{review_warning}{draft_warning}",
+        "terminal too small\nneed 60×16 (now {}×{})\n{mode} • {} • {} {reviewed}/{total} reviewed\n{}\n? help • Ctrl-c quit{review_warning}{draft_warning}",
+        area.width,
+        area.height,
         app.focus().title(),
         if app.remaining_only() { "remaining" } else { "all" },
+        app.status(),
     ))
     .block(block)
     .wrap(Wrap { trim: true });
@@ -642,7 +741,7 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &App) {
     match app.mode() {
         Mode::Normal => {}
         Mode::SearchEntry { target } => draw_search(frame, area, app, target),
-        Mode::Help { .. } => draw_help(frame, area),
+        Mode::Help { .. } => draw_help(frame, area, app),
         Mode::Edit { target, .. } => draw_edit(frame, area, app, &target),
         Mode::Comments { .. } => draw_comments(frame, area, app),
         Mode::ConfirmPublish { target, .. } => draw_publish_confirmation(frame, area, app, &target),
@@ -669,7 +768,7 @@ fn draw_publish_confirmation(
         CommentAnchor::Line(line) => {
             return frame.render_widget(
                 Paragraph::new(format!(
-                    "Line {}:{}\n\nPress y to publish; any other key cancels",
+                    "Press y to publish; any other key cancels\nLine {}:{}",
                     sanitize_display_text(&line.path),
                     line.position
                 ))
@@ -680,7 +779,7 @@ fn draw_publish_confirmation(
     };
     frame.render_widget(
         Paragraph::new(format!(
-            "Publish saved {kind} draft?\n\nPress y to publish; any other key cancels\n{}",
+            "Press y to publish; any other key cancels\nPublish saved {kind} draft?\n{}",
             app.status()
         ))
         .wrap(Wrap { trim: true }),
@@ -702,16 +801,28 @@ fn draw_comments(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
     let lines = match app.current_comments() {
-        Some(CommentListState::Loading) => vec![Line::raw("Loading existing comments…")],
-        Some(CommentListState::Failed(error)) => vec![Line::styled(
-            format!("Comments unavailable: {error}"),
-            Style::default().fg(Color::Red),
-        )],
+        Some(CommentListState::Loading) => vec![
+            Line::raw("Loading existing comments…"),
+            Line::styled(
+                "Esc closes; Ctrl-c cancels and exits",
+                Style::default().fg(Color::Cyan),
+            ),
+        ],
+        Some(CommentListState::Failed(error)) => vec![
+            Line::styled(
+                format!("Comments unavailable: {error}"),
+                Style::default().fg(Color::Red),
+            ),
+            Line::styled(
+                comment_failure_action(error.kind),
+                Style::default().fg(Color::Cyan),
+            ),
+        ],
         Some(CommentListState::Loaded(list)) if list.comments.is_empty() => {
             vec![Line::raw(if list.complete {
-                "No existing comments"
+                "No existing comments — press r to refresh"
             } else {
-                "No comments in the bounded, incomplete result"
+                "INCOMPLETE — no comments in the bounded result; press r to retry"
             })]
         }
         Some(CommentListState::Loaded(list)) => {
@@ -761,7 +872,11 @@ fn draw_comments(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
         None => vec![Line::raw("Comments have not been loaded")],
     };
-    let footer = u16::from(inner.height > 1);
+    let footer = if inner.width < 28 && inner.height > 2 {
+        2
+    } else {
+        u16::from(inner.height > 1)
+    };
     let content = Rect::new(
         inner.x,
         inner.y,
@@ -775,10 +890,14 @@ fn draw_comments(frame: &mut Frame<'_>, area: Rect, app: &App) {
         content,
     );
     if footer > 0 {
+        let footer_lines = if footer == 2 {
+            vec![Line::raw("Esc close • r refresh"), Line::raw("j/k scroll")]
+        } else {
+            vec![Line::raw("Esc close • r refresh • j/k scroll")]
+        };
         frame.render_widget(
-            Paragraph::new("j/k scroll • r refresh • Esc close")
-                .style(Style::default().fg(Color::Cyan)),
-            Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+            Paragraph::new(footer_lines).style(Style::default().fg(Color::Cyan)),
+            Rect::new(inner.x, inner.bottom() - footer, inner.width, footer),
         );
     }
 }
@@ -941,35 +1060,76 @@ fn draw_search(frame: &mut Frame<'_>, area: Rect, app: &App, target: Pane) {
     );
 }
 
-fn draw_help(frame: &mut Frame<'_>, area: Rect) {
+fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let desired_height = u16::try_from(HELP_BINDINGS.len())
         .unwrap_or(u16::MAX)
         .saturating_add(4);
     let popup = centered_rect(area, 72, desired_height);
     frame.render_widget(Clear, popup);
 
-    let mut lines = Vec::with_capacity(HELP_BINDINGS.len() + 2);
-    lines.push(Line::styled(
-        "Normal mode",
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
-    lines.extend(HELP_BINDINGS.iter().map(|binding| {
-        Line::from(vec![
-            Span::styled(
-                format!("{:<24}", binding.keys),
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::raw(binding.action),
-        ])
-    }));
-    lines.push(Line::raw("Press Escape to close"));
+    let block = modal_block(" Keyboard help ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
+    let narrow = inner.width < 28;
+    let header_rows = u16::from(!narrow && inner.height > 0);
+    let footer_rows = if narrow {
+        inner.height.min(2)
+    } else {
+        u16::from(inner.height > 1)
+    };
+    let content_height = inner.height.saturating_sub(header_rows + footer_rows);
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(modal_block(" Keyboard help "))
-            .wrap(Wrap { trim: true }),
-        popup,
+        Paragraph::new("Normal bindings first; prefixed modes isolate their keys")
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        Rect::new(inner.x, inner.y, inner.width, header_rows),
     );
+
+    let align_keys = inner.width >= 68;
+    let lines = HELP_BINDINGS
+        .iter()
+        .map(|binding| {
+            Line::from(vec![
+                Span::styled(
+                    if align_keys {
+                        format!("{:<24}", binding.keys)
+                    } else {
+                        format!("{}  ", binding.keys)
+                    },
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(binding.action),
+            ])
+        })
+        .collect::<Vec<_>>();
+
+    if content_height > 0 {
+        frame.render_widget(
+            Paragraph::new(lines)
+                .scroll((u16::try_from(app.help_scroll()).unwrap_or(u16::MAX), 0))
+                .wrap(Wrap { trim: false }),
+            Rect::new(
+                inner.x,
+                inner.y.saturating_add(header_rows),
+                inner.width,
+                content_height,
+            ),
+        );
+    }
+    if footer_rows > 0 {
+        let footer = if footer_rows == 2 {
+            vec![Line::raw("j/k scroll"), Line::raw("Esc close")]
+        } else {
+            vec![Line::raw("j/k scroll • Esc close")]
+        };
+        frame.render_widget(
+            Paragraph::new(footer).style(Style::default().fg(Color::Cyan)),
+            Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+        );
+    }
 }
 
 fn modal_block<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
@@ -1000,8 +1160,8 @@ mod tests {
     };
     use crate::fixture::DemoFixture;
     use crate::github::{
-        ExistingComment, ExistingCommentAnchor, ExistingComments, FailureScope, LoadEvent,
-        LoadFailure, LoadProgress, LoadStatus, LoadedRepository, RepositoryCoverage,
+        CommentFailure, ExistingComment, ExistingCommentAnchor, ExistingComments, FailureScope,
+        LoadEvent, LoadFailure, LoadProgress, LoadStatus, LoadedRepository, RepositoryCoverage,
     };
     use crate::inbox::{
         ChildPane, Commit, CommitDetail, DiffLine, DiffLineKind, FileChange, FileStatus,
@@ -1099,6 +1259,32 @@ mod tests {
                 coverage: RepositoryCoverage::Complete,
             },
         });
+        app
+    }
+
+    fn modal_app(name: &str) -> App {
+        let mut app = App::new(DemoFixture::load());
+        match name {
+            "normal" => {}
+            "search" => app.handle_input(Input::Character('/')),
+            "help" => app.handle_input(Input::Character('?')),
+            "edit" => {
+                app.handle_input(Input::Character('l'));
+                app.handle_input(Input::Character('c'));
+            }
+            "comments" => {
+                app.handle_input(Input::Character('l'));
+                app.handle_input(Input::Character('C'));
+            }
+            "publish" => {
+                app.handle_input(Input::Character('l'));
+                app.handle_input(Input::Character('c'));
+                app.handle_input(Input::Character('x'));
+                app.handle_input(Input::Escape);
+                app.handle_input(Input::Character('P'));
+            }
+            _ => panic!("unknown modal fixture"),
+        }
         app
     }
 
@@ -1285,6 +1471,33 @@ mod tests {
     }
 
     #[test]
+    fn help_remains_complete_and_scrollable_at_minimum_supported_size() {
+        let mut app = App::new(DemoFixture::load());
+        app.handle_input(Input::Character('?'));
+        let mut visited = String::new();
+
+        for _ in 0..HELP_BINDINGS.len() {
+            visited.push_str(&rendered_text(&mut app, MIN_FULL_WIDTH, MIN_FULL_HEIGHT));
+            app.handle_input(Input::Character('j'));
+        }
+
+        for binding in HELP_BINDINGS {
+            assert!(
+                visited.contains(binding.keys),
+                "minimum-size help is missing {}",
+                binding.keys
+            );
+            assert!(
+                visited.contains(binding.action),
+                "minimum-size help is missing {}",
+                binding.action
+            );
+        }
+        assert!(visited.contains("j/k scroll"));
+        assert!(matches!(app.mode(), Mode::Help { .. }));
+    }
+
+    #[test]
     fn constrained_layout_uses_safe_fallback() {
         for (width, height) in [(1, 1), (10, 3), (59, 15)] {
             let mut app = App::new(DemoFixture::load());
@@ -1309,19 +1522,60 @@ mod tests {
     }
 
     #[test]
+    fn every_modal_mode_remains_actionable_across_boundary_resizes() {
+        for (name, expected) in [
+            ("normal", "terminal too small"),
+            ("search", "Enter"),
+            ("help", "j/k"),
+            ("edit", "Esc"),
+            ("comments", "j/k"),
+            ("publish", "Press y"),
+        ] {
+            let mut app = modal_app(name);
+            for (width, height) in [(120, 32), (80, 24), (60, 16), (59, 15), (40, 8), (20, 5)] {
+                let output = rendered_text(&mut app, width, height);
+                let expected =
+                    if name == "normal" && width >= MIN_FULL_WIDTH && height >= MIN_FULL_HEIGHT {
+                        "Repository"
+                    } else {
+                        expected
+                    };
+                assert!(
+                    output.contains(expected),
+                    "{name} at {width}x{height} lost {expected:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn fatal_authentication_missing_gh_permission_and_rate_limit_are_distinct() {
-        for (category, expected) in [
-            (FailureCategory::Authentication, "authentication failed"),
-            (FailureCategory::MissingGh, "GitHub CLI not found"),
+        for (category, expected, action) in [
+            (
+                FailureCategory::Authentication,
+                "authentication failed",
+                "gh auth login",
+            ),
+            (
+                FailureCategory::MissingGh,
+                "GitHub CLI not found",
+                "Install GitHub CLI",
+            ),
             (
                 FailureCategory::PermissionOrNotFound,
                 "permission denied or resource unavailable",
+                "Check GitHub access",
             ),
-            (FailureCategory::RateLimit, "GitHub API rate limit reached"),
+            (
+                FailureCategory::RateLimit,
+                "GitHub API rate limit reached",
+                "Wait for the rate-limit reset",
+            ),
         ] {
             let output = rendered_text(&mut fatal_app(category), 120, 32);
             assert!(output.contains("LOAD FAILED"));
             assert!(output.contains(expected), "missing {expected:?}");
+            assert!(output.contains(action), "missing action {action:?}");
         }
     }
 
@@ -1334,6 +1588,7 @@ mod tests {
         });
         let output = rendered_text(&mut no_repositories, 120, 32);
         assert!(output.contains("NO OWNED REPOSITORIES"));
+        assert!(output.contains("Check account access"));
         assert!(!output.contains("EMPTY DAY"));
 
         let mut empty_day = live_app();
@@ -1364,6 +1619,7 @@ mod tests {
         });
         let output = rendered_text(&mut empty_day, 120, 32);
         assert!(output.contains("EMPTY DAY"));
+        assert!(output.contains("Choose another date"));
         assert!(!output.contains("NO OWNED REPOSITORIES"));
     }
 
@@ -1511,7 +1767,9 @@ mod tests {
                 http_status: None,
             })),
         });
-        assert!(rendered_text(&mut app, 120, 32).contains("Commit details unavailable: offline"));
+        let failure = rendered_text(&mut app, 120, 32);
+        assert!(failure.contains("Commit details unavailable: offline"));
+        assert!(failure.contains("Enter to retry"));
 
         let mut app = live_commit_app();
         app.apply(Command::Open);
@@ -1567,6 +1825,8 @@ mod tests {
         let output = rendered_text(&mut app, MIN_FULL_WIDTH, MIN_FULL_HEIGHT);
         assert!(output.contains("GitHub response exceeded 16 MiB;"));
         assert!(output.contains("details unavailable"));
+        assert!(output.contains("Press Esc"));
+        assert!(output.contains("another commit"));
     }
 
     #[test]
@@ -1732,7 +1992,9 @@ mod tests {
         app.apply(Command::ToggleReviewed);
         assert!(rendered_text(&mut app, 120, 32).contains("✓"));
         app.apply(Command::ToggleRemaining);
-        assert!(rendered_text(&mut app, 120, 32).contains("ALL REVIEWED"));
+        let all_reviewed = rendered_text(&mut app, 120, 32);
+        assert!(all_reviewed.contains("ALL REVIEWED"));
+        assert!(all_reviewed.contains("press f to show all commits"));
 
         let inbox = live_app().inbox().clone();
         let mut unavailable =
@@ -1851,5 +2113,88 @@ mod tests {
         app.handle_input(Input::Character('P'));
         assert!(rendered_text(&mut app, 120, 32).contains("Press y to publish"));
         assert!(rendered_text(&mut app, 40, 8).contains("Press y to publish"));
+    }
+
+    #[test]
+    fn comment_loading_empty_incomplete_and_failure_states_are_distinct_and_actionable() {
+        let mut loading = modal_app("comments");
+        let loading_output = rendered_text(&mut loading, 80, 24);
+        assert!(loading_output.contains("Loading existing comments"));
+        assert!(loading_output.contains("Ctrl-c cancels and exits"));
+
+        for (complete, expected) in [
+            (true, "No existing comments — press r to refresh"),
+            (
+                false,
+                "INCOMPLETE — no comments in the bounded result; press r to retry",
+            ),
+        ] {
+            let mut app = modal_app("comments");
+            let CommentEffect::Load {
+                request_id, key, ..
+            } = app.take_comment_effects().remove(0)
+            else {
+                panic!()
+            };
+            app.apply_comment_result(CommentResult {
+                request_id,
+                key,
+                target: None,
+                outcome: CommentResultOutcome::Loaded(Ok(ExistingComments {
+                    comments: Vec::new(),
+                    complete,
+                    marker_found: false,
+                })),
+            });
+            assert!(rendered_text(&mut app, 80, 24).contains(expected));
+        }
+
+        for (kind, label, action) in [
+            (
+                CommentFailureKind::Authentication,
+                "authentication failed",
+                "gh auth login",
+            ),
+            (
+                CommentFailureKind::PermissionOrNotFound,
+                "access was denied",
+                "Check GitHub access",
+            ),
+            (
+                CommentFailureKind::RateLimit,
+                "rate limit was reached",
+                "Wait for the rate-limit reset",
+            ),
+            (
+                CommentFailureKind::Offline,
+                "appears to be offline",
+                "Check the network",
+            ),
+            (
+                CommentFailureKind::Cancelled,
+                "request was cancelled",
+                "Press r to retry",
+            ),
+        ] {
+            let mut app = modal_app("comments");
+            let CommentEffect::Load {
+                request_id, key, ..
+            } = app.take_comment_effects().remove(0)
+            else {
+                panic!()
+            };
+            app.apply_comment_result(CommentResult {
+                request_id,
+                key,
+                target: None,
+                outcome: CommentResultOutcome::Loaded(Err(CommentFailure {
+                    kind,
+                    http_status: None,
+                })),
+            });
+            let output = rendered_text(&mut app, 80, 24);
+            assert!(output.contains(label), "missing failure label {label:?}");
+            assert!(output.contains(action), "missing failure action {action:?}");
+        }
     }
 }

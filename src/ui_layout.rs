@@ -73,3 +73,58 @@ impl ReviewPaneLayout {
         self.diff.width.saturating_sub(2) as usize
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pane_layout_stays_in_bounds_at_supported_and_boundary_sizes() {
+        for (width, height) in [
+            (120, 32),
+            (80, 24),
+            (60, 16),
+            (59, 15),
+            (40, 8),
+            (20, 5),
+            (1, 1),
+            (0, 0),
+        ] {
+            let area = Rect::new(0, 0, width, height);
+            let layout = ReviewPaneLayout::from_area(area);
+            for pane in [
+                layout.repository,
+                layout.commit,
+                layout.file,
+                layout.diff,
+                layout.status,
+            ] {
+                assert!(
+                    pane.right() <= area.right(),
+                    "width overflow at {width}x{height}"
+                );
+                assert!(
+                    pane.bottom() <= area.bottom(),
+                    "height overflow at {width}x{height}"
+                );
+            }
+            assert_eq!(layout.repository.x, 0);
+            assert_eq!(layout.diff.right(), area.right());
+            assert_eq!(layout.status.bottom(), area.bottom());
+        }
+    }
+
+    #[test]
+    fn minimum_full_layout_preserves_content_in_every_pane_and_status() {
+        let layout = ReviewPaneLayout::from_area(Rect::new(0, 0, 60, 16));
+
+        assert!(
+            layout
+                .content_heights()
+                .into_iter()
+                .all(|height| height > 0)
+        );
+        assert!(layout.diff_content_width() > 0);
+        assert_eq!(layout.status.height, 1);
+    }
+}

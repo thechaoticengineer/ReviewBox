@@ -220,8 +220,12 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
         action: "open this help",
     },
     HelpBinding {
-        keys: "q / Ctrl-c",
-        action: "quit from normal mode / quit globally",
+        keys: "q",
+        action: "quit from normal mode",
+    },
+    HelpBinding {
+        keys: "Ctrl-c",
+        action: "quit globally; Edit must save first",
     },
     HelpBinding {
         keys: "Search: text, Backspace",
@@ -232,8 +236,12 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
         action: "apply / cancel",
     },
     HelpBinding {
+        keys: "Help: j/k or arrows",
+        action: "scroll this binding list",
+    },
+    HelpBinding {
         keys: "Help: Escape",
-        action: "close help",
+        action: "close help; other keys stay isolated",
     },
     HelpBinding {
         keys: "Edit: printable / Enter",
@@ -256,8 +264,12 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
         action: "save and quit",
     },
     HelpBinding {
-        keys: "Comments: j/k / r / Esc",
-        action: "scroll / refresh / close",
+        keys: "Comments: j/k or arrows",
+        action: "scroll comments",
+    },
+    HelpBinding {
+        keys: "Comments: r / Esc",
+        action: "refresh / close",
     },
     HelpBinding {
         keys: "Publish: y / any other key",
@@ -536,6 +548,7 @@ pub struct App {
     active_publish: Option<ActivePublish>,
     comment_effects: VecDeque<CommentEffect>,
     comments_scroll: usize,
+    help_scroll: usize,
     attempt_source: Box<dyn AttemptSource>,
 }
 
@@ -657,6 +670,7 @@ impl App {
             active_publish: None,
             comment_effects: VecDeque::new(),
             comments_scroll: 0,
+            help_scroll: 0,
             attempt_source: Box::new(SystemAttemptSource),
         };
         app.rebuild_projection(None);
@@ -904,6 +918,7 @@ impl App {
             }
             Input::Character('?') => {
                 self.pending_g = false;
+                self.help_scroll = 0;
                 self.mode = Mode::Help {
                     previous_focus: self.focus,
                 };
@@ -987,10 +1002,24 @@ impl App {
 
     fn handle_help_input(&mut self, previous_focus: Pane, input: Input) {
         self.pending_g = false;
-        if input == Input::Escape {
-            self.focus = previous_focus;
-            self.mode = Mode::Normal;
-            self.status = "Keyboard help closed".to_owned();
+        match input {
+            Input::Character('j') | Input::Down => {
+                self.help_scroll = self
+                    .help_scroll
+                    .saturating_add(1)
+                    .min(HELP_BINDINGS.len().saturating_sub(1));
+                self.status = "Keyboard help scrolled down".to_owned();
+            }
+            Input::Character('k') | Input::Up => {
+                self.help_scroll = self.help_scroll.saturating_sub(1);
+                self.status = "Keyboard help scrolled up".to_owned();
+            }
+            Input::Escape => {
+                self.focus = previous_focus;
+                self.mode = Mode::Normal;
+                self.status = "Keyboard help closed".to_owned();
+            }
+            _ => {}
         }
     }
 
@@ -1807,11 +1836,14 @@ impl App {
     }
 
     fn open_selected(&mut self) {
-        if matches!(self.inbox.source, InboxSource::Live { .. }) && self.focus == Pane::Commit {
+        if matches!(self.inbox.source, InboxSource::Live { .. })
+            && (self.focus == Pane::Commit
+                || matches!(self.current_detail_state(), Some(DetailState::Failed(_))))
+        {
             self.open_live_commit();
-        } else {
-            self.focus_next("Opened selected item");
+            return;
         }
+        self.focus_next("Opened selected item");
     }
 
     fn open_live_commit(&mut self) {
@@ -2508,6 +2540,10 @@ impl App {
 
     pub fn comments_scroll(&self) -> usize {
         self.comments_scroll
+    }
+
+    pub fn help_scroll(&self) -> usize {
+        self.help_scroll
     }
 
     pub fn publish_in_flight(&self) -> bool {
@@ -3866,7 +3902,6 @@ mod tests {
         );
         for input in [
             Input::Character('h'),
-            Input::Character('j'),
             Input::Character('/'),
             Input::Character('q'),
             Input::Enter,
@@ -3876,6 +3911,13 @@ mod tests {
         assert_eq!(app.focus(), focus);
         assert_eq!(app.selected(Pane::Commit), selected);
         assert!(!app.should_quit());
+
+        app.handle_input(Input::Character('j'));
+        app.handle_input(Input::Down);
+        assert_eq!(app.help_scroll(), 2);
+        app.handle_input(Input::Character('k'));
+        app.handle_input(Input::Up);
+        assert_eq!(app.help_scroll(), 0);
 
         app.handle_input(Input::Escape);
         assert_eq!(app.mode(), Mode::Normal);
@@ -3910,6 +3952,69 @@ mod tests {
         let mut app = app();
         app.apply(Command::Quit);
         assert!(app.should_quit());
+    }
+
+    #[test]
+    fn every_documented_normal_binding_has_an_observable_dispatch() {
+        let cases: &[(&str, &str, &[Input])] = &[
+            ("h", "h / l", &[Input::Character('h')]),
+            ("l", "h / l", &[Input::Character('l')]),
+            ("j", "j / k", &[Input::Character('j')]),
+            ("k", "j / k", &[Input::Character('k')]),
+            ("g", "gg / G", &[Input::Character('g')]),
+            (
+                "gg",
+                "gg / G",
+                &[Input::Character('g'), Input::Character('g')],
+            ),
+            ("G", "gg / G", &[Input::Character('G')]),
+            ("Ctrl-d", "Ctrl-d / Ctrl-u", &[Input::HalfPageDown]),
+            ("Ctrl-u", "Ctrl-d / Ctrl-u", &[Input::HalfPageUp]),
+            ("Enter", "Enter / Escape", &[Input::Enter]),
+            ("Escape", "Enter / Escape", &[Input::Escape]),
+            ("/", "/", &[Input::Character('/')]),
+            ("n", "n / N", &[Input::Character('n')]),
+            ("N", "n / N", &[Input::Character('N')]),
+            ("m", "m", &[Input::Character('m')]),
+            ("f", "f", &[Input::Character('f')]),
+            ("c", "c", &[Input::Character('c')]),
+            ("E", "E", &[Input::Character('E')]),
+            ("P", "P", &[Input::Character('P')]),
+            ("C", "C", &[Input::Character('C')]),
+            ("?", "?", &[Input::Character('?')]),
+            ("q", "q", &[Input::Character('q')]),
+            ("Ctrl-c", "Ctrl-c", &[Input::Quit]),
+        ];
+
+        for (key, help_keys, inputs) in cases {
+            let mut app = app();
+            let before = (
+                app.status().to_owned(),
+                app.mode(),
+                app.focus(),
+                app.selected(Pane::Repository),
+                app.remaining_only(),
+                app.should_quit(),
+            );
+            for input in *inputs {
+                app.handle_input(*input);
+            }
+            let after = (
+                app.status().to_owned(),
+                app.mode(),
+                app.focus(),
+                app.selected(Pane::Repository),
+                app.remaining_only(),
+                app.should_quit(),
+            );
+            assert_ne!(before, after, "documented Normal binding {key} did nothing");
+            assert!(
+                HELP_BINDINGS
+                    .iter()
+                    .any(|binding| binding.keys == *help_keys),
+                "dispatched Normal binding {key} is absent from help"
+            );
+        }
     }
 
     fn live_app() -> App {
@@ -4172,10 +4277,11 @@ mod tests {
             Some(DetailState::Failed(_))
         ));
 
-        app.apply(Command::Back);
-        app.apply(Command::Open);
+        assert_eq!(app.focus(), Pane::File);
+        app.handle_input(Input::Enter);
         let (retry_id, retry_key) = take_request(&mut app);
         assert_ne!(retry_id, failed_id);
+        assert_eq!(app.status(), "Loading commit details");
         app.apply_detail_result(DetailResult {
             request_id: retry_id,
             key: retry_key,
