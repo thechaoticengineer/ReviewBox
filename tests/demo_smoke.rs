@@ -50,7 +50,7 @@ fn demo_smoke_binary_succeeds_without_authentication_network_or_persistent_write
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        "ReviewBox demo smoke: ok (11 frames)"
+        "ReviewBox demo smoke: ok (12 frames)"
     );
     assert!(output.stderr.is_empty());
     assert_eq!(

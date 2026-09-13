@@ -4,14 +4,14 @@ A keyboard-first terminal review inbox for commits across GitHub projects.
 
 See [PRODUCT.md](PRODUCT.md) for the accepted requirements and delivery order.
 
-## Current status: live diff review workflow
+## Current status: polished diff review workflow
 
 Implemented now:
 
 - A runnable Rust terminal application with repository, commit, file, and
   diff-like panes populated from deterministic fictional fixtures.
-- Neovim-style normal-mode focus, selection, scrolling, open/back, search, and
-  contextual help behavior.
+- Neovim-style normal-mode focus, selection, scrolling, open/back, repeated
+  search, and contextual help behavior.
 - Bounded selections and scrolling, resize-aware redraws, and a compact fallback
   for terminals smaller than 60 columns by 16 rows.
 - Structured terminal setup and restoration on normal return, propagated
@@ -81,12 +81,20 @@ Implemented now:
   mark unchanged with an error. The remaining-only view hides reviewed commits
   and repositories without remaining work and reports an explicit all-reviewed
   state.
+- A shared live/demo unified-diff viewer with old/new-number gutters,
+  syntax-aware hunk/addition/deletion styling, Unicode-safe soft wrapping, and
+  scroll behavior that reaches the actual tail of long patches after resize.
+  It explicitly labels no textual changes, binary/API-omitted patches, local
+  per-file and per-commit caps, capped file lists, oversized GitHub responses,
+  and sanitized detail failures.
+- `/` saves its query for `n`/`N` repeat navigation in the currently focused
+  repository, commit, file, or diff pane. Repeats are case-insensitive, wrap in
+  either direction, keep list matches visible, and highlight/scroll to diff
+  matches. Search-entry keys remain isolated from normal-mode bindings.
 
 Planned for later delivery increments, and not implemented yet:
 
 - Drafting, editing, persistence, and publishing of comments.
-- Repeated-match navigation with `n` / `N`.
-- Soft-wrapped diff layout and polished repeated-match navigation.
 
 ## Launch configuration and demo
 
@@ -171,6 +179,9 @@ Normal mode:
   selects or scrolls to the first case-insensitive match with one wrap, and
   `Escape` cancels. Empty and no-match searches leave the current position
   unchanged and report their result in the status line.
+- `n` / `N`: repeat the last search forward / backward in the currently focused
+  pane. Repeats use the saved case-insensitive query, wrap at either end, and
+  report when there is no prior query or no match in that pane.
 - `?`: open contextual keyboard help. `Escape` closes it and restores the prior
   pane focus.
 - `m`: toggle the selected commit reviewed/unreviewed from the commit, file, or
@@ -186,8 +197,9 @@ Search mode:
 - Printable characters, including normal-mode binding characters, append to the
   query; `Backspace` removes the last character.
 - `Enter` searches the focused pane case-insensitively from the current position
-  with one wrap, then returns to normal mode. A match selects or scrolls to its
-  first occurrence. Empty and no-match searches keep the previous position.
+  with one wrap, then returns to normal mode. The entered query remains available
+  for `n` / `N`, including after a no-match result. A match selects or scrolls to
+  its first occurrence. Empty and no-match searches keep the previous position.
 - `Escape` cancels the query and returns to normal mode without moving.
 
 Help mode:

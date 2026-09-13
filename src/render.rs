@@ -3,6 +3,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, HELP_BINDINGS, LivePhase, MIN_FULL_HEIGHT, MIN_FULL_WIDTH, Mode, Pane};
 use crate::day::TimezoneSource;
@@ -304,9 +305,12 @@ fn draw_diff_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else if let Some(DetailState::Failed(failure)) = app.current_detail_state() {
         let label = match failure {
             DetailFailure::ResponseTruncated => {
-                "ResponseTruncated — commit response exceeded the local size limit".to_owned()
+                "GitHub response exceeded 16 MiB; details unavailable".to_owned()
             }
-            DetailFailure::Load(failure) => format!("Failed — {failure}"),
+            DetailFailure::Load(failure) => format!(
+                "Commit details unavailable: {}",
+                failure_category_label(failure.category)
+            ),
         };
         vec![Line::styled(
             format!("  {label}"),
@@ -315,27 +319,33 @@ fn draw_diff_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else if let Some(file) = app.current_file() {
         match &file.patch {
             PatchContent::Empty => vec![Line::styled(
-                "  Empty patch — GitHub returned no diff lines",
+                "  No textual changes",
                 Style::default().fg(Color::DarkGray),
             )],
             PatchContent::Unavailable => vec![Line::styled(
-                "  Unavailable — binary or API-omitted patch",
+                "  Patch not provided by GitHub (binary or too large)",
                 Style::default().fg(Color::Yellow),
             )],
-            PatchContent::Text { .. } | PatchContent::Capped { .. } => diff_lines(app),
+            PatchContent::Capped {
+                reason: crate::inbox::PatchCapReason::CommitBudget,
+                ..
+            } => {
+                vec![Line::styled(
+                    "  Omitted by per-commit budget",
+                    Style::default().fg(Color::Yellow),
+                )]
+            }
+            PatchContent::Text { .. } | PatchContent::Capped { .. } => {
+                diff_lines(app, area.height.saturating_sub(2) as usize)
+            }
         }
-    } else if matches!(app.current_detail_state(), Some(DetailState::Ready(_))) {
-        vec![Line::styled(
-            "  (no changed files returned for this commit)",
-            Style::default().fg(Color::DarkGray),
-        )]
     } else if app.current_diff_lines().is_empty() {
         vec![Line::styled(
-            "  (no diff content in this fixture)",
+            "  No textual changes",
             Style::default().fg(Color::DarkGray),
         )]
     } else {
-        diff_lines(app)
+        diff_lines(app, area.height.saturating_sub(2) as usize)
     };
 
     frame.render_widget(
@@ -344,65 +354,117 @@ fn draw_diff_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-fn diff_lines(app: &App) -> Vec<Line<'static>> {
-    let mut lines: Vec<_> = app
+fn diff_lines(app: &App, available_rows: usize) -> Vec<Line<'static>> {
+    let mut lines = diff_notice(app);
+    let gutter_width = app.diff_gutter_width();
+    let number_width = gutter_width.saturating_sub(3) / 2;
+    let content_width = app.diff_content_width();
+    for (index, content) in app
         .current_diff_lines()
         .iter()
         .enumerate()
         .skip(app.scroll(Pane::Diff))
-        .map(|(index, content)| {
-            let color = match content.kind {
-                DiffLineKind::Hunk => Color::Cyan,
-                DiffLineKind::Addition => Color::Green,
-                DiffLineKind::Deletion => Color::Red,
-                _ => Color::Reset,
+    {
+        let style = diff_style(content.kind);
+        let matched = app.diff_match() == Some(index);
+        for (row, text) in wrap_diff_text(&content.text, content_width)
+            .into_iter()
+            .enumerate()
+            .skip(if index == app.scroll(Pane::Diff) {
+                app.diff_row_offset()
+            } else {
+                0
+            })
+        {
+            if lines.len() >= available_rows {
+                return lines;
+            }
+            let gutter = if row == 0 {
+                format_diff_gutter(content.old_line, content.new_line, number_width)
+            } else {
+                " ".repeat(gutter_width)
             };
-            Line::from(vec![
-                Span::styled(
-                    format!("{:>4} ", index + 1),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(content.text.clone(), Style::default().fg(color)),
-            ])
-        })
-        .collect();
+            let text_style = if matched {
+                style.add_modifier(Modifier::REVERSED)
+            } else {
+                style
+            };
+            lines.push(Line::from(vec![
+                Span::styled(gutter, Style::default().fg(Color::DarkGray)),
+                Span::styled(text, text_style),
+            ]));
+        }
+    }
+    lines
+}
+
+fn diff_notice(app: &App) -> Vec<Line<'static>> {
+    if app.scroll(Pane::Diff) != 0 || app.diff_row_offset() != 0 {
+        return Vec::new();
+    }
     if let Some(file) = app.current_file()
         && let PatchContent::Capped {
             omitted_lines,
             omitted_bytes,
+            reason: crate::inbox::PatchCapReason::FileLimit,
             ..
         } = &file.patch
     {
-        lines.insert(
-            0,
-            Line::styled(
-                format!(
-                    "… locally truncated: {omitted_lines} lines and {omitted_bytes} bytes omitted"
-                ),
-                Style::default().fg(Color::Yellow),
+        return vec![Line::styled(
+            format!(
+                "  Patch capped locally: {omitted_lines} lines / {} KiB omitted",
+                omitted_bytes.div_ceil(1024)
             ),
-        );
+            Style::default().fg(Color::Yellow),
+        )];
     }
     if let Some(DetailState::Ready(detail)) = app.current_detail_state()
         && (detail.omitted_files > 0 || detail.more_files_available)
     {
-        let suffix = if detail.more_files_available {
-            "; additional GitHub pages are unavailable"
-        } else {
-            ""
-        };
-        lines.insert(
-            0,
-            Line::styled(
-                format!(
-                    "… incomplete file list: {} files omitted{suffix}",
-                    detail.omitted_files
-                ),
-                Style::default().fg(Color::Yellow),
-            ),
-        );
+        return vec![Line::styled(
+            "  Only first 300 files shown",
+            Style::default().fg(Color::Yellow),
+        )];
     }
-    lines
+    Vec::new()
+}
+
+fn diff_style(kind: DiffLineKind) -> Style {
+    match kind {
+        DiffLineKind::Hunk => Style::default().fg(Color::Cyan),
+        DiffLineKind::Addition => Style::default().fg(Color::Green),
+        DiffLineKind::Deletion => Style::default().fg(Color::Red),
+        DiffLineKind::NoNewline | DiffLineKind::Other => Style::default().fg(Color::DarkGray),
+        DiffLineKind::Context => Style::default(),
+    }
+}
+
+fn format_diff_gutter(old: Option<u32>, new: Option<u32>, width: usize) -> String {
+    let old = old.map_or_else(String::new, |number| number.to_string());
+    let new = new.map_or_else(String::new, |number| number.to_string());
+    format!("{old:>width$} {new:>width$} ")
+}
+
+fn wrap_diff_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut row_width: usize = 0;
+    for character in text.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if row_width > 0 && row_width.saturating_add(character_width) > width {
+            rows.push(std::mem::take(&mut row));
+            row_width = 0;
+        }
+        row.push(character);
+        row_width = row_width.saturating_add(character_width);
+    }
+    if row.is_empty() && rows.is_empty() {
+        rows.push(String::new());
+    } else if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
 }
 
 fn sanitize_display_text(value: &str) -> String {
@@ -429,8 +491,17 @@ fn pane_block<'a>(pane: Pane, focused: bool, app: &App) -> Block<'a> {
         Style::default().fg(Color::DarkGray)
     };
     let (position, length) = app.position(pane);
+    let (reviewed, total) = app.review_progress();
+    let filter = if app.remaining_only() {
+        "remaining"
+    } else {
+        "all"
+    };
     Block::default()
-        .title(format!(" {} {position}/{length} ", pane.title()))
+        .title(format!(
+            " {} {filter} {reviewed}/{total} reviewed • {position}/{length} ",
+            pane.title()
+        ))
         .borders(Borders::ALL)
         .border_style(border_style)
 }
@@ -445,7 +516,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut spans = vec![
         Span::styled(mode, Style::default().fg(Color::Black).bg(Color::Cyan)),
         Span::raw(format!(
-            " {} • {} • h/l focus • j/k move • m reviewed • f remaining • / search • ? help • q quit",
+            " {} • {} • h/l focus • j/k move • m review • f filter • / search • n/N match • ? help • q quit",
             app.focus().title(),
             app.status()
         )),
@@ -473,9 +544,11 @@ fn draw_compact(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .review_warning()
         .map(|warning| format!("\nREVIEW STATE WARNING: {warning}"))
         .unwrap_or_default();
+    let (reviewed, total) = app.review_progress();
     let message = Paragraph::new(format!(
-        "{mode} • {}\nterminal too small for panes\nresize to at least 60×16\nm reviewed • f remaining • / search • ? help • q quit{warning}",
+        "{mode} • {} • {} {reviewed}/{total} reviewed\nterminal too small for panes\nresize to at least 60×16\nm review • f filter • / search • n/N match • ? help • q quit{warning}",
         app.focus().title(),
+        if app.remaining_only() { "remaining" } else { "all" },
     ))
     .block(block)
     .wrap(Wrap { trim: true });
@@ -566,8 +639,8 @@ mod tests {
         RepositoryCoverage,
     };
     use crate::inbox::{
-        ChildPane, Commit, CommitDetail, FileChange, FileStatus, GitHubAuthor, Inbox, PatchContent,
-        Repository, RepositoryIdentity,
+        ChildPane, Commit, CommitDetail, DiffLine, DiffLineKind, FileChange, FileStatus,
+        GitHubAuthor, Inbox, PatchCapReason, PatchContent, Repository, RepositoryIdentity,
     };
     use crate::review_state::ReviewStateError;
     use chrono::{TimeZone, Utc};
@@ -652,6 +725,33 @@ mod tests {
             panic!("expected detail request");
         };
         (*request_id, key.clone())
+    }
+
+    fn demo_patch_app(patch: PatchContent) -> App {
+        App::new(Inbox::demo(vec![Repository {
+            identity: RepositoryIdentity {
+                id: 91,
+                owner: "fixture".to_owned(),
+                name: "patches".to_owned(),
+            },
+            commits: vec![Commit {
+                sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                subject: "render patch states".to_owned(),
+                author: GitHubAuthor {
+                    login: "fixture-user".to_owned(),
+                },
+                authored_at: Utc.with_ymd_and_hms(2024, 1, 15, 12, 0, 0).unwrap(),
+                files: ChildPane::Available(vec![FileChange {
+                    path: "src/patch.rs".to_owned(),
+                    previous_path: None,
+                    status: FileStatus::Modified,
+                    additions: 1,
+                    deletions: 1,
+                    changes: 2,
+                    patch,
+                }]),
+            }],
+        }]))
     }
 
     #[test]
@@ -870,7 +970,10 @@ mod tests {
             key,
             outcome: Err(DetailFailure::ResponseTruncated),
         });
-        assert!(rendered_text(&mut app, 120, 32).contains("ResponseTruncated"));
+        assert!(
+            rendered_text(&mut app, 120, 32)
+                .contains("GitHub response exceeded 16 MiB; details unavailable")
+        );
 
         app.apply(Command::Back);
         app.apply(Command::Open);
@@ -894,7 +997,116 @@ mod tests {
         });
         let unavailable = rendered_text(&mut app, 120, 32);
         assert!(unavailable.contains("assets/image.bin"));
-        assert!(unavailable.contains("Unavailable"));
+        assert!(unavailable.contains("Patch not provided by GitHub"));
+    }
+
+    #[test]
+    fn every_patch_cap_and_detail_failure_state_has_a_precise_presentation() {
+        let states = [
+            (PatchContent::Empty, "No textual changes"),
+            (
+                PatchContent::Unavailable,
+                "Patch not provided by GitHub (binary or too large)",
+            ),
+            (
+                PatchContent::Capped {
+                    lines: vec![DiffLine {
+                        kind: DiffLineKind::Addition,
+                        old_line: None,
+                        new_line: Some(1),
+                        text: "+kept".to_owned(),
+                    }],
+                    omitted_lines: 14,
+                    omitted_bytes: 1_025,
+                    reason: PatchCapReason::FileLimit,
+                },
+                "Patch capped locally: 14 lines / 2 KiB omitted",
+            ),
+            (
+                PatchContent::Capped {
+                    lines: Vec::new(),
+                    omitted_lines: 14,
+                    omitted_bytes: 1_025,
+                    reason: PatchCapReason::CommitBudget,
+                },
+                "Omitted by per-commit budget",
+            ),
+        ];
+        for (patch, expected) in states {
+            let mut app = demo_patch_app(patch);
+            assert!(
+                rendered_text(&mut app, 120, 32).contains(expected),
+                "missing {expected}"
+            );
+        }
+
+        let mut app = live_commit_app();
+        app.apply(Command::Open);
+        app.apply(Command::Open);
+        let (request_id, key) = request_identity(&mut app);
+        app.apply_detail_result(DetailResult {
+            request_id,
+            key,
+            outcome: Err(DetailFailure::Load(LoadFailure {
+                category: FailureCategory::Offline,
+                scope: FailureScope::CommitDetail,
+                http_status: None,
+            })),
+        });
+        assert!(rendered_text(&mut app, 120, 32).contains("Commit details unavailable: offline"));
+
+        let mut app = live_commit_app();
+        app.apply(Command::Open);
+        app.apply(Command::Open);
+        let (request_id, key) = request_identity(&mut app);
+        app.apply_detail_result(DetailResult {
+            request_id,
+            key,
+            outcome: Ok(CommitDetail {
+                files: vec![FileChange {
+                    path: "src/kept.rs".to_owned(),
+                    previous_path: None,
+                    status: FileStatus::Modified,
+                    additions: 1,
+                    deletions: 0,
+                    changes: 1,
+                    patch: PatchContent::Text {
+                        lines: vec![DiffLine {
+                            kind: DiffLineKind::Addition,
+                            old_line: None,
+                            new_line: Some(1),
+                            text: "+kept".to_owned(),
+                        }],
+                    },
+                }],
+                omitted_files: 1,
+                more_files_available: true,
+            }),
+        });
+        assert!(rendered_text(&mut app, 120, 32).contains("Only first 300 files shown"));
+    }
+
+    #[test]
+    fn long_diff_lines_wrap_resize_and_reach_the_tail_without_panicking() {
+        let mut app = demo_patch_app(PatchContent::Text {
+            lines: vec![DiffLine {
+                kind: DiffLineKind::Addition,
+                old_line: None,
+                new_line: Some(10_000),
+                text: format!("+{}TAIL", "x".repeat(600)),
+            }],
+        });
+        for (width, height) in [(1, 1), (60, 16), (200, 60)] {
+            let _ = rendered_text(&mut app, width, height);
+        }
+        app.apply(Command::Open);
+        app.apply(Command::Open);
+        app.apply(Command::Open);
+        let head = rendered_text(&mut app, 60, 16);
+        assert!(head.contains("10000"));
+        app.apply(Command::Last);
+        let tail = rendered_text(&mut app, 60, 16);
+        assert!(tail.contains("TAIL"));
     }
 
     #[test]

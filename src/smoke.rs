@@ -131,6 +131,21 @@ pub fn run() -> io::Result<SmokeReport> {
         "Match for 'routes'",
         "applied search frame",
     )?;
+    input(&mut app, 'n');
+    ensure(
+        app.current_file().map(|file| file.path.as_str()) == Some("tests/routes.rs"),
+        "n must select the next matching file",
+    )?;
+    input(&mut app, 'N');
+    ensure(
+        app.current_file().map(|file| file.path.as_str()) == Some("src/routes.rs"),
+        "N must return to the previous matching file",
+    )?;
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "previous match for 'routes'",
+        "repeated search frame",
+    )?;
 
     input(&mut app, '?');
     ensure(

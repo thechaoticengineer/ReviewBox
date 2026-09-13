@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::github::{
     DetailFailure, DetailState, FailureCategory, LoadEvent, LoadFailure, LoadProgress, LoadStatus,
     LoadedRepository, RepositoryCoverage,
@@ -83,6 +85,8 @@ pub enum Command {
     Back,
     ToggleReviewed,
     ToggleRemaining,
+    SearchNext,
+    SearchPrevious,
     Unrelated,
 }
 
@@ -130,6 +134,10 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
         action: "search the focused pane",
     },
     HelpBinding {
+        keys: "n / N",
+        action: "next / previous search match",
+    },
+    HelpBinding {
         keys: "m",
         action: "mark commit reviewed / unreviewed",
     },
@@ -163,6 +171,12 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
 struct ListPosition {
     selected: usize,
     scroll: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SearchQuery {
+    original: String,
+    needle: String,
 }
 
 const MAX_VISIBLE_FAILURES: usize = 3;
@@ -299,9 +313,13 @@ pub struct App {
     commits: ListPosition,
     files: ListPosition,
     diff_scroll: usize,
+    diff_row_offset: usize,
+    diff_match: Option<usize>,
+    diff_viewport_width: usize,
     viewport_heights: [usize; 4],
     pending_g: bool,
     search_query: String,
+    last_search: Option<SearchQuery>,
     status: String,
     should_quit: bool,
     live: Option<LiveInboxState>,
@@ -360,9 +378,13 @@ impl App {
             commits: ListPosition::default(),
             files: ListPosition::default(),
             diff_scroll: 0,
+            diff_row_offset: 0,
+            diff_match: None,
+            diff_viewport_width: 0,
             viewport_heights: [0; 4],
             pending_g: false,
             search_query: String::new(),
+            last_search: None,
             status,
             should_quit: false,
             live,
@@ -386,6 +408,7 @@ impl App {
         self.terminal_width = width;
         self.terminal_height = height;
         self.viewport_heights = pane_viewport_heights(width, height);
+        self.diff_viewport_width = diff_viewport_width(width);
         self.normalize();
     }
 
@@ -540,6 +563,7 @@ impl App {
         }
 
         self.rebuild_projection(Some(selection));
+        self.clear_diff_match();
         self.cancel_detail_if_selection_changed();
         self.normalize();
     }
@@ -606,6 +630,8 @@ impl App {
             Input::Character('G') => Command::Last,
             Input::Character('m') => Command::ToggleReviewed,
             Input::Character('f') => Command::ToggleRemaining,
+            Input::Character('n') => Command::SearchNext,
+            Input::Character('N') => Command::SearchPrevious,
             Input::Enter => Command::Open,
             Input::Escape => Command::Back,
             Input::HalfPageDown => Command::HalfPageDown,
@@ -662,6 +688,8 @@ impl App {
             Command::Back => self.focus_previous("Returned to parent pane"),
             Command::ToggleReviewed => self.toggle_reviewed(),
             Command::ToggleRemaining => self.toggle_remaining(),
+            Command::SearchNext => self.repeat_search(false),
+            Command::SearchPrevious => self.repeat_search(true),
             Command::Unrelated => self.status = "Key has no action in normal mode".to_owned(),
         }
     }
@@ -759,6 +787,7 @@ impl App {
         let selection = self.selection_identity();
         self.remaining_only = !self.remaining_only;
         self.rebuild_projection(Some(selection));
+        self.clear_diff_match();
         if self.focus > Pane::Commit && before != self.current_detail_key() {
             self.focus = Pane::Commit;
         }
@@ -803,6 +832,7 @@ impl App {
                 self.status = "Commit detail request failed".to_owned();
             }
         }
+        self.clear_diff_match();
         self.normalize();
     }
 
@@ -818,58 +848,94 @@ impl App {
             return;
         }
 
-        let needle = query.to_lowercase();
-        let found = match target {
-            Pane::Repository => {
-                find_wrapped(self.visible.len(), self.repositories.selected, |index| {
-                    self.visible_repositories()[index]
-                        .display_name()
-                        .to_lowercase()
-                        .contains(&needle)
-                })
-            }
-            Pane::Commit => find_wrapped(
-                self.current_commits().len(),
-                self.commits.selected,
-                |index| {
-                    self.current_commits()[index]
-                        .label()
-                        .to_lowercase()
-                        .contains(&needle)
-                },
-            ),
-            Pane::File => find_wrapped(self.current_files().len(), self.files.selected, |index| {
-                self.current_files()[index]
-                    .path
-                    .to_lowercase()
-                    .contains(&needle)
-            }),
-            Pane::Diff => {
-                find_wrapped(self.current_diff_lines().len(), self.diff_scroll, |index| {
-                    self.current_diff_lines()[index]
-                        .text
-                        .to_lowercase()
-                        .contains(&needle)
-                })
-            }
-        };
+        self.last_search = Some(SearchQuery {
+            needle: query.to_lowercase(),
+            original: query,
+        });
+        self.search_current(target, false, true);
+    }
 
+    fn repeat_search(&mut self, backward: bool) {
+        if self.last_search.is_none() {
+            self.status = "No previous search".to_owned();
+            return;
+        }
+        self.search_current(self.focus, backward, false);
+    }
+
+    fn search_current(&mut self, target: Pane, backward: bool, initial: bool) {
+        let Some(query) = self.last_search.clone() else {
+            return;
+        };
+        let current = match target {
+            Pane::Repository => self.repositories.selected,
+            Pane::Commit => self.commits.selected,
+            Pane::File => self.files.selected,
+            Pane::Diff => self.diff_match.unwrap_or(self.diff_scroll),
+        };
+        let found = self.find_match(target, current, backward);
+        let direction = if backward { "previous" } else { "next" };
         if let Some(index) = found {
             match target {
                 Pane::Repository => self.select_repository(index),
                 Pane::Commit => self.select_commit(index),
                 Pane::File => self.select_file(index),
-                Pane::Diff => self.diff_scroll = index,
+                Pane::Diff => {
+                    self.diff_match = Some(index);
+                    self.ensure_diff_line_visible(index);
+                }
             }
             let length = self.dataset_len(target);
-            self.status = format!(
-                "Match for '{query}' in {} ({}/{length})",
-                target.title(),
-                index + 1
-            );
+            let wrapped = if (!backward && index <= current) || (backward && index >= current) {
+                " (wrapped)"
+            } else {
+                ""
+            };
+            self.status = if initial {
+                format!(
+                    "Match for '{}' in {} ({}/{length}){wrapped}",
+                    query.original,
+                    target.title(),
+                    index + 1
+                )
+            } else {
+                format!(
+                    "{direction} match for '{}' in {} ({}/{length}){wrapped}",
+                    query.original,
+                    target.title(),
+                    index + 1
+                )
+            };
         } else {
-            self.status = format!("No match for '{query}' in {}", target.title());
+            self.status = format!("No match for '{}' in {}", query.original, target.title());
         }
+    }
+
+    fn find_match(&self, pane: Pane, current: usize, backward: bool) -> Option<usize> {
+        let needle = self.last_search.as_ref()?.needle.as_str();
+        find_wrapped_direction(
+            self.dataset_len(pane),
+            current,
+            backward,
+            |index| match pane {
+                Pane::Repository => self.visible_repositories()[index]
+                    .display_name()
+                    .to_lowercase()
+                    .contains(needle),
+                Pane::Commit => self.current_commits()[index]
+                    .label()
+                    .to_lowercase()
+                    .contains(needle),
+                Pane::File => self.current_files()[index]
+                    .path
+                    .to_lowercase()
+                    .contains(needle),
+                Pane::Diff => self.current_diff_lines()[index]
+                    .text
+                    .to_lowercase()
+                    .contains(needle),
+            },
+        )
     }
 
     fn focus_previous(&mut self, status: &'static str) {
@@ -926,6 +992,7 @@ impl App {
                 self.select_file(selected);
             }
             Pane::Diff => {
+                self.diff_row_offset = 0;
                 self.diff_scroll = if upward {
                     self.diff_scroll.saturating_sub(amount)
                 } else {
@@ -941,7 +1008,10 @@ impl App {
             Pane::Repository => self.select_repository(0),
             Pane::Commit => self.select_commit(0),
             Pane::File => self.select_file(0),
-            Pane::Diff => self.diff_scroll = 0,
+            Pane::Diff => {
+                self.diff_scroll = 0;
+                self.diff_row_offset = 0;
+            }
         }
         self.status = "Moved to first position".to_owned();
     }
@@ -957,7 +1027,10 @@ impl App {
             Pane::File => {
                 self.select_file(self.current_files().len().saturating_sub(1));
             }
-            Pane::Diff => self.diff_scroll = self.max_diff_scroll(),
+            Pane::Diff => {
+                self.diff_scroll = self.max_diff_scroll();
+                self.diff_row_offset = self.tail_diff_row_offset();
+            }
         }
         self.status = "Moved to last position".to_owned();
     }
@@ -972,6 +1045,8 @@ impl App {
             self.commits = ListPosition::default();
             self.files = ListPosition::default();
             self.diff_scroll = 0;
+            self.diff_row_offset = 0;
+            self.clear_diff_match();
             self.cancel_detail_if_selection_changed();
         }
     }
@@ -981,6 +1056,8 @@ impl App {
             self.commits.selected = selected;
             self.files = ListPosition::default();
             self.diff_scroll = 0;
+            self.diff_row_offset = 0;
+            self.clear_diff_match();
             self.cancel_detail_if_selection_changed();
         }
     }
@@ -989,6 +1066,8 @@ impl App {
         if selected != self.files.selected {
             self.files.selected = selected;
             self.diff_scroll = 0;
+            self.diff_row_offset = 0;
+            self.clear_diff_match();
         }
     }
 
@@ -1014,6 +1093,9 @@ impl App {
         );
 
         self.diff_scroll = self.diff_scroll.min(self.max_diff_scroll());
+        self.diff_row_offset = self
+            .diff_row_offset
+            .min(self.diff_line_rows(self.diff_scroll).saturating_sub(1));
         self.focus = self.focus.min(self.deepest_meaningful_pane());
     }
 
@@ -1036,7 +1118,87 @@ impl App {
 
     fn max_diff_scroll(&self) -> usize {
         let capacity = self.viewport_heights[Pane::Diff.index()].max(1);
-        self.current_diff_lines().len().saturating_sub(capacity)
+        let lines = self.current_diff_lines();
+        let mut rows: usize = 0;
+        for index in (0..lines.len()).rev() {
+            rows = rows.saturating_add(self.diff_line_rows(index));
+            if rows > capacity {
+                return index.saturating_add(1).min(lines.len().saturating_sub(1));
+            }
+        }
+        0
+    }
+
+    fn ensure_diff_line_visible(&mut self, index: usize) {
+        let capacity = self.viewport_heights[Pane::Diff.index()].max(1);
+        if index < self.diff_scroll {
+            self.diff_scroll = index;
+            self.diff_row_offset = 0;
+            return;
+        }
+        let mut rows: usize = 0;
+        for line in self.diff_scroll..=index {
+            rows = rows.saturating_add(self.diff_line_rows(line));
+        }
+        if rows > capacity {
+            self.diff_scroll = index;
+            let mut rows = self.diff_line_rows(index);
+            while self.diff_scroll > 0 {
+                let previous = self.diff_line_rows(self.diff_scroll - 1);
+                if rows.saturating_add(previous) > capacity {
+                    break;
+                }
+                rows += previous;
+                self.diff_scroll -= 1;
+            }
+        }
+        self.diff_row_offset = 0;
+    }
+
+    fn tail_diff_row_offset(&self) -> usize {
+        let capacity = self.viewport_heights[Pane::Diff.index()].max(1);
+        let total_rows = (self.diff_scroll..self.current_diff_lines().len())
+            .map(|index| self.diff_line_rows(index))
+            .sum::<usize>();
+        total_rows.saturating_sub(capacity)
+    }
+
+    fn clear_diff_match(&mut self) {
+        self.diff_match = None;
+        self.diff_row_offset = 0;
+    }
+
+    pub fn diff_match(&self) -> Option<usize> {
+        self.diff_match
+    }
+
+    pub fn diff_row_offset(&self) -> usize {
+        self.diff_row_offset
+    }
+
+    pub fn diff_gutter_width(&self) -> usize {
+        let max_number = self
+            .current_diff_lines()
+            .iter()
+            .flat_map(|line| [line.old_line, line.new_line])
+            .flatten()
+            .max()
+            .unwrap_or(0);
+        decimal_width(max_number)
+            .saturating_mul(2)
+            .saturating_add(3)
+    }
+
+    pub fn diff_content_width(&self) -> usize {
+        self.diff_viewport_width
+            .saturating_sub(self.diff_gutter_width())
+            .max(1)
+    }
+
+    pub fn diff_line_rows(&self, index: usize) -> usize {
+        self.current_diff_lines().get(index).map_or(0, |line| {
+            wrapped_row_count(&line.text, self.diff_content_width())
+        })
     }
 
     pub fn inbox(&self) -> &Inbox {
@@ -1139,6 +1301,28 @@ impl App {
 
     pub fn search_query(&self) -> &str {
         &self.search_query
+    }
+
+    pub fn review_progress(&self) -> (usize, usize) {
+        let total = self
+            .inbox
+            .repositories
+            .iter()
+            .map(|repository| repository.commits.len())
+            .sum();
+        let reviewed = self
+            .inbox
+            .repositories
+            .iter()
+            .flat_map(|repository| {
+                repository
+                    .commits
+                    .iter()
+                    .map(move |commit| (repository, commit))
+            })
+            .filter(|(repository, commit)| self.is_reviewed(repository.identity.id, &commit.sha))
+            .count();
+        (reviewed, total)
     }
 
     pub fn status(&self) -> &str {
@@ -1342,9 +1526,10 @@ impl App {
     }
 }
 
-fn find_wrapped(
+fn find_wrapped_direction(
     length: usize,
     current: usize,
+    backward: bool,
     mut matches: impl FnMut(usize) -> bool,
 ) -> Option<usize> {
     if length == 0 {
@@ -1352,9 +1537,26 @@ fn find_wrapped(
     }
 
     let current = current.min(length - 1);
-    ((current + 1)..length)
-        .chain(0..=current)
-        .find(|&index| matches(index))
+    if backward {
+        (0..current)
+            .rev()
+            .chain((current..length).rev())
+            .find(|&index| matches(index))
+    } else {
+        ((current + 1)..length)
+            .chain(0..=current)
+            .find(|&index| matches(index))
+    }
+}
+
+fn decimal_width(number: u32) -> usize {
+    number.to_string().len().max(1)
+}
+
+fn wrapped_row_count(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let display_width = UnicodeWidthStr::width(text);
+    display_width.div_ceil(width).max(1)
 }
 
 fn moved_index(current: usize, length: usize, upward: bool, amount: usize) -> usize {
@@ -1402,6 +1604,15 @@ fn pane_viewport_heights(width: u16, height: u16) -> [usize; 4] {
         file_outer.saturating_sub(2) as usize,
         pane_height.saturating_sub(2) as usize,
     ]
+}
+
+fn diff_viewport_width(width: u16) -> usize {
+    if width < MIN_FULL_WIDTH {
+        return 0;
+    }
+    width
+        .saturating_sub(width.saturating_mul(44) / 100)
+        .saturating_sub(2) as usize
 }
 
 #[cfg(test)]
@@ -1582,11 +1793,11 @@ mod tests {
         app.focus = Pane::Diff;
 
         app.apply(Command::Last);
-        assert_eq!(app.scroll(Pane::Diff), 4);
+        assert_eq!(app.scroll(Pane::Diff), 5);
         app.apply(Command::MoveDown);
-        assert_eq!(app.scroll(Pane::Diff), 4);
+        assert_eq!(app.scroll(Pane::Diff), 5);
         app.apply(Command::HalfPageUp);
-        assert_eq!(app.scroll(Pane::Diff), 3);
+        assert_eq!(app.scroll(Pane::Diff), 4);
         app.apply(Command::GPrefix);
         app.apply(Command::GPrefix);
         assert_eq!(app.scroll(Pane::Diff), 0);
@@ -1723,7 +1934,7 @@ mod tests {
         let selected = app.selected(Pane::Repository);
 
         app.handle_input(Input::Character('/'));
-        for character in ['h', 'j', 'k', 'l', 'g', 'G', '?', 'q'] {
+        for character in ['h', 'j', 'k', 'l', 'g', 'G', 'n', 'N', '?', 'q'] {
             app.handle_input(Input::Character(character));
         }
 
@@ -1733,7 +1944,7 @@ mod tests {
                 target: Pane::Repository
             }
         );
-        assert_eq!(app.search_query(), "hjklgG?q");
+        assert_eq!(app.search_query(), "hjklgGnN?q");
         assert_eq!(app.focus(), focus);
         assert_eq!(app.selected(Pane::Repository), selected);
         assert!(!app.should_quit());
@@ -1798,6 +2009,99 @@ mod tests {
         enter_search(&mut app, "not present");
         assert_eq!(app.scroll(Pane::Diff), before);
         assert_eq!(app.status(), "No match for 'not present' in Diff");
+    }
+
+    #[test]
+    fn repeated_search_wraps_in_every_pane_and_reports_missing_context() {
+        let mut app = app();
+        app.handle_input(Input::Character('n'));
+        assert_eq!(app.status(), "No previous search");
+
+        enter_search(&mut app, "fictional");
+        assert_eq!(app.selected(Pane::Repository), 1);
+        app.handle_input(Input::Character('n'));
+        assert_eq!(app.selected(Pane::Repository), 2);
+        app.handle_input(Input::Character('n'));
+        assert_eq!(app.selected(Pane::Repository), 0);
+        assert!(app.status().contains("wrapped"));
+        app.handle_input(Input::Character('N'));
+        assert_eq!(app.selected(Pane::Repository), 2);
+
+        app.handle_input(Input::Character('l'));
+        enter_search(&mut app, "e");
+        assert_eq!(app.selected(Pane::Commit), 2);
+        app.handle_input(Input::Character('n'));
+        assert_eq!(app.selected(Pane::Commit), 0);
+        app.handle_input(Input::Character('N'));
+        assert_eq!(app.selected(Pane::Commit), 2);
+
+        app.handle_input(Input::Character('l'));
+        enter_search(&mut app, ".rs");
+        assert_eq!(app.selected(Pane::File), 1);
+        app.handle_input(Input::Character('n'));
+        assert_eq!(app.selected(Pane::File), 2);
+        app.handle_input(Input::Character('N'));
+        assert_eq!(app.selected(Pane::File), 1);
+
+        app.handle_input(Input::Character('l'));
+        enter_search(&mut app, "e");
+        assert_eq!(app.diff_match(), Some(2));
+        app.handle_input(Input::Character('n'));
+        assert_eq!(app.diff_match(), Some(4));
+        app.handle_input(Input::Character('n'));
+        assert_eq!(app.diff_match(), Some(0));
+        app.handle_input(Input::Character('N'));
+        assert_eq!(app.diff_match(), Some(4));
+
+        app.select_file(2);
+        assert_eq!(app.diff_match(), None);
+        app.focus = Pane::Diff;
+        enter_search(&mut app, "e");
+        assert!(app.diff_match().is_some());
+        app.select_commit(0);
+        assert_eq!(app.diff_match(), None);
+        app.focus = Pane::Diff;
+        enter_search(&mut app, "e");
+        app.select_repository(0);
+        assert_eq!(app.diff_match(), None);
+        app.focus = Pane::Diff;
+        enter_search(&mut app, "e");
+        assert!(app.diff_match().is_some());
+        app.toggle_remaining();
+        assert_eq!(app.diff_match(), None);
+    }
+
+    #[test]
+    fn incoming_live_snapshot_invalidates_a_current_diff_match() {
+        let repository = Repository {
+            identity: repository_identity(77, "owned/live"),
+            commits: commits(),
+        };
+        let mut app = live_app_with(vec![repository.clone()]);
+        let key = DetailKey {
+            repository_id: 77,
+            sha: app.current_commit().unwrap().sha.clone(),
+        };
+        app.detail_cache.insert(
+            key,
+            DetailState::Ready(Arc::new(CommitDetail {
+                files: files(),
+                omitted_files: 0,
+                more_files_available: false,
+            })),
+        );
+        app.focus = Pane::Diff;
+        enter_search(&mut app, "e");
+        assert!(app.diff_match().is_some());
+        app.apply_load_event(LoadEvent::RepositorySnapshot {
+            repository_index: 0,
+            repository: LoadedRepository {
+                repository,
+                branch_count: 1,
+                coverage: RepositoryCoverage::Complete,
+            },
+        });
+        assert_eq!(app.diff_match(), None);
     }
 
     #[test]
