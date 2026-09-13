@@ -31,12 +31,19 @@ pub fn translate_key(key: KeyEvent) -> Option<Input> {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let command = match (key.code, control, alt) {
         (KeyCode::Char('c'), true, _) => Input::Quit,
+        (KeyCode::Char('g'), true, _) => Input::Cancel,
         (KeyCode::Char('d'), true, _) => Input::HalfPageDown,
         (KeyCode::Char('u'), true, _) => Input::HalfPageUp,
         (KeyCode::Char(character), false, false) => Input::Character(character),
         (KeyCode::Enter, false, false) => Input::Enter,
         (KeyCode::Esc, false, false) => Input::Escape,
         (KeyCode::Backspace, false, false) => Input::Backspace,
+        (KeyCode::Left, false, false) => Input::Left,
+        (KeyCode::Right, false, false) => Input::Right,
+        (KeyCode::Up, false, false) => Input::Up,
+        (KeyCode::Down, false, false) => Input::Down,
+        (KeyCode::Home, false, false) => Input::Home,
+        (KeyCode::End, false, false) => Input::End,
         _ => Input::Unrelated,
     };
     Some(command)
@@ -363,6 +370,12 @@ mod tests {
             (key(KeyCode::Enter), Input::Enter),
             (key(KeyCode::Esc), Input::Escape),
             (key(KeyCode::Backspace), Input::Backspace),
+            (key(KeyCode::Left), Input::Left),
+            (key(KeyCode::Right), Input::Right),
+            (key(KeyCode::Up), Input::Up),
+            (key(KeyCode::Down), Input::Down),
+            (key(KeyCode::Home), Input::Home),
+            (key(KeyCode::End), Input::End),
         ] {
             assert_eq!(translate_key(key), Some(expected));
         }
@@ -374,6 +387,7 @@ mod tests {
             ('d', Input::HalfPageDown),
             ('u', Input::HalfPageUp),
             ('c', Input::Quit),
+            ('g', Input::Cancel),
         ] {
             let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL);
             assert_eq!(translate_key(key), Some(expected));

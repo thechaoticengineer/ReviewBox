@@ -3,14 +3,17 @@ use std::sync::Arc;
 
 use ratatui::layout::Rect;
 
-use crate::comment_draft::{CommentDrafts, DraftStateError, DraftStore, MemoryDraftStore};
+use crate::comment_draft::{
+    CommentAnchor, CommentDraft, CommentDrafts, CommentTarget, DraftStateError, DraftStore,
+    MAX_DRAFT_CHARACTERS, MemoryDraftStore, line_target,
+};
 use crate::github::{
     DetailFailure, DetailState, FailureCategory, LoadEvent, LoadFailure, LoadProgress, LoadStatus,
     LoadedRepository, RepositoryCoverage,
 };
 use crate::inbox::{
-    Commit, CommitDetail, DiffLine, FileChange, Inbox, InboxSource, PatchCapReason, PatchContent,
-    Repository, RepositoryIdentity,
+    Commit, CommitDetail, DiffLine, DiffLineKind, FileChange, Inbox, InboxSource, PatchCapReason,
+    PatchContent, Repository, RepositoryIdentity,
 };
 use crate::review_state::{
     MemoryReviewStore, ReviewKey, ReviewMarks, ReviewStateError, ReviewStore,
@@ -20,11 +23,40 @@ use crate::ui_layout::{ReviewPaneLayout, wrap_text};
 pub const MIN_FULL_WIDTH: u16 = 60;
 pub const MIN_FULL_HEIGHT: u16 = 16;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Normal,
-    SearchEntry { target: Pane },
-    Help { previous_focus: Pane },
+    SearchEntry {
+        target: Pane,
+    },
+    Help {
+        previous_focus: Pane,
+    },
+    Edit {
+        target: CommentTarget,
+        previous_focus: Pane,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditBuffer {
+    text: String,
+    cursor: usize,
+    saved: Option<String>,
+}
+
+impl EditBuffer {
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn is_saved(&self) -> bool {
+        self.saved.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -99,6 +131,13 @@ pub enum Input {
     Backspace,
     Enter,
     Escape,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    Cancel,
     HalfPageDown,
     HalfPageUp,
     Quit,
@@ -149,6 +188,10 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
         action: "show remaining / all commits",
     },
     HelpBinding {
+        keys: "c",
+        action: "edit commit or selected-line draft",
+    },
+    HelpBinding {
         keys: "?",
         action: "open this help",
     },
@@ -167,6 +210,22 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
     HelpBinding {
         keys: "Help: Escape",
         action: "close help",
+    },
+    HelpBinding {
+        keys: "Edit: printable / Enter",
+        action: "insert text / newline",
+    },
+    HelpBinding {
+        keys: "Edit: arrows / Home / End",
+        action: "move the text cursor",
+    },
+    HelpBinding {
+        keys: "Edit: Esc / Ctrl-g",
+        action: "save and return / cancel",
+    },
+    HelpBinding {
+        keys: "Edit: Ctrl-c",
+        action: "save and quit",
     },
 ];
 
@@ -315,6 +374,7 @@ pub struct App {
     repositories: ListPosition,
     commits: ListPosition,
     files: ListPosition,
+    diff_cursor: usize,
     diff_scroll: usize,
     diff_row_offset: usize,
     diff_match: Option<usize>,
@@ -332,6 +392,7 @@ pub struct App {
     draft_store: Option<Box<dyn DraftStore>>,
     drafts: CommentDrafts,
     draft_warning: Option<String>,
+    edit_buffer: Option<EditBuffer>,
     remaining_only: bool,
     visible: Vec<VisibleRepository>,
     detail_cache: HashMap<DetailKey, DetailState>,
@@ -423,6 +484,7 @@ impl App {
             repositories: ListPosition::default(),
             commits: ListPosition::default(),
             files: ListPosition::default(),
+            diff_cursor: 0,
             diff_scroll: 0,
             diff_row_offset: 0,
             diff_match: None,
@@ -440,6 +502,7 @@ impl App {
             draft_store,
             drafts,
             draft_warning,
+            edit_buffer: None,
             remaining_only: false,
             visible: Vec::new(),
             detail_cache: HashMap::new(),
@@ -473,6 +536,7 @@ impl App {
         }
 
         let selection = self.selection_identity();
+        let previous_detail = self.current_detail_key();
 
         let live = self.live.as_mut().expect("checked above");
         match event {
@@ -618,6 +682,9 @@ impl App {
         }
 
         self.rebuild_projection(Some(selection));
+        if previous_detail != self.current_detail_key() {
+            self.reset_diff_position();
+        }
         self.clear_diff_match();
         self.cancel_detail_if_selection_changed();
         self.normalize();
@@ -637,9 +704,9 @@ impl App {
         }
 
         self.pending_g = false;
-        match self.mode {
+        match &self.mode {
             Mode::Normal => self.apply_normal(command),
-            Mode::SearchEntry { .. } | Mode::Help { .. } => {}
+            Mode::SearchEntry { .. } | Mode::Help { .. } | Mode::Edit { .. } => {}
         }
         self.normalize();
     }
@@ -647,14 +714,24 @@ impl App {
     pub fn handle_input(&mut self, input: Input) {
         if input == Input::Quit {
             self.pending_g = false;
-            self.apply_normal(Command::Quit);
+            if matches!(self.mode, Mode::Edit { .. }) {
+                if self.persist_edit() {
+                    self.quit();
+                }
+            } else {
+                self.apply_normal(Command::Quit);
+            }
             return;
         }
 
-        match self.mode {
+        match self.mode.clone() {
             Mode::Normal => self.handle_normal_input(input),
             Mode::SearchEntry { target } => self.handle_search_input(target, input),
             Mode::Help { previous_focus } => self.handle_help_input(previous_focus, input),
+            Mode::Edit {
+                target: _,
+                previous_focus,
+            } => self.handle_edit_input(previous_focus, input),
         }
         self.normalize();
     }
@@ -685,15 +762,27 @@ impl App {
             Input::Character('G') => Command::Last,
             Input::Character('m') => Command::ToggleReviewed,
             Input::Character('f') => Command::ToggleRemaining,
+            Input::Character('c') => {
+                self.open_comment_editor();
+                return;
+            }
             Input::Character('n') => Command::SearchNext,
             Input::Character('N') => Command::SearchPrevious,
             Input::Enter => Command::Open,
             Input::Escape => Command::Back,
             Input::HalfPageDown => Command::HalfPageDown,
             Input::HalfPageUp => Command::HalfPageUp,
-            Input::Character(_) | Input::Backspace | Input::Unrelated | Input::Quit => {
-                Command::Unrelated
-            }
+            Input::Character(_)
+            | Input::Backspace
+            | Input::Left
+            | Input::Right
+            | Input::Up
+            | Input::Down
+            | Input::Home
+            | Input::End
+            | Input::Cancel
+            | Input::Unrelated
+            | Input::Quit => Command::Unrelated,
         };
         self.apply(command);
     }
@@ -711,7 +800,17 @@ impl App {
                 self.mode = Mode::Normal;
                 self.status = "Search cancelled".to_owned();
             }
-            Input::HalfPageDown | Input::HalfPageUp | Input::Unrelated | Input::Quit => {}
+            Input::Left
+            | Input::Right
+            | Input::Up
+            | Input::Down
+            | Input::Home
+            | Input::End
+            | Input::Cancel
+            | Input::HalfPageDown
+            | Input::HalfPageUp
+            | Input::Unrelated
+            | Input::Quit => {}
         }
     }
 
@@ -724,12 +823,30 @@ impl App {
         }
     }
 
+    fn handle_edit_input(&mut self, previous_focus: Pane, input: Input) {
+        self.pending_g = false;
+        match input {
+            Input::Character(character) => self.insert_edit_character(character),
+            Input::Enter => self.insert_edit_character('\n'),
+            Input::Backspace => self.edit_backspace(),
+            Input::Left => self.move_edit_left(),
+            Input::Right => self.move_edit_right(),
+            Input::Up => self.move_edit_vertical(true),
+            Input::Down => self.move_edit_vertical(false),
+            Input::Home => self.move_edit_home(),
+            Input::End => self.move_edit_end(),
+            Input::Escape => {
+                self.persist_edit();
+            }
+            Input::Cancel => self.cancel_edit(previous_focus),
+            Input::HalfPageDown | Input::HalfPageUp | Input::Unrelated | Input::Quit => {}
+        }
+    }
+
     fn apply_normal(&mut self, command: Command) {
         match command {
             Command::Quit => {
-                self.cancel_active_detail();
-                self.should_quit = true;
-                self.status = "Closing ReviewBox".to_owned();
+                self.quit();
             }
             Command::FocusPrevious => self.focus_previous("Focus moved left"),
             Command::FocusNext => self.focus_next("Focus moved right"),
@@ -747,6 +864,224 @@ impl App {
             Command::SearchPrevious => self.repeat_search(true),
             Command::Unrelated => self.status = "Key has no action in normal mode".to_owned(),
         }
+    }
+
+    fn quit(&mut self) {
+        self.cancel_active_detail();
+        self.should_quit = true;
+        self.status = "Closing ReviewBox".to_owned();
+    }
+
+    fn open_comment_editor(&mut self) {
+        let target = match self.focus {
+            Pane::Repository => {
+                self.status = "Select a commit before writing a comment".to_owned();
+                return;
+            }
+            Pane::Commit | Pane::File => match self.current_commit_target() {
+                Ok(target) => target,
+                Err(message) => {
+                    self.status = message.to_owned();
+                    return;
+                }
+            },
+            Pane::Diff => match self.current_line_comment_target() {
+                Ok(target) => target,
+                Err(message) => {
+                    self.status = message.to_owned();
+                    return;
+                }
+            },
+        };
+        let saved = self.drafts.get(&target).map(|draft| draft.body.clone());
+        let text = saved.clone().unwrap_or_default();
+        let cursor = text.len();
+        let previous_focus = self.focus;
+        self.edit_buffer = Some(EditBuffer {
+            text,
+            cursor,
+            saved,
+        });
+        self.mode = Mode::Edit {
+            target,
+            previous_focus,
+        };
+        self.status = "Editing comment draft".to_owned();
+    }
+
+    fn current_commit_target(&self) -> Result<CommentTarget, &'static str> {
+        let Some(repository) = self.current_repository() else {
+            return Err("No repository is selected");
+        };
+        let Some(commit) = self.current_commit() else {
+            return Err("No commit is selected");
+        };
+        CommentTarget::commit(repository.identity.id, &commit.sha)
+            .map_err(|_| "Selected commit cannot accept a draft")
+    }
+
+    fn current_line_comment_target(&self) -> Result<CommentTarget, &'static str> {
+        let Some(repository) = self.current_repository() else {
+            return Err("No repository is selected");
+        };
+        let Some(commit) = self.current_commit() else {
+            return Err("No commit is selected");
+        };
+        let Some(file) = self.current_file() else {
+            return Err("No diff file is selected");
+        };
+        let Some(line) = line_target(file, self.diff_cursor) else {
+            return Err("Selected diff row cannot accept a line comment");
+        };
+        CommentTarget::line(repository.identity.id, &commit.sha, line)
+            .map_err(|_| "Selected diff row cannot accept a line comment")
+    }
+
+    fn insert_edit_character(&mut self, character: char) {
+        if character != '\n' && character.is_control() {
+            self.status = "Only printable text can be inserted".to_owned();
+            return;
+        }
+        let Some(buffer) = self.edit_buffer.as_mut() else {
+            return;
+        };
+        if buffer.text.chars().count() >= MAX_DRAFT_CHARACTERS {
+            self.status = format!("Draft limit reached ({MAX_DRAFT_CHARACTERS} characters)");
+            return;
+        }
+        buffer.text.insert(buffer.cursor, character);
+        buffer.cursor += character.len_utf8();
+    }
+
+    fn edit_backspace(&mut self) {
+        let Some(buffer) = self.edit_buffer.as_mut() else {
+            return;
+        };
+        if buffer.cursor == 0 {
+            return;
+        }
+        let previous = previous_char_boundary(&buffer.text, buffer.cursor);
+        buffer.text.drain(previous..buffer.cursor);
+        buffer.cursor = previous;
+    }
+
+    fn move_edit_left(&mut self) {
+        if let Some(buffer) = self.edit_buffer.as_mut() {
+            buffer.cursor = previous_char_boundary(&buffer.text, buffer.cursor);
+        }
+    }
+
+    fn move_edit_right(&mut self) {
+        if let Some(buffer) = self.edit_buffer.as_mut() {
+            buffer.cursor = next_char_boundary(&buffer.text, buffer.cursor);
+        }
+    }
+
+    fn move_edit_vertical(&mut self, upward: bool) {
+        let Some(buffer) = self.edit_buffer.as_mut() else {
+            return;
+        };
+        buffer.cursor = vertical_cursor(&buffer.text, buffer.cursor, upward);
+    }
+
+    fn move_edit_home(&mut self) {
+        if let Some(buffer) = self.edit_buffer.as_mut() {
+            buffer.cursor = current_line_bounds(&buffer.text, buffer.cursor).0;
+        }
+    }
+
+    fn move_edit_end(&mut self) {
+        if let Some(buffer) = self.edit_buffer.as_mut() {
+            buffer.cursor = current_line_bounds(&buffer.text, buffer.cursor).1;
+        }
+    }
+
+    fn cancel_edit(&mut self, previous_focus: Pane) {
+        if let Some(buffer) = self.edit_buffer.as_mut() {
+            buffer.text = buffer.saved.clone().unwrap_or_default();
+            buffer.cursor = buffer.text.len();
+        }
+        self.edit_buffer = None;
+        self.focus = previous_focus;
+        self.mode = Mode::Normal;
+        self.status = "Comment edit cancelled; saved draft unchanged".to_owned();
+    }
+
+    fn persist_edit(&mut self) -> bool {
+        let Mode::Edit {
+            target,
+            previous_focus,
+        } = self.mode.clone()
+        else {
+            return true;
+        };
+        let Some(buffer) = self.edit_buffer.as_ref() else {
+            self.status = "Comment editor state is unavailable".to_owned();
+            return false;
+        };
+        let body = buffer.text.clone();
+        let had_saved_draft = buffer.saved.is_some();
+        let deleting_saved_draft = had_saved_draft && body.chars().all(char::is_whitespace);
+
+        let result = if body.chars().all(char::is_whitespace) {
+            if had_saved_draft {
+                self.draft_store
+                    .as_ref()
+                    .ok_or(DraftStateError::Unavailable)
+                    .and_then(|store| store.delete(&target))
+                    .map(Some)
+            } else {
+                Ok(None)
+            }
+        } else {
+            CommentDraft::new(target.clone(), body)
+                .and_then(|draft| {
+                    self.draft_store
+                        .as_ref()
+                        .ok_or(DraftStateError::Unavailable)?
+                        .save(&draft)
+                })
+                .map(Some)
+        };
+
+        match result {
+            Ok(Some(drafts)) => {
+                self.drafts = drafts;
+                self.finish_edit(
+                    previous_focus,
+                    if deleting_saved_draft {
+                        "Blank comment draft deleted"
+                    } else if had_saved_draft {
+                        "Comment draft saved"
+                    } else {
+                        "New comment draft saved"
+                    },
+                );
+                true
+            }
+            Ok(None) => {
+                self.finish_edit(
+                    previous_focus,
+                    if had_saved_draft {
+                        "Blank comment draft deleted"
+                    } else {
+                        "Blank new comment discarded"
+                    },
+                );
+                true
+            }
+            Err(error) => {
+                self.status = format!("Comment draft not saved: {error}");
+                false
+            }
+        }
+    }
+
+    fn finish_edit(&mut self, previous_focus: Pane, status: &'static str) {
+        self.edit_buffer = None;
+        self.focus = previous_focus;
+        self.mode = Mode::Normal;
+        self.status = status.to_owned();
     }
 
     fn open_selected(&mut self) {
@@ -842,9 +1177,13 @@ impl App {
         let selection = self.selection_identity();
         self.remaining_only = !self.remaining_only;
         self.rebuild_projection(Some(selection));
-        self.clear_diff_match();
-        if self.focus > Pane::Commit && before != self.current_detail_key() {
-            self.focus = Pane::Commit;
+        if before != self.current_detail_key() {
+            self.reset_diff_position();
+            if self.focus > Pane::Commit {
+                self.focus = Pane::Commit;
+            }
+        } else {
+            self.clear_diff_match();
         }
         self.cancel_detail_if_selection_changed();
         self.status = if self.remaining_only {
@@ -887,7 +1226,7 @@ impl App {
                 self.status = "Commit detail request failed".to_owned();
             }
         }
-        self.clear_diff_match();
+        self.reset_diff_position();
         self.normalize();
     }
 
@@ -926,7 +1265,7 @@ impl App {
             Pane::Repository => self.repositories.selected,
             Pane::Commit => self.commits.selected,
             Pane::File => self.files.selected,
-            Pane::Diff => self.diff_match.unwrap_or(self.diff_scroll),
+            Pane::Diff => self.diff_cursor,
         };
         let found = self.find_match(target, current, backward);
         let direction = if backward { "previous" } else { "next" };
@@ -937,6 +1276,7 @@ impl App {
                 Pane::File => self.select_file(index),
                 Pane::Diff => {
                     self.diff_match = Some(index);
+                    self.diff_cursor = index;
                     self.ensure_diff_line_visible(index);
                 }
             }
@@ -1047,12 +1387,13 @@ impl App {
                 self.select_file(selected);
             }
             Pane::Diff => {
-                self.diff_row_offset = 0;
-                self.diff_scroll = if upward {
-                    self.diff_scroll.saturating_sub(amount)
-                } else {
-                    self.diff_scroll.saturating_add(amount)
-                };
+                self.diff_cursor = moved_index(
+                    self.diff_cursor,
+                    self.current_diff_lines().len(),
+                    upward,
+                    amount,
+                );
+                self.ensure_diff_line_visible(self.diff_cursor);
             }
         }
         self.status = if upward { "Moved up" } else { "Moved down" }.to_owned();
@@ -1064,8 +1405,8 @@ impl App {
             Pane::Commit => self.select_commit(0),
             Pane::File => self.select_file(0),
             Pane::Diff => {
-                self.diff_scroll = 0;
-                self.diff_row_offset = 0;
+                self.diff_cursor = 0;
+                self.ensure_diff_line_visible(0);
             }
         }
         self.status = "Moved to first position".to_owned();
@@ -1083,6 +1424,7 @@ impl App {
                 self.select_file(self.current_files().len().saturating_sub(1));
             }
             Pane::Diff => {
+                self.diff_cursor = self.current_diff_lines().len().saturating_sub(1);
                 self.diff_scroll = self.max_diff_scroll();
                 self.diff_row_offset = self.tail_diff_row_offset();
             }
@@ -1099,9 +1441,7 @@ impl App {
             self.repositories.selected = selected;
             self.commits = ListPosition::default();
             self.files = ListPosition::default();
-            self.diff_scroll = 0;
-            self.diff_row_offset = 0;
-            self.clear_diff_match();
+            self.reset_diff_position();
             self.cancel_detail_if_selection_changed();
         }
     }
@@ -1110,9 +1450,7 @@ impl App {
         if selected != self.commits.selected {
             self.commits.selected = selected;
             self.files = ListPosition::default();
-            self.diff_scroll = 0;
-            self.diff_row_offset = 0;
-            self.clear_diff_match();
+            self.reset_diff_position();
             self.cancel_detail_if_selection_changed();
         }
     }
@@ -1120,9 +1458,7 @@ impl App {
     fn select_file(&mut self, selected: usize) {
         if selected != self.files.selected {
             self.files.selected = selected;
-            self.diff_scroll = 0;
-            self.diff_row_offset = 0;
-            self.clear_diff_match();
+            self.reset_diff_position();
         }
     }
 
@@ -1147,10 +1483,21 @@ impl App {
             self.viewport_heights[Pane::File.index()],
         );
 
+        let diff_len = self.current_diff_lines().len();
+        self.diff_cursor = self.diff_cursor.min(diff_len.saturating_sub(1));
         self.diff_scroll = self.diff_scroll.min(self.max_diff_scroll());
         self.diff_row_offset = self
             .diff_row_offset
             .min(self.diff_line_rows(self.diff_scroll).saturating_sub(1));
+        let tail_requested = diff_len > 0
+            && self.diff_cursor == diff_len.saturating_sub(1)
+            && self.diff_row_offset > 0;
+        if tail_requested {
+            self.diff_scroll = self.max_diff_scroll();
+            self.diff_row_offset = self.tail_diff_row_offset();
+        } else if diff_len > 0 {
+            self.ensure_diff_line_visible(self.diff_cursor);
+        }
         self.focus = self.focus.min(self.deepest_meaningful_pane());
     }
 
@@ -1223,8 +1570,19 @@ impl App {
         self.diff_row_offset = 0;
     }
 
+    fn reset_diff_position(&mut self) {
+        self.diff_cursor = 0;
+        self.diff_scroll = 0;
+        self.diff_row_offset = 0;
+        self.diff_match = None;
+    }
+
     pub fn diff_match(&self) -> Option<usize> {
         self.diff_match
+    }
+
+    pub fn diff_cursor(&self) -> usize {
+        self.diff_cursor
     }
 
     pub fn diff_row_offset(&self) -> usize {
@@ -1241,7 +1599,7 @@ impl App {
             .unwrap_or(0);
         decimal_width(max_number)
             .saturating_mul(2)
-            .saturating_add(3)
+            .saturating_add(5)
     }
 
     pub fn diff_content_width(&self) -> usize {
@@ -1354,7 +1712,7 @@ impl App {
     }
 
     pub fn mode(&self) -> Mode {
-        self.mode
+        self.mode.clone()
     }
 
     pub fn focus(&self) -> Pane {
@@ -1366,7 +1724,7 @@ impl App {
             Pane::Repository => self.repositories.selected,
             Pane::Commit => self.commits.selected,
             Pane::File => self.files.selected,
-            Pane::Diff => self.diff_scroll,
+            Pane::Diff => self.diff_cursor,
         }
     }
 
@@ -1468,6 +1826,128 @@ impl App {
 
     pub fn draft_count(&self) -> usize {
         self.drafts.len()
+    }
+
+    pub fn edit_buffer(&self) -> Option<&EditBuffer> {
+        self.edit_buffer.as_ref()
+    }
+
+    pub fn commit_has_draft(&self, repository_id: u64, sha: &str) -> bool {
+        CommentTarget::commit(repository_id, sha)
+            .ok()
+            .is_some_and(|target| self.drafts.get(&target).is_some())
+    }
+
+    pub fn diff_line_has_draft(&self, row: usize) -> bool {
+        let Some(repository) = self.current_repository() else {
+            return false;
+        };
+        let Some(commit) = self.current_commit() else {
+            return false;
+        };
+        let Some(file) = self.current_file() else {
+            return false;
+        };
+        line_target(file, row)
+            .and_then(|line| CommentTarget::line(repository.identity.id, &commit.sha, line).ok())
+            .is_some_and(|target| self.drafts.get(&target).is_some())
+    }
+
+    pub fn diff_comment_feedback(&self) -> String {
+        let Some(file) = self.current_file() else {
+            return "line comments unavailable: no diff".to_owned();
+        };
+        if let Some(target) = line_target(file, self.diff_cursor) {
+            return format!("commentable {}:{}", target.path, target.position);
+        }
+        if !file.api_path_is_commentable {
+            return "line comments unavailable: unsafe API path".to_owned();
+        }
+        let lines = match &file.patch {
+            PatchContent::Text { lines }
+            | PatchContent::Capped {
+                lines,
+                reason: PatchCapReason::FileLimit,
+                ..
+            } => lines,
+            PatchContent::Capped {
+                reason: PatchCapReason::CommitBudget,
+                ..
+            } => return "line comments unavailable: commit-budget omission".to_owned(),
+            PatchContent::Empty => return "line comments unavailable: empty patch".to_owned(),
+            PatchContent::NoPatch | PatchContent::Unavailable => {
+                return "line comments unavailable: no text patch".to_owned();
+            }
+        };
+        if lines.first().map(|line| line.kind) != Some(DiffLineKind::Hunk) {
+            return "line comments unavailable: invalid hunk".to_owned();
+        }
+        match lines.get(self.diff_cursor).map(|line| line.kind) {
+            Some(DiffLineKind::Hunk) => "line comments unavailable: hunk header".to_owned(),
+            Some(DiffLineKind::NoNewline) => {
+                "line comments unavailable: no-newline marker".to_owned()
+            }
+            Some(DiffLineKind::Other) => {
+                "line comments unavailable: unsupported patch row".to_owned()
+            }
+            Some(DiffLineKind::Context | DiffLineKind::Addition | DiffLineKind::Deletion) => {
+                "line comments unavailable: invalid target".to_owned()
+            }
+            None => "line comments unavailable: no selected row".to_owned(),
+        }
+    }
+
+    pub fn edit_target_description(&self, target: &CommentTarget) -> String {
+        let short_sha: String = target.sha().chars().take(7).collect();
+        match target.anchor() {
+            CommentAnchor::Commit => format!("commit {short_sha}"),
+            CommentAnchor::Line(line) => {
+                let line_number = self
+                    .target_line_numbers(target)
+                    .map(|(old, new)| match (old, new) {
+                        (Some(old), Some(new)) => format!("old {old}, new {new}"),
+                        (Some(old), None) => format!("old {old}"),
+                        (None, Some(new)) => format!("new {new}"),
+                        (None, None) => "line number unavailable".to_owned(),
+                    })
+                    .unwrap_or_else(|| "line number unavailable".to_owned());
+                format!(
+                    "{short_sha} • {}:{} • {line_number}",
+                    line.path, line.position
+                )
+            }
+        }
+    }
+
+    fn target_line_numbers(&self, target: &CommentTarget) -> Option<(Option<u32>, Option<u32>)> {
+        let CommentAnchor::Line(line) = target.anchor() else {
+            return None;
+        };
+        let row = usize::try_from(line.position).ok()?;
+        let repository = self
+            .inbox
+            .repositories
+            .iter()
+            .find(|repository| repository.identity.id == target.repository_id())?;
+        let commit = repository
+            .commits
+            .iter()
+            .find(|commit| commit.sha == target.sha())?;
+        let files = if self.inbox.child_panes_available() {
+            commit.files.as_slice()
+        } else {
+            let key = DetailKey {
+                repository_id: target.repository_id(),
+                sha: target.sha().to_owned(),
+            };
+            match self.detail_cache.get(&key) {
+                Some(DetailState::Ready(detail)) => &detail.files,
+                _ => return None,
+            }
+        };
+        let content = files.iter().find(|file| file.path == line.path)?;
+        let diff_line = content.patch.lines().get(row)?;
+        Some((diff_line.old_line, diff_line.new_line))
     }
 
     #[cfg(test)]
@@ -1631,6 +2111,54 @@ impl App {
     }
 }
 
+fn previous_char_boundary(text: &str, cursor: usize) -> usize {
+    text[..cursor]
+        .char_indices()
+        .next_back()
+        .map_or(0, |(index, _)| index)
+}
+
+fn next_char_boundary(text: &str, cursor: usize) -> usize {
+    text[cursor..]
+        .chars()
+        .next()
+        .map_or(text.len(), |character| cursor + character.len_utf8())
+}
+
+fn current_line_bounds(text: &str, cursor: usize) -> (usize, usize) {
+    let start = text[..cursor].rfind('\n').map_or(0, |index| index + 1);
+    let end = text[cursor..]
+        .find('\n')
+        .map_or(text.len(), |index| cursor + index);
+    (start, end)
+}
+
+fn vertical_cursor(text: &str, cursor: usize, upward: bool) -> usize {
+    let (start, end) = current_line_bounds(text, cursor);
+    let column = text[start..cursor].chars().count();
+    let (target_start, target_end) = if upward {
+        if start == 0 {
+            return cursor;
+        }
+        let target_end = start - 1;
+        let target_start = text[..target_end].rfind('\n').map_or(0, |index| index + 1);
+        (target_start, target_end)
+    } else {
+        if end == text.len() {
+            return cursor;
+        }
+        let target_start = end + 1;
+        let target_end = text[target_start..]
+            .find('\n')
+            .map_or(text.len(), |index| target_start + index);
+        (target_start, target_end)
+    };
+    text[target_start..target_end]
+        .char_indices()
+        .nth(column)
+        .map_or(target_end, |(index, _)| target_start + index)
+}
+
 fn find_wrapped_direction(
     length: usize,
     current: usize,
@@ -1734,6 +2262,241 @@ mod tests {
         assert_eq!(app.draft_count(), 0);
         assert!(app.review_warning().is_none());
         assert!(app.draft_warning().unwrap().contains("comment-drafts.json"));
+    }
+
+    fn type_edit_text(app: &mut App, text: &str) {
+        for character in text.chars() {
+            app.handle_input(if character == '\n' {
+                Input::Enter
+            } else {
+                Input::Character(character)
+            });
+        }
+    }
+
+    fn open_first_commit_editor(app: &mut App) {
+        app.handle_input(Input::Character('l'));
+        assert_eq!(app.focus(), Pane::Commit);
+        app.handle_input(Input::Character('c'));
+        assert!(matches!(app.mode(), Mode::Edit { .. }));
+    }
+
+    #[test]
+    fn keyboard_commit_draft_supports_multiline_cursor_edit_save_and_reopen() {
+        let mut app = App::new(DemoFixture::load());
+        open_first_commit_editor(&mut app);
+        type_edit_text(&mut app, "alpha\nbeta");
+        app.handle_input(Input::Escape);
+
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.focus(), Pane::Commit);
+        assert_eq!(app.draft_count(), 1);
+        app.handle_input(Input::Character('c'));
+        assert_eq!(app.edit_buffer().unwrap().text(), "alpha\nbeta");
+        assert!(app.edit_buffer().unwrap().is_saved());
+
+        app.handle_input(Input::Up);
+        app.handle_input(Input::Home);
+        app.handle_input(Input::Right);
+        app.handle_input(Input::Character('X'));
+        app.handle_input(Input::Down);
+        app.handle_input(Input::End);
+        app.handle_input(Input::Character('!'));
+        app.handle_input(Input::Escape);
+        app.handle_input(Input::Character('c'));
+        assert_eq!(app.edit_buffer().unwrap().text(), "aXlpha\nbeta!");
+    }
+
+    #[test]
+    fn every_normal_mode_character_is_inserted_while_editing() {
+        let mut app = App::new(DemoFixture::load());
+        open_first_commit_editor(&mut app);
+        let focus = app.focus();
+        let characters = "hjklqnN/?mfgGcEPC";
+        type_edit_text(&mut app, characters);
+
+        assert_eq!(app.edit_buffer().unwrap().text(), characters);
+        assert_eq!(app.focus(), focus);
+        assert!(!app.should_quit());
+        assert!(matches!(app.mode(), Mode::Edit { .. }));
+    }
+
+    #[test]
+    fn keyboard_line_drafts_reject_unsupported_rows_and_keep_targets_separate() {
+        let mut app = App::new(DemoFixture::load());
+        for key in ['l', 'l', 'l'] {
+            app.handle_input(Input::Character(key));
+        }
+        assert_eq!(app.focus(), Pane::Diff);
+        app.handle_input(Input::Character('c'));
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.draft_count(), 0);
+        assert!(app.status().contains("cannot accept"));
+
+        app.handle_input(Input::Character('j'));
+        app.handle_input(Input::Character('c'));
+        let first_target = match app.mode() {
+            Mode::Edit { target, .. } => target,
+            mode => panic!("expected line editor, got {mode:?}"),
+        };
+        assert!(matches!(first_target.anchor(), CommentAnchor::Line(_)));
+        type_edit_text(&mut app, "first line draft");
+        app.handle_input(Input::Escape);
+
+        app.handle_input(Input::Character('h'));
+        app.handle_input(Input::Character('j'));
+        app.handle_input(Input::Character('l'));
+        app.handle_input(Input::Character('j'));
+        app.handle_input(Input::Character('c'));
+        let second_target = match app.mode() {
+            Mode::Edit { target, .. } => target,
+            mode => panic!("expected second line editor, got {mode:?}"),
+        };
+        assert_ne!(first_target, second_target);
+        type_edit_text(&mut app, "second line draft");
+        app.handle_input(Input::Escape);
+
+        assert_eq!(app.draft_count(), 2);
+        assert_eq!(
+            app.drafts.get(&first_target).unwrap().body,
+            "first line draft"
+        );
+        assert_eq!(
+            app.drafts.get(&second_target).unwrap().body,
+            "second line draft"
+        );
+    }
+
+    #[test]
+    fn cancel_restores_the_last_saved_body_and_blank_save_deletes_it() {
+        let mut app = App::new(DemoFixture::load());
+        open_first_commit_editor(&mut app);
+        type_edit_text(&mut app, "saved");
+        app.handle_input(Input::Escape);
+        app.handle_input(Input::Character('c'));
+        type_edit_text(&mut app, " but cancelled");
+        app.handle_input(Input::Cancel);
+        assert_eq!(app.mode(), Mode::Normal);
+
+        app.handle_input(Input::Character('c'));
+        assert_eq!(app.edit_buffer().unwrap().text(), "saved");
+        for _ in 0.."saved".len() {
+            app.handle_input(Input::Backspace);
+        }
+        app.handle_input(Input::Escape);
+        assert_eq!(app.draft_count(), 0);
+        assert_eq!(app.status(), "Blank comment draft deleted");
+    }
+
+    #[derive(Debug)]
+    struct FailingDraftStore;
+
+    impl DraftStore for FailingDraftStore {
+        fn load(&self) -> Result<CommentDrafts, DraftStateError> {
+            Ok(CommentDrafts::default())
+        }
+
+        fn save(&self, _draft: &CommentDraft) -> Result<CommentDrafts, DraftStateError> {
+            Err(DraftStateError::Write(std::io::ErrorKind::PermissionDenied))
+        }
+
+        fn delete(&self, _target: &CommentTarget) -> Result<CommentDrafts, DraftStateError> {
+            Err(DraftStateError::Write(std::io::ErrorKind::PermissionDenied))
+        }
+    }
+
+    #[test]
+    fn failed_save_and_ctrl_c_keep_editable_text_without_quitting() {
+        let mut app = App::with_stores(
+            DemoFixture::load(),
+            Box::new(MemoryReviewStore::default()),
+            Box::new(FailingDraftStore),
+        );
+        open_first_commit_editor(&mut app);
+        type_edit_text(&mut app, "private fictional body");
+
+        app.handle_input(Input::Escape);
+        assert!(matches!(app.mode(), Mode::Edit { .. }));
+        assert_eq!(app.edit_buffer().unwrap().text(), "private fictional body");
+        assert!(!app.status().contains("private fictional body"));
+        app.handle_input(Input::Quit);
+        assert!(matches!(app.mode(), Mode::Edit { .. }));
+        assert_eq!(app.edit_buffer().unwrap().text(), "private fictional body");
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn successful_ctrl_c_saves_before_quitting() {
+        let mut app = App::new(DemoFixture::load());
+        open_first_commit_editor(&mut app);
+        type_edit_text(&mut app, "save before quit");
+
+        app.handle_input(Input::Quit);
+
+        assert!(app.should_quit());
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.draft_count(), 1);
+    }
+
+    #[test]
+    fn editor_refuses_text_beyond_the_character_limit() {
+        let target =
+            CommentTarget::commit(9_000_001, "a1b2c3d000000000000000000000000000000000").unwrap();
+        let draft_store = MemoryDraftStore::default();
+        draft_store
+            .save(&CommentDraft::new(target, "x".repeat(MAX_DRAFT_CHARACTERS)).unwrap())
+            .unwrap();
+        let mut app = App::with_stores(
+            DemoFixture::load(),
+            Box::new(MemoryReviewStore::default()),
+            Box::new(draft_store),
+        );
+        open_first_commit_editor(&mut app);
+
+        app.handle_input(Input::Character('y'));
+
+        assert_eq!(
+            app.edit_buffer().unwrap().text().chars().count(),
+            MAX_DRAFT_CHARACTERS
+        );
+        assert!(app.status().contains("Draft limit reached"));
+    }
+
+    #[test]
+    fn edit_target_survives_live_snapshot_reordering_and_disappearance() {
+        let mut app = live_app();
+        let repository = loaded_repository("fixture/edit-stability", commits());
+        app.apply_load_event(LoadEvent::RepositorySnapshot {
+            repository_index: 0,
+            repository: repository.clone(),
+        });
+        open_first_commit_editor(&mut app);
+        let original_target = match app.mode() {
+            Mode::Edit { target, .. } => target,
+            _ => unreachable!(),
+        };
+
+        let mut reordered = repository;
+        reordered.repository.commits.reverse();
+        app.apply_load_event(LoadEvent::RepositorySnapshot {
+            repository_index: 0,
+            repository: reordered,
+        });
+        app.apply_load_event(LoadEvent::RepositorySnapshot {
+            repository_index: 0,
+            repository: loaded_repository("fixture/edit-stability", Vec::new()),
+        });
+
+        assert!(matches!(
+            app.mode(),
+            Mode::Edit { ref target, .. } if target == &original_target
+        ));
+        type_edit_text(&mut app, "stable identity");
+        app.handle_input(Input::Escape);
+        assert_eq!(
+            app.drafts.get(&original_target).unwrap().body,
+            "stable identity"
+        );
     }
 
     fn files() -> Vec<FileChange> {

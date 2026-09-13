@@ -9,6 +9,7 @@ use crate::day::TimezoneSource;
 use crate::github::{DetailFailure, DetailState, FailureCategory, RESPONSE_TRUNCATED_LABEL};
 use crate::inbox::{DiffLineKind, InboxSource, PatchContent};
 use crate::ui_layout::{ReviewPaneLayout, wrap_text};
+use unicode_width::UnicodeWidthChar;
 
 pub(crate) const NO_PATCH_LABEL: &str =
     "No GitHub text patch (binary, rename/mode-only, or empty file)";
@@ -53,11 +54,20 @@ fn draw_review_panes(frame: &mut Frame<'_>, layout: ReviewPaneLayout, app: &App)
         app.current_commits()
             .iter()
             .map(|commit| {
-                let reviewed = app
-                    .current_repository()
-                    .is_some_and(|repository| app.is_reviewed(repository.identity.id, &commit.sha));
-                let marker = if reviewed { "✓ " } else { "  " };
-                format!("{marker}{}", sanitize_display_text(&commit.label()))
+                let (reviewed, drafted) =
+                    app.current_repository()
+                        .map_or((false, false), |repository| {
+                            (
+                                app.is_reviewed(repository.identity.id, &commit.sha),
+                                app.commit_has_draft(repository.identity.id, &commit.sha),
+                            )
+                        });
+                let review_marker = if reviewed { "✓" } else { " " };
+                let draft_marker = if drafted { "◆" } else { " " };
+                format!(
+                    "{review_marker}{draft_marker} {}",
+                    sanitize_display_text(&commit.label())
+                )
             })
             .collect(),
         "commits",
@@ -393,7 +403,7 @@ fn diff_message(app: &App, area: Rect, message: &str, style: Style) -> Vec<Line<
 fn diff_lines(app: &App, available_rows: usize) -> Vec<Line<'static>> {
     let mut lines = diff_notice(app);
     let gutter_width = app.diff_gutter_width();
-    let number_width = gutter_width.saturating_sub(3) / 2;
+    let number_width = gutter_width.saturating_sub(5) / 2;
     let content_width = app.diff_content_width();
     for (index, content) in app
         .current_diff_lines()
@@ -403,6 +413,8 @@ fn diff_lines(app: &App, available_rows: usize) -> Vec<Line<'static>> {
     {
         let style = diff_style(content.kind);
         let matched = app.diff_match() == Some(index);
+        let selected = app.diff_cursor() == index;
+        let drafted = app.diff_line_has_draft(index);
         for (row, text) in wrap_text(&content.text, content_width)
             .into_iter()
             .enumerate()
@@ -416,17 +428,29 @@ fn diff_lines(app: &App, available_rows: usize) -> Vec<Line<'static>> {
                 return lines;
             }
             let gutter = if row == 0 {
-                format_diff_gutter(content.old_line, content.new_line, number_width)
+                format_diff_gutter(drafted, content.old_line, content.new_line, number_width)
             } else {
                 " ".repeat(gutter_width)
             };
-            let text_style = if matched {
+            let text_style = if selected {
                 style.add_modifier(Modifier::REVERSED)
+            } else if matched {
+                style.add_modifier(Modifier::BOLD)
             } else {
                 style
             };
             lines.push(Line::from(vec![
-                Span::styled(gutter, Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    gutter,
+                    if selected {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                ),
                 Span::styled(text, text_style),
             ]));
         }
@@ -455,10 +479,11 @@ fn diff_style(kind: DiffLineKind) -> Style {
     }
 }
 
-fn format_diff_gutter(old: Option<u32>, new: Option<u32>, width: usize) -> String {
+fn format_diff_gutter(drafted: bool, old: Option<u32>, new: Option<u32>, width: usize) -> String {
     let old = old.map_or_else(String::new, |number| number.to_string());
     let new = new.map_or_else(String::new, |number| number.to_string());
-    format!("{old:>width$} {new:>width$} ")
+    let marker = if drafted { '◆' } else { ' ' };
+    format!("{marker} {old:>width$} {new:>width$} ")
 }
 
 fn sanitize_display_text(value: &str) -> String {
@@ -491,11 +516,20 @@ fn pane_block<'a>(pane: Pane, focused: bool, app: &App) -> Block<'a> {
     } else {
         "all"
     };
-    Block::default()
-        .title(format!(
+    let title = if pane == Pane::Diff {
+        format!(
+            " {} • {} • {filter} {reviewed}/{total} reviewed • {position}/{length} ",
+            pane.title(),
+            app.diff_comment_feedback()
+        )
+    } else {
+        format!(
             " {} {filter} {reviewed}/{total} reviewed • {position}/{length} ",
             pane.title()
-        ))
+        )
+    };
+    Block::default()
+        .title(title)
         .borders(Borders::ALL)
         .border_style(border_style)
 }
@@ -506,14 +540,11 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Mode::Normal => " NORMAL ",
         Mode::SearchEntry { .. } => " SEARCH ",
         Mode::Help { .. } => " HELP ",
+        Mode::Edit { .. } => " EDIT ",
     };
     let mut spans = vec![
         Span::styled(mode, Style::default().fg(Color::Black).bg(Color::Cyan)),
-        Span::raw(format!(
-            " {} • {} • h/l focus • j/k move • m review • f filter • / search • n/N match • ? help • q quit",
-            app.focus().title(),
-            app.status()
-        )),
+        Span::raw(format!(" {} • {}", app.focus().title(), app.status())),
     ];
     if let Some(warning) = app.review_warning() {
         spans.push(Span::styled(
@@ -530,6 +561,9 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if app.draft_store_available() && app.draft_count() > 0 {
         spans.push(Span::raw(format!(" • {} drafts", app.draft_count())));
     }
+    spans.push(Span::raw(
+        " • c comment • h/l focus • j/k move • m review • f filter • / search • n/N match • ? help • q quit",
+    ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -542,6 +576,7 @@ fn draw_compact(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Mode::Normal => "NORMAL",
         Mode::SearchEntry { .. } => "SEARCH",
         Mode::Help { .. } => "HELP",
+        Mode::Edit { .. } => "EDIT",
     };
     let review_warning = app
         .review_warning()
@@ -553,7 +588,7 @@ fn draw_compact(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .unwrap_or_default();
     let (reviewed, total) = app.review_progress();
     let message = Paragraph::new(format!(
-        "{mode} • {} • {} {reviewed}/{total} reviewed\nterminal too small for panes\nresize to at least 60×16\nm review • f filter • / search • n/N match • ? help • q quit{review_warning}{draft_warning}",
+        "{mode} • {} • {} {reviewed}/{total} reviewed\nterminal too small for panes\nresize to at least 60×16\nc comment • m review • f filter • / search • n/N match • ? help • q quit{review_warning}{draft_warning}",
         app.focus().title(),
         if app.remaining_only() { "remaining" } else { "all" },
     ))
@@ -567,7 +602,150 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Mode::Normal => {}
         Mode::SearchEntry { target } => draw_search(frame, area, app, target),
         Mode::Help { .. } => draw_help(frame, area),
+        Mode::Edit { target, .. } => draw_edit(frame, area, app, &target),
     }
+}
+
+fn draw_edit(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    target: &crate::comment_draft::CommentTarget,
+) {
+    let popup = if area.width < MIN_FULL_WIDTH || area.height < MIN_FULL_HEIGHT {
+        area
+    } else {
+        centered_rect(area, 82, 18)
+    };
+    frame.render_widget(Clear, popup);
+    let block = modal_block(" EDIT comment ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let Some(buffer) = app.edit_buffer() else {
+        return;
+    };
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let header_rows = inner.height.min(2);
+    let footer_rows = u16::from(inner.height > header_rows);
+    let body_height = inner.height.saturating_sub(header_rows + footer_rows);
+    let header = Rect::new(inner.x, inner.y, inner.width, header_rows);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::raw(format!("Target: {}", app.edit_target_description(target))),
+            Line::styled(
+                format!(
+                    "{} • {}",
+                    if buffer.is_saved() {
+                        "Saved draft"
+                    } else {
+                        "New draft"
+                    },
+                    app.status()
+                ),
+                if app.status().contains("not saved") {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                },
+            ),
+        ]),
+        header,
+    );
+
+    if body_height > 0 {
+        let body = Rect::new(
+            inner.x,
+            inner.y.saturating_add(header_rows),
+            inner.width,
+            body_height,
+        );
+        let (rows, cursor_row, cursor_column) =
+            wrapped_edit_rows(buffer.text(), buffer.cursor(), body.width as usize);
+        let capacity = body.height as usize;
+        let scroll = cursor_row.saturating_add(1).saturating_sub(capacity);
+        let visible = rows
+            .into_iter()
+            .skip(scroll)
+            .take(capacity)
+            .map(Line::raw)
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(visible), body);
+        let cursor_y = body
+            .y
+            .saturating_add(u16::try_from(cursor_row.saturating_sub(scroll)).unwrap_or(u16::MAX));
+        let cursor_x = body.x.saturating_add(
+            u16::try_from(cursor_column.min(body.width.saturating_sub(1) as usize))
+                .unwrap_or(u16::MAX),
+        );
+        if cursor_x < body.right() && cursor_y < body.bottom() {
+            frame.set_cursor_position((cursor_x, cursor_y));
+        }
+    }
+
+    if footer_rows > 0 {
+        let footer = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
+        frame.render_widget(
+            Paragraph::new(
+                "Esc save/return • Ctrl-g cancel • Ctrl-c save/quit • arrows/Home/End move",
+            )
+            .style(Style::default().fg(Color::Cyan)),
+            footer,
+        );
+    }
+}
+
+fn wrapped_edit_rows(text: &str, cursor: usize, width: usize) -> (Vec<String>, usize, usize) {
+    let width = width.max(1);
+    let mut rows = vec![String::new()];
+    let mut row = 0;
+    let mut column: usize = 0;
+    let mut cursor_position = None;
+    for (index, character) in text.char_indices() {
+        if character != '\n' {
+            let character_width = match character {
+                '\t' => 4,
+                character if character.is_control() => 1,
+                character => UnicodeWidthChar::width(character).unwrap_or(0),
+            };
+            if column > 0 && column.saturating_add(character_width) > width {
+                rows.push(String::new());
+                row += 1;
+                column = 0;
+            }
+        }
+        if index == cursor {
+            cursor_position = Some((row, column));
+        }
+        if character == '\n' {
+            rows.push(String::new());
+            row += 1;
+            column = 0;
+        } else {
+            let (display, character_width) = match character {
+                '\t' => ("    ".to_owned(), 4),
+                character if character.is_control() => ("�".to_owned(), 1),
+                character => (
+                    character.to_string(),
+                    UnicodeWidthChar::width(character).unwrap_or(0),
+                ),
+            };
+            rows[row].push_str(&display);
+            column = column.saturating_add(character_width);
+        }
+    }
+    if cursor == text.len() {
+        if column >= width {
+            rows.push(String::new());
+            row += 1;
+            column = 0;
+        }
+        cursor_position = Some((row, column));
+    }
+    let (cursor_row, cursor_column) = cursor_position.unwrap_or((0, 0));
+    (rows, cursor_row, cursor_column)
 }
 
 fn draw_search(frame: &mut Frame<'_>, area: Rect, app: &App, target: Pane) {
@@ -1382,5 +1560,71 @@ mod tests {
         let output = rendered_text(&mut unavailable, 160, 32);
         assert!(output.contains("REVIEW STATE WARNING"));
         assert!(output.contains("Selected day: 2024-01-15"));
+    }
+
+    #[test]
+    fn edit_mode_renders_target_state_and_cursor_context_in_full_and_compact_layouts() {
+        let mut app = App::new(DemoFixture::load());
+        app.handle_input(Input::Character('l'));
+        app.handle_input(Input::Character('c'));
+        for character in "first\nsecond".chars() {
+            app.handle_input(if character == '\n' {
+                Input::Enter
+            } else {
+                Input::Character(character)
+            });
+        }
+
+        let full = rendered_text(&mut app, 120, 32);
+        assert!(full.contains("EDIT comment"));
+        assert!(full.contains("Target: commit a1b2c3d"));
+        assert!(full.contains("New draft"));
+        assert!(full.contains("first"));
+        assert!(full.contains("second"));
+        assert!(full.contains("save/return"));
+
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        app.resize(120, 32);
+        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        let cursor = terminal.get_cursor_position().expect("cursor position");
+        assert!(cursor.x > 0 && cursor.y > 0);
+
+        let compact = rendered_text(&mut app, 40, 8);
+        assert!(compact.contains("EDIT comment"));
+        assert!(compact.contains("Target: commit a1b2c3d"));
+        assert!(compact.contains("New draft"));
+
+        for (width, height) in [(1, 1), (2, 2), (10, 3), (59, 15), (120, 32)] {
+            let _ = rendered_text(&mut app, width, height);
+            assert!(matches!(app.mode(), Mode::Edit { .. }));
+        }
+    }
+
+    #[test]
+    fn diff_cursor_eligibility_and_commit_and_line_draft_markers_are_visible() {
+        let mut app = App::new(DemoFixture::load());
+        app.handle_input(Input::Character('l'));
+        app.handle_input(Input::Character('c'));
+        app.handle_input(Input::Character('x'));
+        app.handle_input(Input::Escape);
+        assert!(rendered_text(&mut app, 120, 32).contains("◆"));
+
+        app.handle_input(Input::Character('l'));
+        app.handle_input(Input::Character('l'));
+        let ineligible = rendered_text(&mut app, 140, 32);
+        assert!(ineligible.contains("line comments unavailable: hunk header"));
+        app.handle_input(Input::Character('j'));
+        let eligible = rendered_text(&mut app, 140, 32);
+        assert!(eligible.contains("commentable src/welcome.rs:1"));
+        app.handle_input(Input::Character('c'));
+        let editor = rendered_text(&mut app, 140, 32);
+        assert!(editor.contains("src/welcome.rs:1"));
+        assert!(editor.contains("old 1, new 1"));
+        app.handle_input(Input::Character('y'));
+        app.handle_input(Input::Escape);
+        let drafted = rendered_text(&mut app, 140, 32);
+        assert!(drafted.contains("◆"));
+        assert!(drafted.contains("commentable src/welcome.rs:1"));
     }
 }

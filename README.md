@@ -4,7 +4,7 @@ A keyboard-first terminal review inbox for commits across GitHub projects.
 
 See [PRODUCT.md](PRODUCT.md) for the accepted requirements and delivery order.
 
-## Current status: diff review, progress, and draft persistence
+## Current status: diff review, progress, and keyboard comment editing
 
 Implemented now:
 
@@ -90,15 +90,16 @@ Implemented now:
   either direction, keep list matches visible, and highlight/scroll to diff
   matches. Search-entry keys remain isolated from normal-mode bindings.
 - A durable comment-draft persistence layer is initialized in live mode and kept
-  separate from reviewed progress. It supports commit-wide identities and
-  validated GitHub commit-diff line identities, reports sanitized load failures,
-  and shows the count of previously saved drafts. The keyboard editor that will
-  create and change these drafts is not part of this increment yet.
+  separate from reviewed progress. A keyboard-only modal editor creates and
+  changes commit-wide drafts from the Commit and File panes and supported line
+  drafts at the selected Diff row. Draft and diff-cursor markers, target and
+  eligibility feedback, multiline cursor editing, explicit save/cancel behavior,
+  sanitized save errors, and full/compact EDIT layouts are implemented.
 
 Planned for later delivery increments, and not implemented yet:
 
-- Keyboard drafting and editing, external-editor integration, loading existing
-  comments, and publishing comments.
+- External-editor integration, loading existing comments, and publishing
+  comments.
 
 ## Launch configuration and demo
 
@@ -178,6 +179,7 @@ action.
 | Normal | `n` / `N` | Repeat the saved case-insensitive search forward / backward, wrapping at either end. |
 | Normal | `m` | Toggle the selected commit reviewed/unreviewed from Commit, File, or Diff. A live mark changes only after a successful save. |
 | Normal | `f` | Toggle all commits / remaining commits. This filter is not persisted. |
+| Normal | `c` | Create or edit the selected commit draft from Commit or File, or the selected supported line draft from Diff. Repository and unsupported diff rows show a refusal. |
 | Normal | `?` | Open contextual keyboard help. |
 | Normal | `q` | Quit and restore the terminal. |
 | Search | Printable characters | Append text, including characters that are navigation keys in Normal mode. |
@@ -185,7 +187,12 @@ action.
 | Search | `Enter` | Apply the query in the focused pane and return to Normal mode. The query remains available to `n` / `N`, even after no match. |
 | Search | `Escape` | Cancel without moving and return to Normal mode. |
 | Help | `Escape` | Close help and restore its prior focus. Other non-global keys are ignored. |
-| Global | `Ctrl-c` | Quit from Normal, Search, or Help and restore the terminal. |
+| Edit | Printable characters / `Enter` | Insert text or a newline. Normal-mode keys, including `h`, `j`, `k`, `l`, `q`, `n`, `/`, `?`, `m`, `f`, `g`, `G`, `c`, `E`, `P`, and `C`, are inserted literally. |
+| Edit | `Backspace` | Delete the character before the cursor. |
+| Edit | Arrow keys / `Home` / `End` | Move by character, line, or to the current line boundary in multiline text. |
+| Edit | `Escape` | Save and return to the prior pane. Whitespace-only text deletes an existing draft or discards a new one. A failed save keeps the text open for retry. |
+| Edit | `Ctrl-g` | Cancel changes, restore the last saved body, and return to the prior pane. |
+| Global | `Ctrl-c` | Quit from Normal, Search, or Help. In Edit, save first and quit only if that succeeds. |
 
 Search starts after the current list selection or diff position, selects or
 scrolls to the first match, and wraps once. Empty and no-match searches do not
@@ -241,6 +248,15 @@ commit SHA, and either the whole commit or a line target made from the API file
 path and GitHub commit-diff position. Bodies must contain non-whitespace text and
 are limited to 65,000 characters; line paths are limited to 4,096 bytes and may
 not contain control characters. The file is capped at 16 MiB when read.
+
+Press `c` in the Commit or File pane to edit the selected commit-wide draft.
+In the Diff pane, `j`, `k`, `gg`, `G`, `Ctrl-d`, and `Ctrl-u` move a highlighted
+logical-row cursor; `n` and `N` move it to diff search matches. The Diff title
+shows whether that row is commentable and, when it is, its path and GitHub patch
+position. Press `c` there to edit that exact line target. Commit rows and diff
+gutters display a `◆` for saved drafts. The editor identifies its target and
+whether the draft is new or saved, wraps text, and exposes the terminal cursor
+in both full and compact layouts.
 
 Only retained context, addition, and deletion rows in a textual patch beginning
 with a valid `@@` hunk header can become line targets. Hunk headers, no-newline

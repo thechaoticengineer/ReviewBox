@@ -74,6 +74,36 @@ pub fn run() -> io::Result<SmokeReport> {
         "Refine fictional launch screen",
         "commit navigation frame",
     )?;
+    input(&mut app, 'c');
+    ensure(
+        matches!(app.mode(), Mode::Edit { .. }),
+        "c must open the commit draft editor",
+    )?;
+    for character in "fictional\nreview".chars() {
+        app.handle_input(if character == '\n' {
+            Input::Enter
+        } else {
+            Input::Character(character)
+        });
+    }
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "EDIT comment",
+        "commit editor frame",
+    )?;
+    app.handle_input(Input::Escape);
+    ensure(app.draft_count() == 1, "Escape must save the commit draft")?;
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "◆",
+        "commit draft marker frame",
+    )?;
+    input(&mut app, 'c');
+    app.handle_input(Input::Cancel);
+    ensure(
+        app.mode() == Mode::Normal && app.draft_count() == 1,
+        "Ctrl-g must leave the saved draft unchanged",
+    )?;
     app.handle_input(Input::Enter);
     ensure(app.focus() == Pane::File, "Enter must descend to files")?;
     ensure_contains(
@@ -87,6 +117,23 @@ pub fn run() -> io::Result<SmokeReport> {
         &render_frame(&mut terminal, &mut app, &mut frames)?,
         "Welcome aboard",
         "opened substantial diff frame",
+    )?;
+    input(&mut app, 'c');
+    ensure(
+        app.mode() == Mode::Normal && app.draft_count() == 1,
+        "a hunk header must refuse a line draft",
+    )?;
+    input(&mut app, 'j');
+    input(&mut app, 'c');
+    ensure(
+        matches!(app.mode(), Mode::Edit { .. }),
+        "c must open an eligible line draft",
+    )?;
+    input(&mut app, 'q');
+    app.handle_input(Input::Escape);
+    ensure(
+        !app.should_quit() && app.draft_count() == 2,
+        "q must insert in EDIT and Escape must save the line draft",
     )?;
 
     resize(&mut terminal, 60, 16)?;
@@ -103,7 +150,8 @@ pub fn run() -> io::Result<SmokeReport> {
     input(&mut app, 'G');
     ensure(app.scroll(Pane::Diff) > 0, "G must scroll to the diff end")?;
     let tail = render_frame(&mut terminal, &mut app, &mut frames)?;
-    ensure_contains(&tail, "launch revie", "diff tail frame")?;
+    ensure_contains(&tail, "launch", "diff tail frame")?;
+    ensure_contains(&tail, "complete", "diff tail frame")?;
     input(&mut app, 'g');
     input(&mut app, 'g');
     ensure(
