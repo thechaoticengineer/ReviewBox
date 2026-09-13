@@ -7,6 +7,7 @@ use crate::comment_draft::{
     CommentAnchor, CommentDraft, CommentDrafts, CommentTarget, DraftStateError, DraftStore,
     MAX_DRAFT_CHARACTERS, MemoryDraftStore, line_target,
 };
+use crate::external_editor::EditorOutcome;
 use crate::github::{
     DetailFailure, DetailState, FailureCategory, LoadEvent, LoadFailure, LoadProgress, LoadStatus,
     LoadedRepository, RepositoryCoverage,
@@ -138,6 +139,7 @@ pub enum Input {
     Home,
     End,
     Cancel,
+    ExternalEditor,
     HalfPageDown,
     HalfPageUp,
     Quit,
@@ -192,6 +194,10 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
         action: "edit commit or selected-line draft",
     },
     HelpBinding {
+        keys: "E",
+        action: "edit draft with $VISUAL / $EDITOR",
+    },
+    HelpBinding {
         keys: "?",
         action: "open this help",
     },
@@ -224,10 +230,27 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
         action: "save and return / cancel",
     },
     HelpBinding {
+        keys: "Edit: Ctrl-e",
+        action: "edit current buffer externally",
+    },
+    HelpBinding {
         keys: "Edit: Ctrl-c",
         action: "save and quit",
     },
 ];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EditorOrigin {
+    Normal,
+    Edit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EditorRequest {
+    pub target: CommentTarget,
+    pub body: String,
+    pub origin: EditorOrigin,
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 struct ListPosition {
@@ -400,6 +423,7 @@ pub struct App {
     active_request: Option<ActiveDetailRequest>,
     next_request_id: u64,
     effects: VecDeque<DetailEffect>,
+    editor_requests: VecDeque<EditorRequest>,
 }
 
 impl App {
@@ -510,6 +534,7 @@ impl App {
             active_request: None,
             next_request_id: 1,
             effects: VecDeque::new(),
+            editor_requests: VecDeque::new(),
         };
         app.rebuild_projection(None);
         app.normalize();
@@ -766,6 +791,10 @@ impl App {
                 self.open_comment_editor();
                 return;
             }
+            Input::Character('E') => {
+                self.request_external_editor_from_normal();
+                return;
+            }
             Input::Character('n') => Command::SearchNext,
             Input::Character('N') => Command::SearchPrevious,
             Input::Enter => Command::Open,
@@ -781,6 +810,7 @@ impl App {
             | Input::Home
             | Input::End
             | Input::Cancel
+            | Input::ExternalEditor
             | Input::Unrelated
             | Input::Quit => Command::Unrelated,
         };
@@ -807,6 +837,7 @@ impl App {
             | Input::Home
             | Input::End
             | Input::Cancel
+            | Input::ExternalEditor
             | Input::HalfPageDown
             | Input::HalfPageUp
             | Input::Unrelated
@@ -839,6 +870,7 @@ impl App {
                 self.persist_edit();
             }
             Input::Cancel => self.cancel_edit(previous_focus),
+            Input::ExternalEditor => self.request_external_editor_from_edit(),
             Input::HalfPageDown | Input::HalfPageUp | Input::Unrelated | Input::Quit => {}
         }
     }
@@ -873,25 +905,12 @@ impl App {
     }
 
     fn open_comment_editor(&mut self) {
-        let target = match self.focus {
-            Pane::Repository => {
-                self.status = "Select a commit before writing a comment".to_owned();
+        let target = match self.comment_target_for_focus() {
+            Ok(target) => target,
+            Err(message) => {
+                self.status = message.to_owned();
                 return;
             }
-            Pane::Commit | Pane::File => match self.current_commit_target() {
-                Ok(target) => target,
-                Err(message) => {
-                    self.status = message.to_owned();
-                    return;
-                }
-            },
-            Pane::Diff => match self.current_line_comment_target() {
-                Ok(target) => target,
-                Err(message) => {
-                    self.status = message.to_owned();
-                    return;
-                }
-            },
         };
         let saved = self.drafts.get(&target).map(|draft| draft.body.clone());
         let text = saved.clone().unwrap_or_default();
@@ -907,6 +926,109 @@ impl App {
             previous_focus,
         };
         self.status = "Editing comment draft".to_owned();
+    }
+
+    fn comment_target_for_focus(&self) -> Result<CommentTarget, &'static str> {
+        match self.focus {
+            Pane::Repository => Err("Select a commit before writing a comment"),
+            Pane::Commit | Pane::File => self.current_commit_target(),
+            Pane::Diff => self.current_line_comment_target(),
+        }
+    }
+
+    fn request_external_editor_from_normal(&mut self) {
+        let target = match self.comment_target_for_focus() {
+            Ok(target) => target,
+            Err(message) => {
+                self.status = message.to_owned();
+                return;
+            }
+        };
+        let body = self
+            .drafts
+            .get(&target)
+            .map(|draft| draft.body.clone())
+            .unwrap_or_default();
+        self.editor_requests.push_back(EditorRequest {
+            target,
+            body,
+            origin: EditorOrigin::Normal,
+        });
+        self.status = "Opening external editor".to_owned();
+    }
+
+    fn request_external_editor_from_edit(&mut self) {
+        let Mode::Edit { target, .. } = self.mode.clone() else {
+            return;
+        };
+        let Some(buffer) = self.edit_buffer.as_ref() else {
+            self.status = "Comment editor state is unavailable".to_owned();
+            return;
+        };
+        self.editor_requests.push_back(EditorRequest {
+            target,
+            body: buffer.text.clone(),
+            origin: EditorOrigin::Edit,
+        });
+        self.status = "Opening external editor".to_owned();
+    }
+
+    pub fn take_editor_requests(&mut self) -> Vec<EditorRequest> {
+        self.editor_requests.drain(..).collect()
+    }
+
+    pub fn apply_editor_outcome(&mut self, request: EditorRequest, outcome: EditorOutcome) {
+        match outcome {
+            EditorOutcome::Replaced(body) => {
+                let had_saved_draft = self.drafts.get(&request.target).is_some();
+                let result =
+                    CommentDraft::new(request.target.clone(), body.clone()).and_then(|draft| {
+                        self.draft_store
+                            .as_ref()
+                            .ok_or(DraftStateError::Unavailable)?
+                            .save(&draft)
+                    });
+                match result {
+                    Ok(drafts) => {
+                        self.drafts = drafts;
+                        if request.origin == EditorOrigin::Edit {
+                            self.replace_matching_edit_buffer(&request.target, body, true);
+                        }
+                        self.status = if had_saved_draft {
+                            "Comment draft saved from external editor"
+                        } else {
+                            "New comment draft saved from external editor"
+                        }
+                        .to_owned();
+                    }
+                    Err(error) => {
+                        if request.origin == EditorOrigin::Edit {
+                            self.replace_matching_edit_buffer(&request.target, body, false);
+                        }
+                        self.status = format!("External editor text not saved: {error}");
+                    }
+                }
+            }
+            EditorOutcome::Unchanged => {
+                self.status = "External editor left the draft unchanged".to_owned();
+            }
+            EditorOutcome::Failed(error) => {
+                self.status = format!("External editor failed: {error}");
+            }
+        }
+    }
+
+    fn replace_matching_edit_buffer(&mut self, target: &CommentTarget, body: String, saved: bool) {
+        if !matches!(&self.mode, Mode::Edit { target: active, .. } if active == target) {
+            return;
+        }
+        if let Some(buffer) = self.edit_buffer.as_mut() {
+            buffer.text = body;
+            buffer.cursor = buffer.text.len();
+            if saved {
+                buffer.saved = Some(buffer.text.clone());
+            }
+        }
     }
 
     fn current_commit_target(&self) -> Result<CommentTarget, &'static str> {
@@ -2322,6 +2444,75 @@ mod tests {
     }
 
     #[test]
+    fn normal_e_queues_the_context_draft_without_entering_edit_mode() {
+        let mut app = App::new(DemoFixture::load());
+        app.handle_input(Input::Character('E'));
+        assert!(app.take_editor_requests().is_empty());
+        assert!(app.status().contains("Select a commit"));
+
+        app.handle_input(Input::Character('l'));
+        app.handle_input(Input::Character('E'));
+        let requests = app.take_editor_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].origin, EditorOrigin::Normal);
+        assert!(requests[0].body.is_empty());
+        assert!(matches!(requests[0].target.anchor(), CommentAnchor::Commit));
+        assert_eq!(app.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn ctrl_e_replaces_and_saves_the_current_edit_buffer_without_leaving_edit() {
+        let mut app = App::new(DemoFixture::load());
+        open_first_commit_editor(&mut app);
+        type_edit_text(&mut app, "before");
+        app.handle_input(Input::ExternalEditor);
+        let request = app.take_editor_requests().pop().unwrap();
+        assert_eq!(request.origin, EditorOrigin::Edit);
+        assert_eq!(request.body, "before");
+
+        app.apply_editor_outcome(
+            request,
+            EditorOutcome::Replaced("after\nsecond line".to_owned()),
+        );
+
+        assert!(matches!(app.mode(), Mode::Edit { .. }));
+        assert_eq!(app.edit_buffer().unwrap().text(), "after\nsecond line");
+        assert!(app.edit_buffer().unwrap().is_saved());
+        assert_eq!(app.draft_count(), 1);
+    }
+
+    #[test]
+    fn unsuccessful_external_exit_preserves_the_saved_draft() {
+        let mut app = App::new(DemoFixture::load());
+        open_first_commit_editor(&mut app);
+        type_edit_text(&mut app, "durable body");
+        app.handle_input(Input::Escape);
+        app.handle_input(Input::Character('E'));
+        let request = app.take_editor_requests().pop().unwrap();
+        let target = request.target.clone();
+
+        app.apply_editor_outcome(request, EditorOutcome::Unchanged);
+
+        assert_eq!(app.drafts.get(&target).unwrap().body, "durable body");
+        assert_eq!(app.status(), "External editor left the draft unchanged");
+    }
+
+    #[test]
+    fn external_editor_action_is_blocked_by_search_and_help_modals() {
+        let mut app = App::new(DemoFixture::load());
+        app.handle_input(Input::Character('/'));
+        app.handle_input(Input::ExternalEditor);
+        assert!(app.take_editor_requests().is_empty());
+        assert!(matches!(app.mode(), Mode::SearchEntry { .. }));
+        app.handle_input(Input::Escape);
+
+        app.handle_input(Input::Character('?'));
+        app.handle_input(Input::ExternalEditor);
+        assert!(app.take_editor_requests().is_empty());
+        assert!(matches!(app.mode(), Mode::Help { .. }));
+    }
+
+    #[test]
     fn keyboard_line_drafts_reject_unsupported_rows_and_keep_targets_separate() {
         let mut app = App::new(DemoFixture::load());
         for key in ['l', 'l', 'l'] {
@@ -2405,6 +2596,23 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct SeededFailingDraftStore(CommentDrafts);
+
+    impl DraftStore for SeededFailingDraftStore {
+        fn load(&self) -> Result<CommentDrafts, DraftStateError> {
+            Ok(self.0.clone())
+        }
+
+        fn save(&self, _draft: &CommentDraft) -> Result<CommentDrafts, DraftStateError> {
+            Err(DraftStateError::Write(std::io::ErrorKind::PermissionDenied))
+        }
+
+        fn delete(&self, _target: &CommentTarget) -> Result<CommentDrafts, DraftStateError> {
+            Err(DraftStateError::Write(std::io::ErrorKind::PermissionDenied))
+        }
+    }
+
     #[test]
     fn failed_save_and_ctrl_c_keep_editable_text_without_quitting() {
         let mut app = App::with_stores(
@@ -2423,6 +2631,35 @@ mod tests {
         assert!(matches!(app.mode(), Mode::Edit { .. }));
         assert_eq!(app.edit_buffer().unwrap().text(), "private fictional body");
         assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn failed_external_save_preserves_prior_draft_and_keeps_new_edit_text() {
+        let memory = MemoryDraftStore::default();
+        let target =
+            CommentTarget::commit(9_000_001, "a1b2c3d000000000000000000000000000000000").unwrap();
+        memory
+            .save(&CommentDraft::new(target.clone(), "saved before").unwrap())
+            .unwrap();
+        let drafts = memory.load().unwrap();
+        let mut app = App::with_stores(
+            DemoFixture::load(),
+            Box::new(MemoryReviewStore::default()),
+            Box::new(SeededFailingDraftStore(drafts)),
+        );
+        open_first_commit_editor(&mut app);
+        app.handle_input(Input::ExternalEditor);
+        let request = app.take_editor_requests().pop().unwrap();
+
+        app.apply_editor_outcome(
+            request,
+            EditorOutcome::Replaced("recovered from editor".to_owned()),
+        );
+
+        assert_eq!(app.drafts.get(&target).unwrap().body, "saved before");
+        assert_eq!(app.edit_buffer().unwrap().text(), "recovered from editor");
+        assert!(app.edit_buffer().unwrap().is_saved());
+        assert!(!app.status().contains("recovered from editor"));
     }
 
     #[test]

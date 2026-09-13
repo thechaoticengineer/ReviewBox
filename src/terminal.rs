@@ -15,6 +15,11 @@ pub trait TerminalOps {
     fn disable_raw_mode(&mut self) -> io::Result<()>;
 }
 
+pub trait TerminalSuspend {
+    fn suspend(&mut self) -> io::Result<()>;
+    fn resume(&mut self) -> io::Result<()>;
+}
+
 pub struct CrosstermOps;
 
 impl TerminalOps for CrosstermOps {
@@ -74,14 +79,20 @@ impl<O: TerminalOps> TerminalGuard<O> {
     }
 
     fn setup(&mut self) -> io::Result<()> {
-        self.ops.enable_raw_mode()?;
-        self.raw_mode = true;
+        if !self.raw_mode {
+            self.ops.enable_raw_mode()?;
+            self.raw_mode = true;
+        }
 
-        self.ops.enter_alternate_screen()?;
-        self.alternate_screen = true;
+        if !self.alternate_screen {
+            self.ops.enter_alternate_screen()?;
+            self.alternate_screen = true;
+        }
 
-        self.ops.hide_cursor()?;
-        self.cursor_hidden = true;
+        if !self.cursor_hidden {
+            self.ops.hide_cursor()?;
+            self.cursor_hidden = true;
+        }
         Ok(())
     }
 
@@ -90,6 +101,12 @@ impl<O: TerminalOps> TerminalGuard<O> {
             return Ok(());
         }
 
+        let result = self.release("terminal restoration failed");
+        self.restored = true;
+        result
+    }
+
+    fn release(&mut self, context: &str) -> io::Result<()> {
         let mut errors = Vec::new();
         if self.cursor_hidden {
             if let Err(error) = self.ops.show_cursor() {
@@ -109,8 +126,6 @@ impl<O: TerminalOps> TerminalGuard<O> {
             }
             self.raw_mode = false;
         }
-        self.restored = true;
-
         if errors.is_empty() {
             Ok(())
         } else {
@@ -119,10 +134,24 @@ impl<O: TerminalOps> TerminalGuard<O> {
                 .map(|error| error.to_string())
                 .collect::<Vec<_>>()
                 .join("; ");
-            Err(io::Error::other(format!(
-                "terminal restoration failed: {message}"
-            )))
+            Err(io::Error::other(format!("{context}: {message}")))
         }
+    }
+}
+
+impl<O: TerminalOps> TerminalSuspend for TerminalGuard<O> {
+    fn suspend(&mut self) -> io::Result<()> {
+        if self.restored {
+            return Err(io::Error::other("terminal session is already restored"));
+        }
+        self.release("terminal suspension failed")
+    }
+
+    fn resume(&mut self) -> io::Result<()> {
+        if self.restored {
+            return Err(io::Error::other("terminal session is already restored"));
+        }
+        self.setup()
     }
 }
 
@@ -132,13 +161,22 @@ impl<O: TerminalOps> Drop for TerminalGuard<O> {
     }
 }
 
+#[cfg(test)]
 pub fn with_terminal<O, F, T>(ops: O, run: F) -> io::Result<T>
 where
     O: TerminalOps,
     F: FnOnce() -> io::Result<T>,
 {
+    with_terminal_session(ops, |_| run())
+}
+
+pub fn with_terminal_session<O, F, T>(ops: O, run: F) -> io::Result<T>
+where
+    O: TerminalOps,
+    F: FnOnce(&mut TerminalGuard<O>) -> io::Result<T>,
+{
     let mut guard = TerminalGuard::acquire(ops)?;
-    let run_result = run();
+    let run_result = run(&mut guard);
     let restore_result = guard.restore();
 
     match (run_result, restore_result) {
@@ -287,6 +325,104 @@ mod tests {
         drop(guard);
 
         assert_eq!(calls(&log).len(), 6);
+    }
+
+    #[test]
+    fn suspend_and_resume_use_exact_terminal_order_and_restore_remains_idempotent() {
+        let (ops, log) = RecordingOps::new(None);
+        let mut guard = TerminalGuard::acquire(ops).expect("setup succeeds");
+
+        guard.suspend().expect("suspend succeeds");
+        guard.resume().expect("resume succeeds");
+        guard.restore().expect("restore succeeds");
+        guard.restore().expect("second restore is a no-op");
+        drop(guard);
+
+        assert_eq!(
+            calls(&log),
+            [
+                "enable_raw",
+                "enter_screen",
+                "hide_cursor",
+                "show_cursor",
+                "leave_screen",
+                "disable_raw",
+                "enable_raw",
+                "enter_screen",
+                "hide_cursor",
+                "show_cursor",
+                "leave_screen",
+                "disable_raw",
+            ]
+        );
+    }
+
+    #[derive(Clone)]
+    struct ResumeFailOps {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        enable_count: usize,
+    }
+
+    impl ResumeFailOps {
+        fn record(&mut self, name: &'static str) -> io::Result<()> {
+            self.calls.lock().expect("calls mutex").push(name);
+            if name == "enable_raw" {
+                self.enable_count += 1;
+                if self.enable_count == 2 {
+                    return Err(io::Error::other("forced resume failure"));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl TerminalOps for ResumeFailOps {
+        fn enable_raw_mode(&mut self) -> io::Result<()> {
+            self.record("enable_raw")
+        }
+        fn enter_alternate_screen(&mut self) -> io::Result<()> {
+            self.record("enter_screen")
+        }
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            self.record("hide_cursor")
+        }
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.record("show_cursor")
+        }
+        fn leave_alternate_screen(&mut self) -> io::Result<()> {
+            self.record("leave_screen")
+        }
+        fn disable_raw_mode(&mut self) -> io::Result<()> {
+            self.record("disable_raw")
+        }
+    }
+
+    #[test]
+    fn failed_resume_leaves_final_restore_idempotent_without_repeating_steps() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let ops = ResumeFailOps {
+            calls: Arc::clone(&log),
+            enable_count: 0,
+        };
+        let mut guard = TerminalGuard::acquire(ops).expect("setup succeeds");
+        guard.suspend().expect("suspend succeeds");
+
+        assert!(guard.resume().is_err());
+        guard.restore().expect("no acquired resources remain");
+        drop(guard);
+
+        assert_eq!(
+            calls(&log),
+            [
+                "enable_raw",
+                "enter_screen",
+                "hide_cursor",
+                "show_cursor",
+                "leave_screen",
+                "disable_raw",
+                "enable_raw",
+            ]
+        );
     }
 
     #[test]

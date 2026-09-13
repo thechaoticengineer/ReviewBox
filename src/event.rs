@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io;
 use std::time::Duration;
 
@@ -9,8 +10,12 @@ use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 
 use crate::app::{App, DetailEffect, DetailResult, Input};
+use crate::external_editor::{
+    EditorError, EditorProcess, EditorTempFiles, edit_draft, resolve_editor,
+};
 use crate::github::LoadEvent;
 use crate::render;
+use crate::terminal::TerminalSuspend;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_LOADER_EVENTS_PER_TICK: usize = 32;
@@ -32,6 +37,7 @@ pub fn translate_key(key: KeyEvent) -> Option<Input> {
     let command = match (key.code, control, alt) {
         (KeyCode::Char('c'), true, _) => Input::Quit,
         (KeyCode::Char('g'), true, _) => Input::Cancel,
+        (KeyCode::Char('e'), true, _) => Input::ExternalEditor,
         (KeyCode::Char('d'), true, _) => Input::HalfPageDown,
         (KeyCode::Char('u'), true, _) => Input::HalfPageUp,
         (KeyCode::Char(character), false, false) => Input::Character(character),
@@ -100,6 +106,30 @@ impl EventSource for CrosstermEventSource {
     }
 }
 
+pub struct ExternalEditorSession<'a> {
+    terminal: &'a mut dyn TerminalSuspend,
+    process: &'a mut dyn EditorProcess,
+    temp_files: &'a mut dyn EditorTempFiles,
+    lookup: &'a dyn Fn(&str) -> Option<OsString>,
+}
+
+impl<'a> ExternalEditorSession<'a> {
+    pub fn new(
+        terminal: &'a mut dyn TerminalSuspend,
+        process: &'a mut dyn EditorProcess,
+        temp_files: &'a mut dyn EditorTempFiles,
+        lookup: &'a dyn Fn(&str) -> Option<OsString>,
+    ) -> Self {
+        Self {
+            terminal,
+            process,
+            temp_files,
+            lookup,
+        }
+    }
+}
+
+#[cfg(test)]
 pub fn run<B: Backend, E: EventSource>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -113,6 +143,7 @@ where
     run_with_loader(terminal, app, events, &mut loader, &mut details)
 }
 
+#[cfg(test)]
 pub fn run_with_loader<B: Backend, E: EventSource, L: LoaderEventSource, D: DetailRequester>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -123,7 +154,43 @@ pub fn run_with_loader<B: Backend, E: EventSource, L: LoaderEventSource, D: Deta
 where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    let result = run_loop(terminal, app, events, loader, details);
+    let result = run_loop(terminal, app, events, loader, details, None);
+    loader.cancel();
+    details.shutdown();
+    result
+}
+
+pub fn run_with_editor<B: Backend, E: EventSource>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    events: &mut E,
+    editor: &mut ExternalEditorSession<'_>,
+) -> io::Result<()>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    let mut loader = NoLoaderEvents;
+    let mut details = NoDetails;
+    run_with_loader_and_editor(terminal, app, events, &mut loader, &mut details, editor)
+}
+
+pub fn run_with_loader_and_editor<
+    B: Backend,
+    E: EventSource,
+    L: LoaderEventSource,
+    D: DetailRequester,
+>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    events: &mut E,
+    loader: &mut L,
+    details: &mut D,
+    editor: &mut ExternalEditorSession<'_>,
+) -> io::Result<()>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    let result = run_loop(terminal, app, events, loader, details, Some(editor));
     loader.cancel();
     details.shutdown();
     result
@@ -135,6 +202,7 @@ fn run_loop<B: Backend, E: EventSource, L: LoaderEventSource, D: DetailRequester
     events: &mut E,
     loader: &mut L,
     details: &mut D,
+    mut editor: Option<&mut ExternalEditorSession<'_>>,
 ) -> io::Result<()>
 where
     B::Error: std::error::Error + Send + Sync + 'static,
@@ -153,6 +221,8 @@ where
                 }
             }
         }
+
+        apply_editor_requests(terminal, app, editor.as_deref_mut())?;
 
         apply_detail_effects(app, details);
 
@@ -178,6 +248,55 @@ where
         draw(terminal, app)?;
     }
 
+    Ok(())
+}
+
+fn apply_editor_requests<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    mut editor: Option<&mut ExternalEditorSession<'_>>,
+) -> io::Result<()>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    for request in app.take_editor_requests() {
+        let Some(session) = editor.as_mut() else {
+            app.apply_editor_outcome(
+                request,
+                crate::external_editor::EditorOutcome::Failed(EditorError::NotConfigured),
+            );
+            continue;
+        };
+        let command = match resolve_editor(|name| (session.lookup)(name)) {
+            Ok(command) => command,
+            Err(error) => {
+                app.apply_editor_outcome(
+                    request,
+                    crate::external_editor::EditorOutcome::Failed(error),
+                );
+                continue;
+            }
+        };
+        let result = edit_draft(
+            &request.body,
+            &command,
+            session.terminal,
+            session.process,
+            session.temp_files,
+        );
+        let outcome = result.outcome;
+        if let Err(_error) = result.resume {
+            app.apply_editor_outcome(request, outcome);
+            return Err(io::Error::other(
+                "external editor terminal restoration failed",
+            ));
+        }
+        if result.terminal_touched {
+            terminal.clear().map_err(io::Error::other)?;
+            terminal.autoresize().map_err(io::Error::other)?;
+        }
+        app.apply_editor_outcome(request, outcome);
+    }
     Ok(())
 }
 
@@ -208,9 +327,16 @@ where
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::convert::Infallible;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use crate::comment_draft::{
+        CommentDraft, CommentDrafts, CommentTarget, DraftStateError, DraftStore,
+    };
+    use crate::external_editor::EditorCommand;
     use crate::fixture::DemoFixture;
     use crate::github::{
         FailureCategory, FailureScope, LoadFailure, LoadProgress, LoadStatus, LoadedRepository,
@@ -220,9 +346,182 @@ mod tests {
         ChildPane, Commit, CommitDetail, FileChange, FileStatus, GitHubAuthor, Inbox, Repository,
         RepositoryIdentity,
     };
+    use crate::review_state::MemoryReviewStore;
     use chrono::{TimeZone, Utc};
-    use ratatui::backend::TestBackend;
+    use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
+    use ratatui::buffer::Cell;
+    use ratatui::layout::{Position, Size};
     use ratatui::{TerminalOptions, Viewport};
+
+    struct RecordingBackend {
+        inner: TestBackend,
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl RecordingBackend {
+        fn new(log: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                inner: TestBackend::new(100, 24),
+                log,
+            }
+        }
+    }
+
+    impl Backend for RecordingBackend {
+        type Error = Infallible;
+
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            self.log.lock().unwrap().push("redraw");
+            self.inner.draw(content)
+        }
+
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.hide_cursor()
+        }
+
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.show_cursor()
+        }
+
+        fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+            self.inner.get_cursor_position()
+        }
+
+        fn set_cursor_position<P: Into<Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), Self::Error> {
+            self.inner.set_cursor_position(position)
+        }
+
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            self.log.lock().unwrap().push("clear");
+            self.inner.clear()
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Self::Error> {
+            self.log.lock().unwrap().push("clear");
+            self.inner.clear_region(clear_type)
+        }
+
+        fn size(&self) -> Result<Size, Self::Error> {
+            self.inner.size()
+        }
+
+        fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+            self.inner.window_size()
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.inner.flush()
+        }
+    }
+
+    struct RecordingSuspend {
+        log: Arc<Mutex<Vec<&'static str>>>,
+        suspend_failure: bool,
+        resume_failure: bool,
+    }
+
+    impl TerminalSuspend for RecordingSuspend {
+        fn suspend(&mut self) -> io::Result<()> {
+            let mut log = self.log.lock().unwrap();
+            log.extend(["show_cursor", "leave_alternate_screen", "disable_raw_mode"]);
+            if self.suspend_failure {
+                Err(io::Error::other("injected suspend failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn resume(&mut self) -> io::Result<()> {
+            let mut log = self.log.lock().unwrap();
+            log.push("enable_raw_mode");
+            if self.resume_failure {
+                return Err(io::Error::other("injected resume failure"));
+            }
+            log.extend(["enter_alternate_screen", "hide_cursor"]);
+            Ok(())
+        }
+    }
+
+    struct ScriptedEditorProcess {
+        log: Arc<Mutex<Vec<&'static str>>>,
+        result: Result<bool, EditorError>,
+    }
+
+    impl EditorProcess for ScriptedEditorProcess {
+        fn run(&mut self, command: &EditorCommand, path: &Path) -> Result<bool, EditorError> {
+            assert_eq!(command.program, "nvim");
+            assert_eq!(command.args, ["-f"]);
+            assert_eq!(path, Path::new("/private/draft.md"));
+            self.log.lock().unwrap().push("launch");
+            self.result
+        }
+    }
+
+    struct ScriptedTempFiles {
+        create: Result<PathBuf, EditorError>,
+        read: Result<String, EditorError>,
+        cleaned: bool,
+    }
+
+    impl EditorTempFiles for ScriptedTempFiles {
+        fn create(&mut self, _body: &str) -> Result<PathBuf, EditorError> {
+            self.create.clone()
+        }
+
+        fn read(&mut self, _path: &Path) -> Result<String, EditorError> {
+            self.read.clone()
+        }
+
+        fn cleanup(&mut self, _path: &Path) -> Result<(), EditorError> {
+            self.cleaned = true;
+            Ok(())
+        }
+    }
+
+    fn queue_normal_editor(app: &mut App) {
+        app.handle_input(Input::Character('l'));
+        app.handle_input(Input::Character('E'));
+    }
+
+    fn run_editor_request(
+        app: &mut App,
+        process_result: Result<bool, EditorError>,
+        read_result: Result<String, EditorError>,
+        suspend_failure: bool,
+        resume_failure: bool,
+    ) -> (io::Result<()>, Vec<&'static str>, bool) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut terminal = Terminal::new(RecordingBackend::new(Arc::clone(&log))).unwrap();
+        let mut terminal_state = RecordingSuspend {
+            log: Arc::clone(&log),
+            suspend_failure,
+            resume_failure,
+        };
+        let mut process = ScriptedEditorProcess {
+            log: Arc::clone(&log),
+            result: process_result,
+        };
+        let mut temp_files = ScriptedTempFiles {
+            create: Ok(PathBuf::from("/private/draft.md")),
+            read: read_result,
+            cleaned: false,
+        };
+        let lookup = |name: &str| (name == "VISUAL").then(|| OsString::from("nvim -f"));
+        let mut session =
+            ExternalEditorSession::new(&mut terminal_state, &mut process, &mut temp_files, &lookup);
+        let result = apply_editor_requests(&mut terminal, app, Some(&mut session));
+        if result.is_ok() {
+            draw(&mut terminal, app).unwrap();
+        }
+        let calls = log.lock().unwrap().clone();
+        (result, calls, temp_files.cleaned)
+    }
 
     struct Events(Vec<io::Result<AppEvent>>);
 
@@ -388,10 +687,200 @@ mod tests {
             ('u', Input::HalfPageUp),
             ('c', Input::Quit),
             ('g', Input::Cancel),
+            ('e', Input::ExternalEditor),
         ] {
             let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL);
             assert_eq!(translate_key(key), Some(expected));
         }
+    }
+
+    fn expected_editor_cycle() -> Vec<&'static str> {
+        vec![
+            "show_cursor",
+            "leave_alternate_screen",
+            "disable_raw_mode",
+            "launch",
+            "enable_raw_mode",
+            "enter_alternate_screen",
+            "hide_cursor",
+            "clear",
+            "redraw",
+        ]
+    }
+
+    #[test]
+    fn editor_terminal_cycle_is_exact_for_success_exit_and_read_failures() {
+        for (process, read, expected_status) in [
+            (Ok(true), Ok("replacement".to_owned()), "saved"),
+            (Ok(false), Ok("ignored".to_owned()), "unchanged"),
+            (
+                Err(EditorError::Launch),
+                Ok("ignored".to_owned()),
+                "could not be run",
+            ),
+            (Ok(true), Err(EditorError::Read), "could not be read"),
+            (Ok(true), Err(EditorError::Decode), "valid UTF-8"),
+            (Ok(true), Err(EditorError::TooLarge), "draft limit"),
+        ] {
+            let mut app = App::new(DemoFixture::load());
+            queue_normal_editor(&mut app);
+            let (result, calls, cleaned) =
+                run_editor_request(&mut app, process, read, false, false);
+
+            result.unwrap();
+            assert_eq!(calls, expected_editor_cycle());
+            assert!(cleaned);
+            assert!(app.status().contains(expected_status));
+            assert_eq!(app.mode(), crate::app::Mode::Normal);
+            app.handle_input(Input::Character('q'));
+            assert!(app.should_quit(), "reacquired TUI must remain usable");
+        }
+    }
+
+    #[test]
+    fn suspend_failure_skips_launch_but_reacquires_clears_and_redraws() {
+        let mut app = App::new(DemoFixture::load());
+        queue_normal_editor(&mut app);
+        let (result, calls, cleaned) =
+            run_editor_request(&mut app, Ok(true), Ok("ignored".to_owned()), true, false);
+
+        result.unwrap();
+        assert_eq!(
+            calls,
+            [
+                "show_cursor",
+                "leave_alternate_screen",
+                "disable_raw_mode",
+                "enable_raw_mode",
+                "enter_alternate_screen",
+                "hide_cursor",
+                "clear",
+                "redraw",
+            ]
+        );
+        assert!(cleaned);
+        assert!(app.status().contains("terminal could not switch"));
+    }
+
+    #[test]
+    fn configuration_and_temp_failures_do_not_touch_the_terminal() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut backend_terminal = Terminal::new(RecordingBackend::new(Arc::clone(&log))).unwrap();
+        let mut terminal_state = RecordingSuspend {
+            log: Arc::clone(&log),
+            suspend_failure: false,
+            resume_failure: false,
+        };
+        let mut process = ScriptedEditorProcess {
+            log: Arc::clone(&log),
+            result: Ok(true),
+        };
+        let mut temp_files = ScriptedTempFiles {
+            create: Ok(PathBuf::from("/private/draft.md")),
+            read: Ok("changed".to_owned()),
+            cleaned: false,
+        };
+
+        let mut app = App::new(DemoFixture::load());
+        queue_normal_editor(&mut app);
+        let missing = |_name: &str| None;
+        let mut session = ExternalEditorSession::new(
+            &mut terminal_state,
+            &mut process,
+            &mut temp_files,
+            &missing,
+        );
+        apply_editor_requests(&mut backend_terminal, &mut app, Some(&mut session)).unwrap();
+        assert!(log.lock().unwrap().is_empty());
+        assert!(app.status().contains("no external editor"));
+
+        queue_normal_editor(&mut app);
+        temp_files.create = Err(EditorError::TempFile);
+        let configured = |name: &str| (name == "EDITOR").then(|| OsString::from("nvim"));
+        let mut session = ExternalEditorSession::new(
+            &mut terminal_state,
+            &mut process,
+            &mut temp_files,
+            &configured,
+        );
+        apply_editor_requests(&mut backend_terminal, &mut app, Some(&mut session)).unwrap();
+        assert!(log.lock().unwrap().is_empty());
+        assert!(app.status().contains("private editor file"));
+    }
+
+    #[test]
+    fn resume_failure_returns_a_sanitized_error_after_saving_read_content() {
+        let mut app = App::new(DemoFixture::load());
+        queue_normal_editor(&mut app);
+        let (result, calls, cleaned) = run_editor_request(
+            &mut app,
+            Ok(true),
+            Ok("saved despite resume failure".to_owned()),
+            false,
+            true,
+        );
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "external editor terminal restoration failed"
+        );
+        assert_eq!(
+            calls,
+            [
+                "show_cursor",
+                "leave_alternate_screen",
+                "disable_raw_mode",
+                "launch",
+                "enable_raw_mode",
+            ]
+        );
+        assert!(cleaned);
+        assert_eq!(app.draft_count(), 1);
+        assert!(!app.status().contains("saved despite resume failure"));
+    }
+
+    #[derive(Debug)]
+    struct EventFailingDraftStore;
+
+    impl DraftStore for EventFailingDraftStore {
+        fn load(&self) -> Result<CommentDrafts, DraftStateError> {
+            Ok(CommentDrafts::default())
+        }
+
+        fn save(&self, _draft: &CommentDraft) -> Result<CommentDrafts, DraftStateError> {
+            Err(DraftStateError::Write(io::ErrorKind::PermissionDenied))
+        }
+
+        fn delete(&self, _target: &CommentTarget) -> Result<CommentDrafts, DraftStateError> {
+            Err(DraftStateError::Write(io::ErrorKind::PermissionDenied))
+        }
+    }
+
+    #[test]
+    fn external_save_failure_still_reacquires_and_redraws_with_text_recoverable() {
+        let mut app = App::with_stores(
+            DemoFixture::load(),
+            Box::new(MemoryReviewStore::default()),
+            Box::new(EventFailingDraftStore),
+        );
+        app.handle_input(Input::Character('l'));
+        app.handle_input(Input::Character('c'));
+        app.handle_input(Input::Character('x'));
+        app.handle_input(Input::ExternalEditor);
+
+        let (result, calls, cleaned) = run_editor_request(
+            &mut app,
+            Ok(true),
+            Ok("recoverable replacement".to_owned()),
+            false,
+            false,
+        );
+
+        result.unwrap();
+        assert_eq!(calls, expected_editor_cycle());
+        assert!(cleaned);
+        assert_eq!(app.edit_buffer().unwrap().text(), "recoverable replacement");
+        assert!(app.status().contains("not saved"));
     }
 
     #[test]

@@ -4,7 +4,7 @@ A keyboard-first terminal review inbox for commits across GitHub projects.
 
 See [PRODUCT.md](PRODUCT.md) for the accepted requirements and delivery order.
 
-## Current status: diff review, progress, and keyboard comment editing
+## Current status: diff review, comment drafts, and external editing
 
 Implemented now:
 
@@ -95,11 +95,15 @@ Implemented now:
   drafts at the selected Diff row. Draft and diff-cursor markers, target and
   eligibility feedback, multiline cursor editing, explicit save/cancel behavior,
   sanitized save errors, and full/compact EDIT layouts are implemented.
+- Commit and supported line drafts can be opened in the first nonblank configured
+  `$VISUAL`, then `$EDITOR`, including commands such as `nvim -f`. ReviewBox
+  restores the normal terminal before launch and reacquires, clears, resizes, and
+  redraws the TUI afterward. Successful nonblank edits are saved; launch, exit,
+  read, UTF-8, size, or save failures preserve the prior durable draft.
 
 Planned for later delivery increments, and not implemented yet:
 
-- External-editor integration, loading existing comments, and publishing
-  comments.
+- Loading existing comments and publishing comments.
 
 ## Launch configuration and demo
 
@@ -143,8 +147,10 @@ cancel loading and exit.
 
 The demo needs no GitHub authentication. It performs no network requests or
 network writes and does not persist runtime state; reviewed marks and comment
-draft state exist only in memory for that process. All repository names, commit
-IDs, files, and diff-like content are fictional.
+draft state exist only in memory for that process. It may launch an explicitly
+configured external editor when `E` or `Ctrl-e` is pressed, but that path remains
+network-free. All repository names, commit IDs, files, and diff-like content are
+fictional.
 
 Run the same fixture/state/rendering integration noninteractively with:
 
@@ -180,6 +186,7 @@ action.
 | Normal | `m` | Toggle the selected commit reviewed/unreviewed from Commit, File, or Diff. A live mark changes only after a successful save. |
 | Normal | `f` | Toggle all commits / remaining commits. This filter is not persisted. |
 | Normal | `c` | Create or edit the selected commit draft from Commit or File, or the selected supported line draft from Diff. Repository and unsupported diff rows show a refusal. |
+| Normal | `E` | Open that same contextual draft in `$VISUAL` or `$EDITOR`. A missing draft starts with an empty buffer; Repository and unsupported diff rows show a refusal. |
 | Normal | `?` | Open contextual keyboard help. |
 | Normal | `q` | Quit and restore the terminal. |
 | Search | Printable characters | Append text, including characters that are navigation keys in Normal mode. |
@@ -192,6 +199,7 @@ action.
 | Edit | Arrow keys / `Home` / `End` | Move by character, line, or to the current line boundary in multiline text. |
 | Edit | `Escape` | Save and return to the prior pane. Whitespace-only text deletes an existing draft or discards a new one. A failed save keeps the text open for retry. |
 | Edit | `Ctrl-g` | Cancel changes, restore the last saved body, and return to the prior pane. |
+| Edit | `Ctrl-e` | Open the current in-memory buffer externally, save a successful replacement, and stay in Edit. If saving fails, the replacement remains in the Edit buffer for recovery. |
 | Global | `Ctrl-c` | Quit from Normal, Search, or Help. In Edit, save first and quit only if that succeeds. |
 
 Search starts after the current list selection or diff position, selects or
@@ -276,6 +284,17 @@ unreadable file is reported and never overwritten; failed replacement preserves
 the previous bytes. No lock coordinates concurrent ReviewBox processes, so two
 simultaneous writers can still race. Drafts are never stored in
 `review-state.json`. Demo and demo-smoke construct only memory-backed draft state.
+
+External editing selects the first nonblank value from `$VISUAL`, then `$EDITOR`.
+The value is split into an executable and arguments with quote and backslash
+support, but is never passed through a shell; the private draft body and temporary
+path are not interpolated into a command string. The temporary `draft.md` is
+created outside the repository under an absolute `$XDG_RUNTIME_DIR`, when set,
+or the system temporary directory. Its new directory uses mode `0700` and its
+file mode `0600` on Unix. Input and output are capped at 1 MiB and decoded as
+strict UTF-8, with the durable 65,000-character draft limit enforced. The file
+and directory are removed best-effort after every launch path. A successful
+blank result or a nonzero editor exit leaves the previous draft unchanged.
 
 ## GitHub loading behavior and limitations
 
@@ -363,6 +382,13 @@ mode in reverse setup order. Setup tracks acquired resources so a recoverable
 partial setup failure also restores what was already changed. Process aborts,
 `SIGKILL`, power loss, and equivalent failures cannot be guaranteed to run
 cleanup.
+
+Before an external editor starts, ReviewBox shows the cursor, leaves the
+alternate screen, and disables raw mode. After the editor returns—even after a
+nonzero exit or launch/read failure—it enables raw mode, enters the alternate
+screen, hides the cursor, and fully redraws. If terminal reacquisition fails,
+already-read content is still offered to the draft store before ReviewBox exits
+with a sanitized error; final teardown remains idempotent.
 
 ## Development checks
 
