@@ -8,6 +8,7 @@ use std::io::{self, Read};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -97,6 +98,7 @@ impl CommentTarget {
 pub struct CommentDraft {
     pub target: CommentTarget,
     pub body: String,
+    pub submission: Option<SubmissionAttempt>,
 }
 
 impl CommentDraft {
@@ -104,9 +106,31 @@ impl CommentDraft {
         let draft = Self {
             target,
             body: body.into(),
+            submission: None,
         };
         validate_draft(&draft)?;
         Ok(draft)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmissionAttempt {
+    pub attempt: String,
+    pub started_at: DateTime<Utc>,
+}
+
+impl SubmissionAttempt {
+    pub fn new(
+        attempt: impl Into<String>,
+        started_at: DateTime<Utc>,
+    ) -> Result<Self, DraftStateError> {
+        let value = Self {
+            attempt: attempt.into(),
+            started_at,
+        };
+        validate_submission(&value)?;
+        Ok(value)
     }
 }
 
@@ -184,6 +208,16 @@ pub trait DraftStore: fmt::Debug {
     fn load(&self) -> Result<CommentDrafts, DraftStateError>;
     fn save(&self, draft: &CommentDraft) -> Result<CommentDrafts, DraftStateError>;
     fn delete(&self, target: &CommentTarget) -> Result<CommentDrafts, DraftStateError>;
+    fn begin_submission(
+        &self,
+        _target: &CommentTarget,
+        _attempt: SubmissionAttempt,
+    ) -> Result<CommentDrafts, DraftStateError> {
+        Err(DraftStateError::Unavailable)
+    }
+    fn clear_submission(&self, _target: &CommentTarget) -> Result<CommentDrafts, DraftStateError> {
+        Err(DraftStateError::Unavailable)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -277,6 +311,11 @@ impl DraftStore for FileDraftStore {
     fn save(&self, draft: &CommentDraft) -> Result<CommentDrafts, DraftStateError> {
         validate_draft(draft)?;
         let mut drafts = self.read_drafts()?;
+        if drafts.get(&draft.target).is_some_and(|existing| {
+            existing.submission.is_some() && existing.submission != draft.submission
+        }) {
+            return Err(DraftStateError::InvalidDraft);
+        }
         drafts.insert(draft.clone());
         self.write_drafts(&drafts)?;
         Ok(drafts)
@@ -286,6 +325,38 @@ impl DraftStore for FileDraftStore {
         validate_target(target)?;
         let mut drafts = self.read_drafts()?;
         drafts.remove(target);
+        self.write_drafts(&drafts)?;
+        Ok(drafts)
+    }
+
+    fn begin_submission(
+        &self,
+        target: &CommentTarget,
+        attempt: SubmissionAttempt,
+    ) -> Result<CommentDrafts, DraftStateError> {
+        validate_target(target)?;
+        validate_submission(&attempt)?;
+        let mut drafts = self.read_drafts()?;
+        let draft = drafts
+            .drafts
+            .get_mut(target)
+            .ok_or(DraftStateError::InvalidDraft)?;
+        if draft.submission.is_some() {
+            return Err(DraftStateError::InvalidDraft);
+        }
+        draft.submission = Some(attempt);
+        self.write_drafts(&drafts)?;
+        Ok(drafts)
+    }
+
+    fn clear_submission(&self, target: &CommentTarget) -> Result<CommentDrafts, DraftStateError> {
+        validate_target(target)?;
+        let mut drafts = self.read_drafts()?;
+        let draft = drafts
+            .drafts
+            .get_mut(target)
+            .ok_or(DraftStateError::InvalidDraft)?;
+        draft.submission = None;
         self.write_drafts(&drafts)?;
         Ok(drafts)
     }
@@ -312,6 +383,11 @@ impl DraftStore for MemoryDraftStore {
     fn save(&self, draft: &CommentDraft) -> Result<CommentDrafts, DraftStateError> {
         validate_draft(draft)?;
         let mut drafts = self.drafts.borrow_mut();
+        if drafts.get(&draft.target).is_some_and(|existing| {
+            existing.submission.is_some() && existing.submission != draft.submission
+        }) {
+            return Err(DraftStateError::InvalidDraft);
+        }
         drafts.insert(draft.clone());
         Ok(drafts.clone())
     }
@@ -320,6 +396,36 @@ impl DraftStore for MemoryDraftStore {
         validate_target(target)?;
         let mut drafts = self.drafts.borrow_mut();
         drafts.remove(target);
+        Ok(drafts.clone())
+    }
+
+    fn begin_submission(
+        &self,
+        target: &CommentTarget,
+        attempt: SubmissionAttempt,
+    ) -> Result<CommentDrafts, DraftStateError> {
+        validate_target(target)?;
+        validate_submission(&attempt)?;
+        let mut drafts = self.drafts.borrow_mut();
+        let draft = drafts
+            .drafts
+            .get_mut(target)
+            .ok_or(DraftStateError::InvalidDraft)?;
+        if draft.submission.is_some() {
+            return Err(DraftStateError::InvalidDraft);
+        }
+        draft.submission = Some(attempt);
+        Ok(drafts.clone())
+    }
+
+    fn clear_submission(&self, target: &CommentTarget) -> Result<CommentDrafts, DraftStateError> {
+        validate_target(target)?;
+        let mut drafts = self.drafts.borrow_mut();
+        let draft = drafts
+            .drafts
+            .get_mut(target)
+            .ok_or(DraftStateError::InvalidDraft)?;
+        draft.submission = None;
         Ok(drafts.clone())
     }
 }
@@ -381,6 +487,21 @@ fn validate_draft(draft: &CommentDraft) -> Result<(), DraftStateError> {
     {
         return Err(DraftStateError::InvalidDraft);
     }
+    if let Some(submission) = &draft.submission {
+        validate_submission(submission)?;
+    }
+    Ok(())
+}
+
+fn validate_submission(submission: &SubmissionAttempt) -> Result<(), DraftStateError> {
+    if submission.attempt.len() != 32
+        || !submission
+            .attempt
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(DraftStateError::InvalidDraft);
+    }
     Ok(())
 }
 
@@ -414,6 +535,8 @@ struct CommitDrafts {
 #[serde(deny_unknown_fields)]
 struct BodyDraft {
     body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    submission: Option<SubmissionAttempt>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -422,6 +545,8 @@ struct LineDraft {
     path: String,
     position: u32,
     body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    submission: Option<SubmissionAttempt>,
 }
 
 #[derive(Serialize)]
@@ -494,18 +619,27 @@ fn decode(bytes: &[u8]) -> Result<CommentDrafts, DraftStateError> {
                     CommentDraft {
                         target: base,
                         body: body.body,
+                        submission: body.submission,
                     },
                 )?;
             }
             for line in commit.lines {
                 let body = line.body;
+                let submission = line.submission;
                 let line_target = LineTarget {
                     path: line.path,
                     position: line.position,
                 };
                 let target = CommentTarget::line(repository_id, &sha, line_target)
                     .map_err(|_| DraftStateError::Malformed)?;
-                insert_decoded(&mut drafts, CommentDraft { target, body })?;
+                insert_decoded(
+                    &mut drafts,
+                    CommentDraft {
+                        target,
+                        body,
+                        submission,
+                    },
+                )?;
             }
         }
     }
@@ -542,12 +676,14 @@ fn encode(drafts: &CommentDrafts) -> Result<Vec<u8>, DraftStateError> {
             CommentAnchor::Commit => {
                 commit.commit = Some(BodyDraft {
                     body: draft.body.clone(),
+                    submission: draft.submission.clone(),
                 });
             }
             CommentAnchor::Line(line) => commit.lines.push(LineDraft {
                 path: line.path.clone(),
                 position: line.position,
                 body: draft.body.clone(),
+                submission: draft.submission.clone(),
             }),
         }
     }
@@ -763,6 +899,46 @@ mod tests {
                 sha('e'),
                 sha('f')
             )
+        );
+    }
+
+    #[test]
+    fn submission_record_round_trips_and_old_schema_stays_compatible() {
+        let directory = TestDirectory::new();
+        let store = store(&directory);
+        let draft = commit_draft(7, &sha('a'), "pending review");
+        let target = draft.target.clone();
+        store.save(&draft).unwrap();
+        let without_submission = fs::read_to_string(directory.state_path()).unwrap();
+        assert!(!without_submission.contains("submission"));
+
+        let attempt = SubmissionAttempt::new(
+            "0123456789abcdef0123456789abcdef",
+            "2024-01-15T12:00:00Z".parse().unwrap(),
+        )
+        .unwrap();
+        let drafts = store.begin_submission(&target, attempt.clone()).unwrap();
+        assert_eq!(
+            drafts.get(&target).unwrap().submission.as_ref(),
+            Some(&attempt)
+        );
+        assert_eq!(store.save(&draft), Err(DraftStateError::InvalidDraft));
+        assert!(
+            fs::read_to_string(directory.state_path())
+                .unwrap()
+                .contains("0123456789abcdef0123456789abcdef")
+        );
+        let reloaded = store.load().unwrap();
+        assert_eq!(
+            reloaded.get(&target).unwrap().submission.as_ref(),
+            Some(&attempt)
+        );
+        let cleared = store.clear_submission(&target).unwrap();
+        assert!(cleared.get(&target).unwrap().submission.is_none());
+        assert!(
+            !fs::read_to_string(directory.state_path())
+                .unwrap()
+                .contains("submission")
         );
     }
 
@@ -1036,6 +1212,7 @@ mod tests {
         let invalid_error = CommentDraft {
             target: CommentTarget::commit(1, sha('a')).unwrap(),
             body: "fictional private body".repeat(MAX_DRAFT_CHARACTERS),
+            submission: None,
         };
         let invalid_error = MemoryDraftStore::default()
             .save(&invalid_error)

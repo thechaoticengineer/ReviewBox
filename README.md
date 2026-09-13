@@ -4,7 +4,7 @@ A keyboard-first terminal review inbox for commits across GitHub projects.
 
 See [PRODUCT.md](PRODUCT.md) for the accepted requirements and delivery order.
 
-## Current status: diff review, comment drafts, and external editing
+## Current status: diff review and commit comments
 
 Implemented now:
 
@@ -100,10 +100,15 @@ Implemented now:
   restores the normal terminal before launch and reacquires, clears, resizes, and
   redraws the TUI afterward. Successful nonblank edits are saved; launch, exit,
   read, UTF-8, size, or save failures preserve the prior durable draft.
+- Existing commit comments load on demand in a keyboard-scrollable overlay.
+  Publishing is a separate `P` action with a `y` confirmation and uses only
+  GitHub's commit-comments endpoint. Created comments refresh the overlay;
+  failures preserve the draft, and ambiguous outcomes remain durably locked
+  until marker-based reconciliation proves whether the exact attempt exists.
 
 Planned for later delivery increments, and not implemented yet:
 
-- Loading existing comments and publishing comments.
+- Installation packaging and final workflow polish.
 
 ## Launch configuration and demo
 
@@ -141,9 +146,10 @@ Metadata (read) permission for authenticated repository discovery and Contents
 classic token needs the `repo` scope to include private repositories; a
 fine-grained token must select the desired repositories and grant those read
 permissions. Repositories hidden from the credential cannot be discovered.
-ReviewBox does not inspect or persist the credential. Every request is a
-read-only `gh api --method GET` request. Press `q` or `Ctrl-c` at any time to
-cancel loading and exit.
+ReviewBox does not inspect or persist the credential. Inbox, detail, and comment
+loading use explicit `gh api --method GET` requests. The only write request is
+the user-confirmed commit-comment `POST` described below. Press `q` or `Ctrl-c`
+at any time to cancel active work and exit.
 
 The demo needs no GitHub authentication. It performs no network requests or
 network writes and does not persist runtime state; reviewed marks and comment
@@ -187,6 +193,8 @@ action.
 | Normal | `f` | Toggle all commits / remaining commits. This filter is not persisted. |
 | Normal | `c` | Create or edit the selected commit draft from Commit or File, or the selected supported line draft from Diff. Repository and unsupported diff rows show a refusal. |
 | Normal | `E` | Open that same contextual draft in `$VISUAL` or `$EDITOR`. A missing draft starts with an empty buffer; Repository and unsupported diff rows show a refusal. |
+| Normal | `P` | Publish that saved contextual draft. A confirmation overlay accepts only `y`; every other key cancels. An unresolved prior attempt reconciles instead of posting again. |
+| Normal | `C` | Open existing comments for the selected commit. This also reconciles an unresolved publish attempt for that commit. |
 | Normal | `?` | Open contextual keyboard help. |
 | Normal | `q` | Quit and restore the terminal. |
 | Search | Printable characters | Append text, including characters that are navigation keys in Normal mode. |
@@ -194,6 +202,7 @@ action.
 | Search | `Enter` | Apply the query in the focused pane and return to Normal mode. The query remains available to `n` / `N`, even after no match. |
 | Search | `Escape` | Cancel without moving and return to Normal mode. |
 | Help | `Escape` | Close help and restore its prior focus. Other non-global keys are ignored. |
+| Comments | `j` / `k`, `r`, `Escape` | Scroll, refresh, or close the existing-comments overlay. |
 | Edit | Printable characters / `Enter` | Insert text or a newline. Normal-mode keys, including `h`, `j`, `k`, `l`, `q`, `n`, `/`, `?`, `m`, `f`, `g`, `G`, `c`, `E`, `P`, and `C`, are inserted literally. |
 | Edit | `Backspace` | Delete the character before the cursor. |
 | Edit | Arrow keys / `Home` / `End` | Move by character, line, or to the current line boundary in multiline text. |
@@ -295,6 +304,24 @@ file mode `0600` on Unix. Input and output are capped at 1 MiB and decoded as
 strict UTF-8, with the durable 65,000-character draft limit enforced. The file
 and directory are removed best-effort after every launch path. A successful
 blank result or a nonzero editor exit leaves the previous draft unchanged.
+
+Publishing sends `POST /repos/{owner}/{repo}/commits/{full_sha}/comments` with
+the body alone for a commit draft, or body, path, and validated GitHub diff
+position for a line draft. ReviewBox does not use pull-request review or issue
+comment APIs. Before posting, it appends a unique HTML marker and atomically
+stores that attempt and its start time in the draft file. A parsed `201 Created`
+response removes the draft. Definite client/authentication failures clear only
+the attempt lock; transport failures, cancellation, unexpected statuses, and
+unreadable success responses keep it locked. `P` or `C` then lists comments and
+searches the raw API body for that exact marker before any display truncation.
+Only a match removes the draft. A complete not-found listing may unlock a retry
+after 60 seconds; an incomplete or younger result never does. Editing and repeat
+publishing stay disabled while the outcome is unresolved.
+
+Comment lists fetch up to ten pages of 100 comments and label capped results as
+incomplete. Displayed author, path, timestamp, and body text are sanitized, and
+bodies are capped at 8,000 characters. The demo and demo-smoke flows use an
+in-process fake comment service with no `gh` or network-write path.
 
 ## GitHub loading behavior and limitations
 

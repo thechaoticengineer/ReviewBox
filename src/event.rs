@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io;
 use std::time::Duration;
@@ -9,11 +10,12 @@ use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 
-use crate::app::{App, DetailEffect, DetailResult, Input};
+use crate::app::{App, CommentEffect, CommentResult, DetailEffect, DetailResult, Input};
 use crate::external_editor::{
     EditorError, EditorProcess, EditorTempFiles, edit_draft, resolve_editor,
 };
 use crate::github::LoadEvent;
+use crate::github::{ExistingComment, ExistingCommentAnchor, ExistingComments, PublishOutcome};
 use crate::render;
 use crate::terminal::TerminalSuspend;
 
@@ -91,6 +93,70 @@ impl DetailRequester for NoDetails {
     fn shutdown(&mut self) {}
 }
 
+pub trait CommentRequester {
+    fn request(&mut self, effect: CommentEffect);
+    fn cancel(&mut self, request_id: u64);
+    fn try_next(&mut self) -> Option<CommentResult>;
+    fn shutdown(&mut self);
+}
+
+/// Network-incapable comment service for demo, smoke, and fixture runs.
+#[derive(Default)]
+pub struct FakeComments {
+    results: VecDeque<CommentResult>,
+}
+
+impl CommentRequester for FakeComments {
+    fn request(&mut self, effect: CommentEffect) {
+        match effect {
+            CommentEffect::Load {
+                request_id,
+                key,
+                reconcile_target,
+                marker,
+                ..
+            } => self.results.push_back(CommentResult {
+                request_id,
+                key,
+                target: reconcile_target,
+                outcome: crate::app::CommentResultOutcome::Loaded(Ok(ExistingComments {
+                    comments: vec![ExistingComment {
+                        id: 1,
+                        author: Some("fictional-reviewer".to_owned()),
+                        created_at: chrono::DateTime::from_timestamp(1_704_110_400, 0)
+                            .expect("fixed demo timestamp"),
+                        anchor: ExistingCommentAnchor::Commit,
+                        body: "Fictional existing feedback for the offline demo.".to_owned(),
+                    }],
+                    complete: true,
+                    marker_found: marker.is_some(),
+                })),
+            }),
+            CommentEffect::Publish {
+                request_id,
+                key,
+                target,
+                ..
+            } => self.results.push_back(CommentResult {
+                request_id,
+                key,
+                target: Some(target),
+                outcome: crate::app::CommentResultOutcome::Published(PublishOutcome::Created {
+                    id: 1,
+                }),
+            }),
+            CommentEffect::Cancel { .. } => {}
+        }
+    }
+    fn cancel(&mut self, _request_id: u64) {}
+    fn try_next(&mut self) -> Option<CommentResult> {
+        self.results.pop_front()
+    }
+    fn shutdown(&mut self) {
+        self.results.clear();
+    }
+}
+
 pub struct CrosstermEventSource;
 
 impl EventSource for CrosstermEventSource {
@@ -154,9 +220,11 @@ pub fn run_with_loader<B: Backend, E: EventSource, L: LoaderEventSource, D: Deta
 where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    let result = run_loop(terminal, app, events, loader, details, None);
+    let mut comments = FakeComments::default();
+    let result = run_loop(terminal, app, events, loader, details, &mut comments, None);
     loader.cancel();
     details.shutdown();
+    comments.shutdown();
     result
 }
 
@@ -171,37 +239,68 @@ where
 {
     let mut loader = NoLoaderEvents;
     let mut details = NoDetails;
-    run_with_loader_and_editor(terminal, app, events, &mut loader, &mut details, editor)
+    let mut comments = FakeComments::default();
+    let result = run_loop(
+        terminal,
+        app,
+        events,
+        &mut loader,
+        &mut details,
+        &mut comments,
+        Some(editor),
+    );
+    loader.cancel();
+    details.shutdown();
+    comments.shutdown();
+    result
 }
 
-pub fn run_with_loader_and_editor<
+pub fn run_with_services_and_editor<
     B: Backend,
     E: EventSource,
     L: LoaderEventSource,
     D: DetailRequester,
+    C: CommentRequester,
 >(
     terminal: &mut Terminal<B>,
     app: &mut App,
     events: &mut E,
     loader: &mut L,
     details: &mut D,
+    comments: &mut C,
     editor: &mut ExternalEditorSession<'_>,
 ) -> io::Result<()>
 where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    let result = run_loop(terminal, app, events, loader, details, Some(editor));
+    let result = run_loop(
+        terminal,
+        app,
+        events,
+        loader,
+        details,
+        comments,
+        Some(editor),
+    );
     loader.cancel();
     details.shutdown();
+    comments.shutdown();
     result
 }
 
-fn run_loop<B: Backend, E: EventSource, L: LoaderEventSource, D: DetailRequester>(
+fn run_loop<
+    B: Backend,
+    E: EventSource,
+    L: LoaderEventSource,
+    D: DetailRequester,
+    C: CommentRequester,
+>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     events: &mut E,
     loader: &mut L,
     details: &mut D,
+    comments: &mut C,
     mut editor: Option<&mut ExternalEditorSession<'_>>,
 ) -> io::Result<()>
 where
@@ -225,6 +324,7 @@ where
         apply_editor_requests(terminal, app, editor.as_deref_mut())?;
 
         apply_detail_effects(app, details);
+        apply_comment_effects(app, comments);
 
         if app.should_quit() {
             break;
@@ -244,11 +344,29 @@ where
             };
             app.apply_detail_result(result);
         }
+        for _ in 0..MAX_DETAIL_RESULTS_PER_TICK {
+            let Some(result) = comments.try_next() else {
+                break;
+            };
+            app.apply_comment_result(result);
+        }
+        apply_comment_effects(app, comments);
 
         draw(terminal, app)?;
     }
 
     Ok(())
+}
+
+fn apply_comment_effects<C: CommentRequester>(app: &mut App, comments: &mut C) {
+    for effect in app.take_comment_effects() {
+        match effect {
+            request @ (CommentEffect::Load { .. } | CommentEffect::Publish { .. }) => {
+                comments.request(request)
+            }
+            CommentEffect::Cancel { request_id } => comments.cancel(request_id),
+        }
+    }
 }
 
 fn apply_editor_requests<B: Backend>(
@@ -1198,5 +1316,79 @@ mod tests {
         assert_eq!(details.cancellations, details.requests);
         assert!(details.shutdown);
         assert!(cancelled.load(Ordering::Acquire));
+    }
+
+    #[derive(Default)]
+    struct RecordingComments {
+        requests: Vec<&'static str>,
+        results: VecDeque<CommentResult>,
+        shutdown: bool,
+    }
+
+    impl CommentRequester for RecordingComments {
+        fn request(&mut self, effect: CommentEffect) {
+            match effect {
+                CommentEffect::Load {
+                    request_id,
+                    key,
+                    reconcile_target,
+                    ..
+                } => {
+                    self.requests.push("GET");
+                    self.results.push_back(CommentResult {
+                        request_id,
+                        key,
+                        target: reconcile_target,
+                        outcome: crate::app::CommentResultOutcome::Loaded(Ok(ExistingComments {
+                            comments: Vec::new(),
+                            complete: true,
+                            marker_found: false,
+                        })),
+                    });
+                }
+                CommentEffect::Publish { .. } => self.requests.push("POST"),
+                CommentEffect::Cancel { .. } => {}
+            }
+        }
+        fn cancel(&mut self, _request_id: u64) {}
+        fn try_next(&mut self) -> Option<CommentResult> {
+            self.results.pop_front()
+        }
+        fn shutdown(&mut self) {
+            self.shutdown = true;
+        }
+    }
+
+    #[test]
+    fn event_loop_dispatches_comment_loading_through_a_network_incapable_fake() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(DemoFixture::load());
+        let mut events = ScriptedEvents(VecDeque::from([
+            Ok(Some(AppEvent::Input(Input::Character('l')))),
+            Ok(Some(AppEvent::Input(Input::Character('C')))),
+            Ok(None),
+            Ok(Some(AppEvent::Input(Input::Quit))),
+        ]));
+        let mut loader = NoLoaderEvents;
+        let mut details = NoDetails;
+        let mut comments = RecordingComments::default();
+        run_loop(
+            &mut terminal,
+            &mut app,
+            &mut events,
+            &mut loader,
+            &mut details,
+            &mut comments,
+            None,
+        )
+        .unwrap();
+        comments.shutdown();
+        assert_eq!(comments.requests, ["GET"]);
+        assert!(comments.shutdown);
+        assert!(matches!(
+            app.current_comments(),
+            Some(crate::app::CommentListState::Loaded(_))
+        ));
     }
 }

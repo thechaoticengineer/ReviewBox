@@ -5,6 +5,7 @@ use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 
 use crate::app::{App, Input, Mode, Pane};
+use crate::event::{CommentRequester, FakeComments};
 use crate::fixture::DemoFixture;
 use crate::github::RESPONSE_TRUNCATED_LABEL;
 use crate::render;
@@ -135,6 +136,38 @@ pub fn run() -> io::Result<SmokeReport> {
         !app.should_quit() && app.draft_count() == 2,
         "q must insert in EDIT and Escape must save the line draft",
     )?;
+
+    let mut comments = FakeComments::default();
+    input(&mut app, 'C');
+    drain_fake_comments(&mut app, &mut comments);
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "fictional-reviewer",
+        "network-free comments frame",
+    )?;
+    app.handle_input(Input::Escape);
+    input(&mut app, 'P');
+    ensure(
+        matches!(app.mode(), Mode::ConfirmPublish { .. }),
+        "P must require explicit confirmation",
+    )?;
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "Press y to publish",
+        "publish confirmation frame",
+    )?;
+    input(&mut app, 'y');
+    drain_fake_comments(&mut app, &mut comments);
+    ensure(
+        app.draft_count() == 1,
+        "fake publish must clear only its line draft",
+    )?;
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "Comment published",
+        "fake publish success frame",
+    )?;
+    drain_fake_comments(&mut app, &mut comments);
 
     resize(&mut terminal, 60, 16)?;
     ensure(
@@ -357,6 +390,15 @@ fn search(app: &mut App, query: &str) -> io::Result<()> {
 
 fn input(app: &mut App, character: char) {
     app.handle_input(Input::Character(character));
+}
+
+fn drain_fake_comments(app: &mut App, comments: &mut FakeComments) {
+    for effect in app.take_comment_effects() {
+        comments.request(effect);
+    }
+    while let Some(result) = comments.try_next() {
+        app.apply_comment_result(result);
+    }
 }
 
 fn resize(terminal: &mut Terminal<TestBackend>, width: u16, height: u16) -> io::Result<()> {

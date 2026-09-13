@@ -4,9 +4,14 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use crate::app::{App, HELP_BINDINGS, LivePhase, MIN_FULL_HEIGHT, MIN_FULL_WIDTH, Mode, Pane};
+use crate::app::{
+    App, CommentListState, HELP_BINDINGS, LivePhase, MIN_FULL_HEIGHT, MIN_FULL_WIDTH, Mode, Pane,
+};
+use crate::comment_draft::CommentAnchor;
 use crate::day::TimezoneSource;
-use crate::github::{DetailFailure, DetailState, FailureCategory, RESPONSE_TRUNCATED_LABEL};
+use crate::github::{
+    DetailFailure, DetailState, ExistingCommentAnchor, FailureCategory, RESPONSE_TRUNCATED_LABEL,
+};
 use crate::inbox::{DiffLineKind, InboxSource, PatchContent};
 use crate::ui_layout::{ReviewPaneLayout, wrap_text};
 use unicode_width::UnicodeWidthChar;
@@ -54,16 +59,23 @@ fn draw_review_panes(frame: &mut Frame<'_>, layout: ReviewPaneLayout, app: &App)
         app.current_commits()
             .iter()
             .map(|commit| {
-                let (reviewed, drafted) =
+                let (reviewed, drafted, commented) =
                     app.current_repository()
-                        .map_or((false, false), |repository| {
+                        .map_or((false, false, false), |repository| {
                             (
                                 app.is_reviewed(repository.identity.id, &commit.sha),
                                 app.commit_has_draft(repository.identity.id, &commit.sha),
+                                app.commit_has_comments(repository.identity.id, &commit.sha),
                             )
                         });
                 let review_marker = if reviewed { "✓" } else { " " };
-                let draft_marker = if drafted { "◆" } else { " " };
+                let draft_marker = if drafted {
+                    "◆"
+                } else if commented {
+                    "●"
+                } else {
+                    " "
+                };
                 format!(
                     "{review_marker}{draft_marker} {}",
                     sanitize_display_text(&commit.label())
@@ -415,6 +427,7 @@ fn diff_lines(app: &App, available_rows: usize) -> Vec<Line<'static>> {
         let matched = app.diff_match() == Some(index);
         let selected = app.diff_cursor() == index;
         let drafted = app.diff_line_has_draft(index);
+        let commented = app.diff_line_has_comment(index);
         for (row, text) in wrap_text(&content.text, content_width)
             .into_iter()
             .enumerate()
@@ -428,7 +441,13 @@ fn diff_lines(app: &App, available_rows: usize) -> Vec<Line<'static>> {
                 return lines;
             }
             let gutter = if row == 0 {
-                format_diff_gutter(drafted, content.old_line, content.new_line, number_width)
+                format_diff_gutter(
+                    drafted,
+                    commented,
+                    content.old_line,
+                    content.new_line,
+                    number_width,
+                )
             } else {
                 " ".repeat(gutter_width)
             };
@@ -479,10 +498,22 @@ fn diff_style(kind: DiffLineKind) -> Style {
     }
 }
 
-fn format_diff_gutter(drafted: bool, old: Option<u32>, new: Option<u32>, width: usize) -> String {
+fn format_diff_gutter(
+    drafted: bool,
+    commented: bool,
+    old: Option<u32>,
+    new: Option<u32>,
+    width: usize,
+) -> String {
     let old = old.map_or_else(String::new, |number| number.to_string());
     let new = new.map_or_else(String::new, |number| number.to_string());
-    let marker = if drafted { '◆' } else { ' ' };
+    let marker = if drafted {
+        '◆'
+    } else if commented {
+        '●'
+    } else {
+        ' '
+    };
     format!("{marker} {old:>width$} {new:>width$} ")
 }
 
@@ -541,6 +572,8 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Mode::SearchEntry { .. } => " SEARCH ",
         Mode::Help { .. } => " HELP ",
         Mode::Edit { .. } => " EDIT ",
+        Mode::Comments { .. } => " COMMENTS ",
+        Mode::ConfirmPublish { .. } => " PUBLISH? ",
     };
     let mut spans = vec![
         Span::styled(mode, Style::default().fg(Color::Black).bg(Color::Cyan)),
@@ -561,8 +594,14 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if app.draft_store_available() && app.draft_count() > 0 {
         spans.push(Span::raw(format!(" • {} drafts", app.draft_count())));
     }
+    if app.publish_in_flight() {
+        spans.push(Span::styled(
+            " • publishing",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     spans.push(Span::raw(
-        " • c comment • h/l focus • j/k move • m review • f filter • / search • n/N match • ? help • q quit",
+        " • c edit • P publish • C comments • h/l focus • j/k move • m review • f filter • / search • ? help • q quit",
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -577,6 +616,8 @@ fn draw_compact(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Mode::SearchEntry { .. } => "SEARCH",
         Mode::Help { .. } => "HELP",
         Mode::Edit { .. } => "EDIT",
+        Mode::Comments { .. } => "COMMENTS",
+        Mode::ConfirmPublish { .. } => "PUBLISH?",
     };
     let review_warning = app
         .review_warning()
@@ -603,6 +644,142 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Mode::SearchEntry { target } => draw_search(frame, area, app, target),
         Mode::Help { .. } => draw_help(frame, area),
         Mode::Edit { target, .. } => draw_edit(frame, area, app, &target),
+        Mode::Comments { .. } => draw_comments(frame, area, app),
+        Mode::ConfirmPublish { target, .. } => draw_publish_confirmation(frame, area, app, &target),
+    }
+}
+
+fn draw_publish_confirmation(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    target: &crate::comment_draft::CommentTarget,
+) {
+    let popup = if area.width < MIN_FULL_WIDTH || area.height < MIN_FULL_HEIGHT {
+        area
+    } else {
+        centered_rect(area, 70, 7)
+    };
+    frame.render_widget(Clear, popup);
+    let block = modal_block(" PUBLISH comment? ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let kind = match target.anchor() {
+        CommentAnchor::Commit => "commit",
+        CommentAnchor::Line(line) => {
+            return frame.render_widget(
+                Paragraph::new(format!(
+                    "Line {}:{}\n\nPress y to publish; any other key cancels",
+                    sanitize_display_text(&line.path),
+                    line.position
+                ))
+                .wrap(Wrap { trim: true }),
+                inner,
+            );
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Publish saved {kind} draft?\n\nPress y to publish; any other key cancels\n{}",
+            app.status()
+        ))
+        .wrap(Wrap { trim: true }),
+        inner,
+    );
+}
+
+fn draw_comments(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let popup = if area.width < MIN_FULL_WIDTH || area.height < MIN_FULL_HEIGHT {
+        area
+    } else {
+        centered_rect(area, 86, 22)
+    };
+    frame.render_widget(Clear, popup);
+    let block = modal_block(" COMMIT comments ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let lines = match app.current_comments() {
+        Some(CommentListState::Loading) => vec![Line::raw("Loading existing comments…")],
+        Some(CommentListState::Failed(error)) => vec![Line::styled(
+            format!("Comments unavailable: {error}"),
+            Style::default().fg(Color::Red),
+        )],
+        Some(CommentListState::Loaded(list)) if list.comments.is_empty() => {
+            vec![Line::raw(if list.complete {
+                "No existing comments"
+            } else {
+                "No comments in the bounded, incomplete result"
+            })]
+        }
+        Some(CommentListState::Loaded(list)) => {
+            let mut lines = Vec::new();
+            if !list.complete {
+                lines.push(Line::styled(
+                    "INCOMPLETE — only the first bounded pages are shown",
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            for comment in &list.comments {
+                let author = comment.author.as_deref().unwrap_or("unknown author");
+                let anchor = match &comment.anchor {
+                    ExistingCommentAnchor::Commit => "commit".to_owned(),
+                    ExistingCommentAnchor::Line {
+                        path,
+                        position: Some(position),
+                        ..
+                    } => format!("{}:{position}", sanitize_display_text(path)),
+                    ExistingCommentAnchor::Line {
+                        path,
+                        position: None,
+                        line: Some(line),
+                        ..
+                    } => format!("{}:line {line} (outdated)", sanitize_display_text(path)),
+                    ExistingCommentAnchor::Line { path, .. } => {
+                        format!("{} (outdated)", sanitize_display_text(path))
+                    }
+                };
+                lines.push(Line::styled(
+                    format!(
+                        "@{author} • {} • {anchor}",
+                        comment.created_at.format("%Y-%m-%d %H:%M UTC")
+                    ),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
+                lines.extend(
+                    comment
+                        .body
+                        .lines()
+                        .flat_map(|line| wrap_text(line, inner.width as usize))
+                        .map(Line::raw),
+                );
+                lines.push(Line::raw(""));
+            }
+            lines
+        }
+        None => vec![Line::raw("Comments have not been loaded")],
+    };
+    let footer = u16::from(inner.height > 1);
+    let content = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(footer),
+    );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((u16::try_from(app.comments_scroll()).unwrap_or(u16::MAX), 0))
+            .wrap(Wrap { trim: false }),
+        content,
+    );
+    if footer > 0 {
+        frame.render_widget(
+            Paragraph::new("j/k scroll • r refresh • Esc close")
+                .style(Style::default().fg(Color::Cyan)),
+            Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+        );
     }
 }
 
@@ -817,11 +994,14 @@ fn centered_rect(area: Rect, desired_width: u16, desired_height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{Command, DetailEffect, DetailResult, Input};
+    use crate::app::{
+        Command, CommentEffect, CommentResult, CommentResultOutcome, DetailEffect, DetailResult,
+        Input,
+    };
     use crate::fixture::DemoFixture;
     use crate::github::{
-        FailureScope, LoadEvent, LoadFailure, LoadProgress, LoadStatus, LoadedRepository,
-        RepositoryCoverage,
+        ExistingComment, ExistingCommentAnchor, ExistingComments, FailureScope, LoadEvent,
+        LoadFailure, LoadProgress, LoadStatus, LoadedRepository, RepositoryCoverage,
     };
     use crate::inbox::{
         ChildPane, Commit, CommitDetail, DiffLine, DiffLineKind, FileChange, FileStatus,
@@ -1626,5 +1806,50 @@ mod tests {
         let drafted = rendered_text(&mut app, 140, 32);
         assert!(drafted.contains("◆"));
         assert!(drafted.contains("commentable src/welcome.rs:1"));
+    }
+
+    #[test]
+    fn comments_and_publish_confirmation_render_in_full_and_compact_layouts() {
+        let mut app = App::new(DemoFixture::load());
+        app.handle_input(Input::Character('l'));
+        app.handle_input(Input::Character('C'));
+        let CommentEffect::Load {
+            request_id, key, ..
+        } = app.take_comment_effects().remove(0)
+        else {
+            panic!()
+        };
+        app.apply_comment_result(CommentResult {
+            request_id,
+            key,
+            target: None,
+            outcome: CommentResultOutcome::Loaded(Ok(ExistingComments {
+                comments: vec![ExistingComment {
+                    id: 8,
+                    author: Some("fictional-reviewer".to_owned()),
+                    created_at: Utc.with_ymd_and_hms(2024, 1, 15, 12, 0, 0).unwrap(),
+                    anchor: ExistingCommentAnchor::Line {
+                        path: "src/welcome.rs".to_owned(),
+                        position: None,
+                        line: Some(7),
+                    },
+                    body: "Existing fictional feedback".to_owned(),
+                }],
+                complete: false,
+                marker_found: false,
+            })),
+        });
+        for (width, height) in [(120, 32), (40, 8)] {
+            let text = rendered_text(&mut app, width, height);
+            assert!(text.contains("fictional-reviewer"));
+            assert!(text.contains("INCOMPLETE"));
+        }
+        app.handle_input(Input::Escape);
+        app.handle_input(Input::Character('c'));
+        app.handle_input(Input::Character('x'));
+        app.handle_input(Input::Escape);
+        app.handle_input(Input::Character('P'));
+        assert!(rendered_text(&mut app, 120, 32).contains("Press y to publish"));
+        assert!(rendered_text(&mut app, 40, 8).contains("Press y to publish"));
     }
 }

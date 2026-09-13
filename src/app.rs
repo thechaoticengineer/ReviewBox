@@ -1,16 +1,19 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fs::File;
+use std::io::Read;
 use std::sync::Arc;
 
 use ratatui::layout::Rect;
 
 use crate::comment_draft::{
     CommentAnchor, CommentDraft, CommentDrafts, CommentTarget, DraftStateError, DraftStore,
-    MAX_DRAFT_CHARACTERS, MemoryDraftStore, line_target,
+    MAX_DRAFT_CHARACTERS, MemoryDraftStore, SubmissionAttempt, line_target,
 };
 use crate::external_editor::EditorOutcome;
 use crate::github::{
-    DetailFailure, DetailState, FailureCategory, LoadEvent, LoadFailure, LoadProgress, LoadStatus,
-    LoadedRepository, RepositoryCoverage,
+    CommentFailure, DetailFailure, DetailState, ExistingCommentAnchor, ExistingComments,
+    FailureCategory, LoadEvent, LoadFailure, LoadProgress, LoadStatus, LoadedRepository,
+    PublishOutcome, RepositoryCoverage,
 };
 use crate::inbox::{
     Commit, CommitDetail, DiffLine, DiffLineKind, FileChange, Inbox, InboxSource, PatchCapReason,
@@ -34,6 +37,13 @@ pub enum Mode {
         previous_focus: Pane,
     },
     Edit {
+        target: CommentTarget,
+        previous_focus: Pane,
+    },
+    Comments {
+        previous_focus: Pane,
+    },
+    ConfirmPublish {
         target: CommentTarget,
         previous_focus: Pane,
     },
@@ -198,6 +208,14 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
         action: "edit draft with $VISUAL / $EDITOR",
     },
     HelpBinding {
+        keys: "P",
+        action: "publish draft after confirmation",
+    },
+    HelpBinding {
+        keys: "C",
+        action: "open existing commit comments",
+    },
+    HelpBinding {
         keys: "?",
         action: "open this help",
     },
@@ -236,6 +254,14 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
     HelpBinding {
         keys: "Edit: Ctrl-c",
         action: "save and quit",
+    },
+    HelpBinding {
+        keys: "Comments: j/k / r / Esc",
+        action: "scroll / refresh / close",
+    },
+    HelpBinding {
+        keys: "Publish: y / any other key",
+        action: "confirm / cancel",
     },
 ];
 
@@ -290,6 +316,87 @@ pub struct DetailResult {
     pub request_id: u64,
     pub key: DetailKey,
     pub outcome: Result<CommitDetail, DetailFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommentListState {
+    Loading,
+    Loaded(ExistingComments),
+    Failed(CommentFailure),
+}
+
+#[derive(Debug, Clone)]
+pub enum CommentEffect {
+    Load {
+        request_id: u64,
+        key: DetailKey,
+        repository: RepositoryIdentity,
+        marker: Option<String>,
+        reconcile_target: Option<CommentTarget>,
+    },
+    Publish {
+        request_id: u64,
+        key: DetailKey,
+        target: CommentTarget,
+        repository: RepositoryIdentity,
+        body_with_marker: String,
+    },
+    Cancel {
+        request_id: u64,
+    },
+}
+
+#[derive(Debug)]
+pub enum CommentResultOutcome {
+    Loaded(Result<ExistingComments, CommentFailure>),
+    Published(PublishOutcome),
+}
+
+#[derive(Debug)]
+pub struct CommentResult {
+    pub request_id: u64,
+    pub key: DetailKey,
+    pub target: Option<CommentTarget>,
+    pub outcome: CommentResultOutcome,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveCommentLoad {
+    request_id: u64,
+    key: DetailKey,
+}
+
+#[derive(Debug, Clone)]
+struct ActivePublish {
+    request_id: u64,
+    key: DetailKey,
+    target: CommentTarget,
+    repository: RepositoryIdentity,
+}
+
+pub trait AttemptSource: std::fmt::Debug {
+    fn next(&self) -> Result<SubmissionAttempt, ()>;
+    fn now(&self) -> chrono::DateTime<chrono::Utc>;
+}
+
+#[derive(Debug)]
+pub struct SystemAttemptSource;
+
+impl AttemptSource for SystemAttemptSource {
+    fn next(&self) -> Result<SubmissionAttempt, ()> {
+        let mut bytes = [0_u8; 16];
+        File::open("/dev/urandom")
+            .and_then(|mut file| file.read_exact(&mut bytes))
+            .map_err(|_| ())?;
+        let attempt = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        SubmissionAttempt::new(attempt, chrono::Utc::now()).map_err(|_| ())
+    }
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -424,6 +531,12 @@ pub struct App {
     next_request_id: u64,
     effects: VecDeque<DetailEffect>,
     editor_requests: VecDeque<EditorRequest>,
+    comment_cache: HashMap<DetailKey, CommentListState>,
+    active_comment_load: Option<ActiveCommentLoad>,
+    active_publish: Option<ActivePublish>,
+    comment_effects: VecDeque<CommentEffect>,
+    comments_scroll: usize,
+    attempt_source: Box<dyn AttemptSource>,
 }
 
 impl App {
@@ -494,10 +607,13 @@ impl App {
         drafts: CommentDrafts,
         draft_warning: Option<String>,
     ) -> Self {
-        let status = match &inbox.source {
+        let mut status = match &inbox.source {
             InboxSource::Demo => "Offline fictional demo".to_owned(),
             InboxSource::Live { .. } => "GitHub loading started".to_owned(),
         };
+        if drafts.iter().any(|draft| draft.submission.is_some()) {
+            status = "A comment publish is unverified; press P or open C to reconcile".to_owned();
+        }
         let live = matches!(inbox.source, InboxSource::Live { .. }).then(LiveInboxState::new);
         let mut app = Self {
             inbox,
@@ -535,6 +651,12 @@ impl App {
             next_request_id: 1,
             effects: VecDeque::new(),
             editor_requests: VecDeque::new(),
+            comment_cache: HashMap::new(),
+            active_comment_load: None,
+            active_publish: None,
+            comment_effects: VecDeque::new(),
+            comments_scroll: 0,
+            attempt_source: Box::new(SystemAttemptSource),
         };
         app.rebuild_projection(None);
         app.normalize();
@@ -731,7 +853,11 @@ impl App {
         self.pending_g = false;
         match &self.mode {
             Mode::Normal => self.apply_normal(command),
-            Mode::SearchEntry { .. } | Mode::Help { .. } | Mode::Edit { .. } => {}
+            Mode::SearchEntry { .. }
+            | Mode::Help { .. }
+            | Mode::Edit { .. }
+            | Mode::Comments { .. }
+            | Mode::ConfirmPublish { .. } => {}
         }
         self.normalize();
     }
@@ -757,6 +883,11 @@ impl App {
                 target: _,
                 previous_focus,
             } => self.handle_edit_input(previous_focus, input),
+            Mode::Comments { previous_focus } => self.handle_comments_input(previous_focus, input),
+            Mode::ConfirmPublish {
+                target,
+                previous_focus,
+            } => self.handle_publish_confirmation(target, previous_focus, input),
         }
         self.normalize();
     }
@@ -793,6 +924,14 @@ impl App {
             }
             Input::Character('E') => {
                 self.request_external_editor_from_normal();
+                return;
+            }
+            Input::Character('P') => {
+                self.request_publish();
+                return;
+            }
+            Input::Character('C') => {
+                self.open_comments();
                 return;
             }
             Input::Character('n') => Command::SearchNext,
@@ -854,6 +993,39 @@ impl App {
         }
     }
 
+    fn handle_comments_input(&mut self, previous_focus: Pane, input: Input) {
+        match input {
+            Input::Character('j') | Input::Down => {
+                self.comments_scroll = self.comments_scroll.saturating_add(1)
+            }
+            Input::Character('k') | Input::Up => {
+                self.comments_scroll = self.comments_scroll.saturating_sub(1)
+            }
+            Input::Character('r') => self.load_current_comments(true),
+            Input::Escape => {
+                self.focus = previous_focus;
+                self.mode = Mode::Normal;
+                self.status = "Comments closed".to_owned();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_publish_confirmation(
+        &mut self,
+        target: CommentTarget,
+        previous_focus: Pane,
+        input: Input,
+    ) {
+        self.mode = Mode::Normal;
+        self.focus = previous_focus;
+        if input != Input::Character('y') {
+            self.status = "Publish cancelled".to_owned();
+            return;
+        }
+        self.confirm_publish(target);
+    }
+
     fn handle_edit_input(&mut self, previous_focus: Pane, input: Input) {
         self.pending_g = false;
         match input {
@@ -900,6 +1072,16 @@ impl App {
 
     fn quit(&mut self) {
         self.cancel_active_detail();
+        if let Some(active) = self.active_comment_load.take() {
+            self.comment_effects.push_back(CommentEffect::Cancel {
+                request_id: active.request_id,
+            });
+        }
+        if let Some(active) = self.active_publish.take() {
+            self.comment_effects.push_back(CommentEffect::Cancel {
+                request_id: active.request_id,
+            });
+        }
         self.should_quit = true;
         self.status = "Closing ReviewBox".to_owned();
     }
@@ -912,6 +1094,14 @@ impl App {
                 return;
             }
         };
+        if self
+            .drafts
+            .get(&target)
+            .is_some_and(|draft| draft.submission.is_some())
+        {
+            self.status = "Publish outcome is unverified; reconcile before editing".to_owned();
+            return;
+        }
         let saved = self.drafts.get(&target).map(|draft| draft.body.clone());
         let text = saved.clone().unwrap_or_default();
         let cursor = text.len();
@@ -944,6 +1134,14 @@ impl App {
                 return;
             }
         };
+        if self
+            .drafts
+            .get(&target)
+            .is_some_and(|draft| draft.submission.is_some())
+        {
+            self.status = "Publish outcome is unverified; reconcile before editing".to_owned();
+            return;
+        }
         let body = self
             .drafts
             .get(&target)
@@ -965,6 +1163,14 @@ impl App {
             self.status = "Comment editor state is unavailable".to_owned();
             return;
         };
+        if self
+            .drafts
+            .get(&target)
+            .is_some_and(|draft| draft.submission.is_some())
+        {
+            self.status = "Publish outcome is unverified; reconcile before editing".to_owned();
+            return;
+        }
         self.editor_requests.push_back(EditorRequest {
             target,
             body: buffer.text.clone(),
@@ -975,6 +1181,385 @@ impl App {
 
     pub fn take_editor_requests(&mut self) -> Vec<EditorRequest> {
         self.editor_requests.drain(..).collect()
+    }
+
+    #[cfg(test)]
+    pub fn set_attempt_source(&mut self, source: Box<dyn AttemptSource>) {
+        self.attempt_source = source;
+    }
+
+    fn request_publish(&mut self) {
+        if self.active_publish.is_some() {
+            self.status = "A comment publish is already in progress".to_owned();
+            return;
+        }
+        let target = match self.comment_target_for_focus() {
+            Ok(target) => target,
+            Err(message) => {
+                self.status = message.to_owned();
+                return;
+            }
+        };
+        let Some(draft) = self.drafts.get(&target) else {
+            self.status = "No saved comment draft to publish".to_owned();
+            return;
+        };
+        if draft.body.chars().all(char::is_whitespace) {
+            self.status = "Empty comment drafts cannot be published".to_owned();
+            return;
+        }
+        if draft.submission.is_some() {
+            self.reconcile_target(target);
+            return;
+        }
+        self.mode = Mode::ConfirmPublish {
+            target,
+            previous_focus: self.focus,
+        };
+        self.status = "Confirm publish with y; any other key cancels".to_owned();
+    }
+
+    fn confirm_publish(&mut self, target: CommentTarget) {
+        if self.active_publish.is_some() {
+            self.status = "A comment publish is already in progress".to_owned();
+            return;
+        }
+        let Some(draft) = self.drafts.get(&target).cloned() else {
+            self.status = "Comment draft is no longer available".to_owned();
+            return;
+        };
+        let Ok(attempt) = self.attempt_source.next() else {
+            self.status = "Could not create a safe publish identifier; draft preserved".to_owned();
+            return;
+        };
+        let Some(store) = self.draft_store.as_ref() else {
+            self.status = "Comment drafts are unavailable; nothing was published".to_owned();
+            return;
+        };
+        let drafts = match store.begin_submission(&target, attempt.clone()) {
+            Ok(drafts) => drafts,
+            Err(error) => {
+                self.status = format!("Publish not started; draft unchanged: {error}");
+                return;
+            }
+        };
+        let Some((key, repository)) = self.repository_for_target(&target) else {
+            let _ = store
+                .clear_submission(&target)
+                .map(|drafts| self.drafts = drafts);
+            self.status = "Publish not started; repository is unavailable".to_owned();
+            return;
+        };
+        self.drafts = drafts;
+        let request_id = self.allocate_request_id();
+        let marker = format!("<!-- reviewbox-attempt:{} -->", attempt.attempt);
+        let body_with_marker = format!("{}\n\n{marker}", draft.body);
+        self.active_publish = Some(ActivePublish {
+            request_id,
+            key: key.clone(),
+            target: target.clone(),
+            repository: repository.clone(),
+        });
+        self.comment_effects.push_back(CommentEffect::Publish {
+            request_id,
+            key,
+            target,
+            repository,
+            body_with_marker,
+        });
+        self.status = "Publishing comment".to_owned();
+    }
+
+    fn open_comments(&mut self) {
+        if self.current_commit().is_none() {
+            self.status = "Select a commit before opening comments".to_owned();
+            return;
+        }
+        let previous_focus = self.focus;
+        self.mode = Mode::Comments { previous_focus };
+        self.comments_scroll = 0;
+        self.load_current_comments(false);
+    }
+
+    fn load_current_comments(&mut self, force: bool) {
+        let Some((key, repository)) = self.current_detail_target() else {
+            self.status = "No commit is selected".to_owned();
+            return;
+        };
+        if !force
+            && matches!(
+                self.comment_cache.get(&key),
+                Some(CommentListState::Loading)
+            )
+        {
+            return;
+        }
+        if let Some(active) = self.active_comment_load.take() {
+            self.comment_effects.push_back(CommentEffect::Cancel {
+                request_id: active.request_id,
+            });
+        }
+        let reconcile_target = self
+            .drafts
+            .iter()
+            .find(|draft| {
+                draft.target.repository_id() == key.repository_id
+                    && draft.target.sha() == key.sha
+                    && draft.submission.is_some()
+            })
+            .map(|draft| draft.target.clone());
+        let marker = reconcile_target
+            .as_ref()
+            .and_then(|target| self.drafts.get(target)?.submission.as_ref())
+            .map(|submission| format!("<!-- reviewbox-attempt:{} -->", submission.attempt));
+        let request_id = self.allocate_request_id();
+        self.comment_cache
+            .insert(key.clone(), CommentListState::Loading);
+        self.active_comment_load = Some(ActiveCommentLoad {
+            request_id,
+            key: key.clone(),
+        });
+        self.comment_effects.push_back(CommentEffect::Load {
+            request_id,
+            key,
+            repository,
+            marker,
+            reconcile_target,
+        });
+        self.status = "Loading commit comments".to_owned();
+    }
+
+    fn reconcile_target(&mut self, target: CommentTarget) {
+        let Some((key, repository)) = self.repository_for_target(&target) else {
+            self.status = "Cannot reconcile while the repository is unavailable".to_owned();
+            return;
+        };
+        if let Some(active) = self.active_comment_load.take() {
+            self.comment_effects.push_back(CommentEffect::Cancel {
+                request_id: active.request_id,
+            });
+        }
+        let marker = self
+            .drafts
+            .get(&target)
+            .and_then(|draft| draft.submission.as_ref())
+            .map(|submission| format!("<!-- reviewbox-attempt:{} -->", submission.attempt));
+        let request_id = self.allocate_request_id();
+        self.comment_cache
+            .insert(key.clone(), CommentListState::Loading);
+        self.active_comment_load = Some(ActiveCommentLoad {
+            request_id,
+            key: key.clone(),
+        });
+        self.comment_effects.push_back(CommentEffect::Load {
+            request_id,
+            key,
+            repository,
+            marker,
+            reconcile_target: Some(target),
+        });
+        self.status = "Reconciling the previous publish attempt".to_owned();
+    }
+
+    fn repository_for_target(
+        &self,
+        target: &CommentTarget,
+    ) -> Option<(DetailKey, RepositoryIdentity)> {
+        let repository = self
+            .inbox
+            .repositories
+            .iter()
+            .find(|repository| repository.identity.id == target.repository_id())?;
+        Some((
+            DetailKey {
+                repository_id: target.repository_id(),
+                sha: target.sha().to_owned(),
+            },
+            repository.identity.clone(),
+        ))
+    }
+
+    fn allocate_request_id(&mut self) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        id
+    }
+
+    pub fn take_comment_effects(&mut self) -> Vec<CommentEffect> {
+        self.comment_effects.drain(..).collect()
+    }
+
+    pub fn apply_comment_result(&mut self, result: CommentResult) {
+        match result.outcome {
+            CommentResultOutcome::Loaded(outcome) => {
+                let current = self.active_comment_load.as_ref().is_some_and(|active| {
+                    active.request_id == result.request_id && active.key == result.key
+                });
+                if !current {
+                    return;
+                }
+                self.active_comment_load = None;
+                match outcome {
+                    Ok(list) => {
+                        let count = list.comments.len();
+                        let complete = list.complete;
+                        let found = list.marker_found;
+                        self.comment_cache
+                            .insert(result.key, CommentListState::Loaded(list));
+                        if let Some(target) = result.target {
+                            self.apply_reconciliation(target, found, complete);
+                        } else {
+                            self.status = if count == 0 {
+                                "No existing comments".to_owned()
+                            } else {
+                                format!("Loaded {count} existing comments")
+                            };
+                        }
+                    }
+                    Err(error) => {
+                        self.comment_cache
+                            .insert(result.key, CommentListState::Failed(error));
+                        self.status = "Could not load commit comments".to_owned();
+                    }
+                }
+            }
+            CommentResultOutcome::Published(outcome) => {
+                let current = self.active_publish.as_ref().is_some_and(|active| {
+                    active.request_id == result.request_id
+                        && active.key == result.key
+                        && Some(&active.target) == result.target.as_ref()
+                });
+                if !current {
+                    return;
+                }
+                let active = self.active_publish.take().expect("checked active publish");
+                match outcome {
+                    PublishOutcome::Created { .. } => {
+                        match self
+                            .draft_store
+                            .as_ref()
+                            .ok_or(DraftStateError::Unavailable)
+                            .and_then(|store| store.delete(&active.target))
+                        {
+                            Ok(drafts) => {
+                                self.drafts = drafts;
+                                self.status = "Comment published".to_owned();
+                                self.queue_comment_load(active.key, active.repository, None, None);
+                            }
+                            Err(error) => {
+                                self.status = format!(
+                                    "Comment was created, but its local draft could not be cleared: {error}"
+                                )
+                            }
+                        }
+                    }
+                    PublishOutcome::DefinitelyNotCreated(error) => {
+                        match self
+                            .draft_store
+                            .as_ref()
+                            .ok_or(DraftStateError::Unavailable)
+                            .and_then(|store| store.clear_submission(&active.target))
+                        {
+                            Ok(drafts) => {
+                                self.drafts = drafts;
+                                self.status =
+                                    format!("Comment was not published; draft preserved: {error}");
+                            }
+                            Err(store_error) => {
+                                self.status = format!(
+                                    "Publish failed and its lock could not be cleared: {store_error}"
+                                )
+                            }
+                        }
+                    }
+                    PublishOutcome::Unverified(error) => {
+                        self.status = format!(
+                            "Publish outcome is unverified; draft locked for reconciliation: {error}"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_reconciliation(&mut self, target: CommentTarget, found: bool, complete: bool) {
+        if found {
+            match self
+                .draft_store
+                .as_ref()
+                .ok_or(DraftStateError::Unavailable)
+                .and_then(|store| store.delete(&target))
+            {
+                Ok(drafts) => {
+                    self.drafts = drafts;
+                    self.status = "Previous publish confirmed; draft cleared".to_owned();
+                }
+                Err(error) => {
+                    self.status =
+                        format!("Publish confirmed, but local draft could not be cleared: {error}")
+                }
+            }
+            return;
+        }
+        let old_enough = self
+            .drafts
+            .get(&target)
+            .and_then(|draft| draft.submission.as_ref())
+            .is_some_and(|submission| {
+                self.attempt_source
+                    .now()
+                    .signed_duration_since(submission.started_at)
+                    .num_seconds()
+                    >= 60
+            });
+        if complete && old_enough {
+            match self
+                .draft_store
+                .as_ref()
+                .ok_or(DraftStateError::Unavailable)
+                .and_then(|store| store.clear_submission(&target))
+            {
+                Ok(drafts) => {
+                    self.drafts = drafts;
+                    self.status =
+                        "No matching comment found; publish lock cleared for a new attempt"
+                            .to_owned();
+                }
+                Err(error) => self.status = format!("Could not clear the publish lock: {error}"),
+            }
+        } else if !complete {
+            self.status = "Comment listing is incomplete; publish remains unverified".to_owned();
+        } else {
+            self.status = "No matching comment yet; wait before retrying".to_owned();
+        }
+    }
+
+    fn queue_comment_load(
+        &mut self,
+        key: DetailKey,
+        repository: RepositoryIdentity,
+        marker: Option<String>,
+        reconcile_target: Option<CommentTarget>,
+    ) {
+        if let Some(active) = self.active_comment_load.take() {
+            self.comment_effects.push_back(CommentEffect::Cancel {
+                request_id: active.request_id,
+            });
+        }
+        let request_id = self.allocate_request_id();
+        self.comment_cache
+            .insert(key.clone(), CommentListState::Loading);
+        self.active_comment_load = Some(ActiveCommentLoad {
+            request_id,
+            key: key.clone(),
+        });
+        self.comment_effects.push_back(CommentEffect::Load {
+            request_id,
+            key,
+            repository,
+            marker,
+            reconcile_target,
+        });
     }
 
     pub fn apply_editor_outcome(&mut self, request: EditorRequest, outcome: EditorOutcome) {
@@ -1902,6 +2487,18 @@ impl App {
         &self.status
     }
 
+    pub fn current_comments(&self) -> Option<&CommentListState> {
+        self.comment_cache.get(&self.current_detail_key()?)
+    }
+
+    pub fn comments_scroll(&self) -> usize {
+        self.comments_scroll
+    }
+
+    pub fn publish_in_flight(&self) -> bool {
+        self.active_publish.is_some()
+    }
+
     pub fn should_quit(&self) -> bool {
         self.should_quit
     }
@@ -1960,6 +2557,10 @@ impl App {
             .is_some_and(|target| self.drafts.get(&target).is_some())
     }
 
+    pub fn commit_has_comments(&self, repository_id: u64, sha: &str) -> bool {
+        self.comment_cache.get(&DetailKey { repository_id, sha: sha.to_owned() }).is_some_and(|state| matches!(state, CommentListState::Loaded(list) if !list.comments.is_empty()))
+    }
+
     pub fn diff_line_has_draft(&self, row: usize) -> bool {
         let Some(repository) = self.current_repository() else {
             return false;
@@ -1973,6 +2574,16 @@ impl App {
         line_target(file, row)
             .and_then(|line| CommentTarget::line(repository.identity.id, &commit.sha, line).ok())
             .is_some_and(|target| self.drafts.get(&target).is_some())
+    }
+
+    pub fn diff_line_has_comment(&self, row: usize) -> bool {
+        let Some(file) = self.current_file() else {
+            return false;
+        };
+        let Some(target) = line_target(file, row) else {
+            return false;
+        };
+        matches!(self.current_comments(), Some(CommentListState::Loaded(list)) if list.comments.iter().any(|comment| matches!(&comment.anchor, ExistingCommentAnchor::Line { path, position: Some(position), .. } if path == &target.path && *position == target.position)))
     }
 
     pub fn diff_comment_feedback(&self) -> String {
@@ -2176,6 +2787,17 @@ impl App {
             .is_some_and(|active| Some(&active.key) != selected.as_ref())
         {
             self.cancel_active_detail();
+        }
+        if self
+            .active_comment_load
+            .as_ref()
+            .is_some_and(|active| Some(&active.key) != selected.as_ref())
+            && let Some(active) = self.active_comment_load.take()
+        {
+            self.comment_cache.remove(&active.key);
+            self.comment_effects.push_back(CommentEffect::Cancel {
+                request_id: active.request_id,
+            });
         }
     }
 
@@ -3715,5 +4337,424 @@ mod tests {
         );
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[derive(Debug)]
+    struct FixedAttemptSource {
+        now: chrono::DateTime<Utc>,
+        nonce: &'static str,
+    }
+
+    impl AttemptSource for FixedAttemptSource {
+        fn next(&self) -> Result<SubmissionAttempt, ()> {
+            SubmissionAttempt::new(self.nonce, self.now).map_err(|_| ())
+        }
+        fn now(&self) -> chrono::DateTime<Utc> {
+            self.now
+        }
+    }
+
+    fn app_with_commit_draft() -> App {
+        let mut app = App::new(DemoFixture::load());
+        app.set_attempt_source(Box::new(FixedAttemptSource {
+            now: Utc.with_ymd_and_hms(2024, 1, 15, 12, 2, 0).unwrap(),
+            nonce: "0123456789abcdef0123456789abcdef",
+        }));
+        open_first_commit_editor(&mut app);
+        type_edit_text(&mut app, "ready to publish");
+        app.handle_input(Input::Escape);
+        app
+    }
+
+    fn begin_publish(app: &mut App) -> (u64, DetailKey, CommentTarget) {
+        app.handle_input(Input::Character('P'));
+        assert!(matches!(app.mode(), Mode::ConfirmPublish { .. }));
+        app.handle_input(Input::Character('y'));
+        let effects = app.take_comment_effects();
+        assert_eq!(effects.len(), 1);
+        let CommentEffect::Publish {
+            request_id,
+            key,
+            target,
+            body_with_marker,
+            ..
+        } = &effects[0]
+        else {
+            panic!("publish effect")
+        };
+        assert!(
+            body_with_marker
+                .ends_with("<!-- reviewbox-attempt:0123456789abcdef0123456789abcdef -->")
+        );
+        (*request_id, key.clone(), target.clone())
+    }
+
+    #[test]
+    fn publish_requires_confirmation_allows_one_in_flight_and_clears_only_on_created() {
+        let mut app = app_with_commit_draft();
+        let (request_id, key, target) = begin_publish(&mut app);
+        assert!(app.publish_in_flight());
+        app.handle_input(Input::Character('P'));
+        assert!(app.status().contains("already in progress"));
+        app.handle_input(Input::Character('y'));
+        assert!(app.take_comment_effects().is_empty());
+        assert_eq!(app.draft_count(), 1);
+        app.apply_comment_result(CommentResult {
+            request_id: request_id + 1,
+            key: key.clone(),
+            target: Some(target.clone()),
+            outcome: CommentResultOutcome::Published(PublishOutcome::Created { id: 8 }),
+        });
+        assert!(app.publish_in_flight());
+        assert_eq!(app.draft_count(), 1);
+        app.apply_comment_result(CommentResult {
+            request_id,
+            key,
+            target: Some(target),
+            outcome: CommentResultOutcome::Published(PublishOutcome::Created { id: 9 }),
+        });
+        assert_eq!(app.draft_count(), 0);
+        assert!(app.status().contains("published"));
+        assert!(matches!(
+            app.take_comment_effects().as_slice(),
+            [CommentEffect::Load { .. }]
+        ));
+    }
+
+    #[test]
+    fn rejected_and_unverified_publish_outcomes_preserve_the_draft() {
+        let mut rejected = app_with_commit_draft();
+        let (request_id, key, target) = begin_publish(&mut rejected);
+        rejected.apply_comment_result(CommentResult {
+            request_id,
+            key,
+            target: Some(target.clone()),
+            outcome: CommentResultOutcome::Published(PublishOutcome::DefinitelyNotCreated(
+                CommentFailure {
+                    kind: crate::github::CommentFailureKind::PermissionOrNotFound,
+                    http_status: Some(403),
+                },
+            )),
+        });
+        assert!(rejected.drafts.get(&target).unwrap().submission.is_none());
+        assert!(rejected.status().contains("draft preserved"));
+
+        let mut ambiguous = app_with_commit_draft();
+        let (request_id, key, target) = begin_publish(&mut ambiguous);
+        ambiguous.apply_comment_result(CommentResult {
+            request_id,
+            key,
+            target: Some(target.clone()),
+            outcome: CommentResultOutcome::Published(PublishOutcome::Unverified(CommentFailure {
+                kind: crate::github::CommentFailureKind::Transport,
+                http_status: None,
+            })),
+        });
+        assert!(ambiguous.drafts.get(&target).unwrap().submission.is_some());
+        ambiguous.handle_input(Input::Character('c'));
+        assert_eq!(ambiguous.mode(), Mode::Normal);
+        ambiguous.handle_input(Input::Character('E'));
+        assert!(ambiguous.take_editor_requests().is_empty());
+    }
+
+    #[derive(Debug)]
+    struct SubmissionFailingStore(CommentDrafts);
+
+    impl DraftStore for SubmissionFailingStore {
+        fn load(&self) -> Result<CommentDrafts, DraftStateError> {
+            Ok(self.0.clone())
+        }
+        fn save(&self, _draft: &CommentDraft) -> Result<CommentDrafts, DraftStateError> {
+            Err(DraftStateError::Unavailable)
+        }
+        fn delete(&self, _target: &CommentTarget) -> Result<CommentDrafts, DraftStateError> {
+            Err(DraftStateError::Unavailable)
+        }
+    }
+
+    #[test]
+    fn cancelled_confirmation_and_failed_attempt_persistence_never_emit_a_post() {
+        let mut cancelled = app_with_commit_draft();
+        cancelled.handle_input(Input::Character('P'));
+        cancelled.handle_input(Input::Character('n'));
+        assert_eq!(cancelled.mode(), Mode::Normal);
+        assert!(cancelled.take_comment_effects().is_empty());
+        assert_eq!(cancelled.draft_count(), 1);
+
+        let inbox = DemoFixture::load();
+        let target = CommentTarget::commit(
+            inbox.repositories[0].identity.id,
+            &inbox.repositories[0].commits[0].sha,
+        )
+        .unwrap();
+        let seed = MemoryDraftStore::default()
+            .save(&CommentDraft::new(target, "safe body").unwrap())
+            .unwrap();
+        let mut failed = App::with_stores(
+            inbox,
+            Box::new(MemoryReviewStore::default()),
+            Box::new(SubmissionFailingStore(seed)),
+        );
+        failed.handle_input(Input::Character('l'));
+        failed.handle_input(Input::Character('P'));
+        failed.handle_input(Input::Character('y'));
+        assert!(failed.take_comment_effects().is_empty());
+        assert_eq!(failed.draft_count(), 1);
+        assert!(failed.status().contains("not started"));
+    }
+
+    #[test]
+    fn ambiguous_attempt_reconciles_by_exact_marker_and_ignores_stale_results() {
+        let mut app = app_with_commit_draft();
+        let (publish_id, key, target) = begin_publish(&mut app);
+        app.apply_comment_result(CommentResult {
+            request_id: publish_id,
+            key: key.clone(),
+            target: Some(target.clone()),
+            outcome: CommentResultOutcome::Published(PublishOutcome::Unverified(CommentFailure {
+                kind: crate::github::CommentFailureKind::Transport,
+                http_status: None,
+            })),
+        });
+        app.handle_input(Input::Character('P'));
+        let effects = app.take_comment_effects();
+        let CommentEffect::Load {
+            request_id,
+            marker: Some(marker),
+            ..
+        } = &effects[0]
+        else {
+            panic!("reconciliation load")
+        };
+        let request_id = *request_id;
+        app.apply_comment_result(CommentResult {
+            request_id: request_id + 99,
+            key: key.clone(),
+            target: Some(target.clone()),
+            outcome: CommentResultOutcome::Loaded(Ok(ExistingComments {
+                comments: Vec::new(),
+                complete: true,
+                marker_found: true,
+            })),
+        });
+        assert_eq!(app.draft_count(), 1);
+        assert!(marker.contains("0123456789abcdef0123456789abcdef"));
+        app.apply_comment_result(CommentResult {
+            request_id,
+            key,
+            target: Some(target),
+            outcome: CommentResultOutcome::Loaded(Ok(ExistingComments {
+                comments: Vec::new(),
+                complete: true,
+                marker_found: true,
+            })),
+        });
+        assert_eq!(app.draft_count(), 0);
+        assert!(app.status().contains("confirmed"));
+    }
+
+    #[test]
+    fn complete_old_not_found_unlocks_but_incomplete_and_young_attempts_do_not() {
+        for (complete, old, unlocked) in [
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let mut app = app_with_commit_draft();
+            let (publish_id, key, target) = begin_publish(&mut app);
+            app.apply_comment_result(CommentResult {
+                request_id: publish_id,
+                key: key.clone(),
+                target: Some(target.clone()),
+                outcome: CommentResultOutcome::Published(PublishOutcome::Unverified(
+                    CommentFailure {
+                        kind: crate::github::CommentFailureKind::Transport,
+                        http_status: None,
+                    },
+                )),
+            });
+            if !old {
+                app.set_attempt_source(Box::new(FixedAttemptSource {
+                    now: Utc.with_ymd_and_hms(2024, 1, 15, 12, 2, 30).unwrap(),
+                    nonce: "fedcba9876543210fedcba9876543210",
+                }));
+            } else {
+                app.set_attempt_source(Box::new(FixedAttemptSource {
+                    now: Utc.with_ymd_and_hms(2024, 1, 15, 12, 3, 1).unwrap(),
+                    nonce: "fedcba9876543210fedcba9876543210",
+                }));
+            }
+            app.handle_input(Input::Character('P'));
+            let CommentEffect::Load { request_id, .. } = app.take_comment_effects().remove(0)
+            else {
+                panic!()
+            };
+            app.apply_comment_result(CommentResult {
+                request_id,
+                key,
+                target: Some(target.clone()),
+                outcome: CommentResultOutcome::Loaded(Ok(ExistingComments {
+                    comments: Vec::new(),
+                    complete,
+                    marker_found: false,
+                })),
+            });
+            assert_eq!(
+                app.drafts.get(&target).unwrap().submission.is_none(),
+                unlocked
+            );
+            if unlocked {
+                app.handle_input(Input::Character('P'));
+                app.handle_input(Input::Character('y'));
+                let CommentEffect::Publish {
+                    body_with_marker, ..
+                } = app.take_comment_effects().remove(0)
+                else {
+                    panic!()
+                };
+                assert!(body_with_marker.contains("fedcba9876543210fedcba9876543210"));
+                assert!(!body_with_marker.contains("0123456789abcdef0123456789abcdef"));
+            }
+        }
+    }
+
+    #[test]
+    fn blank_editor_result_has_no_publishable_draft_and_comments_have_loading_empty_failure_states()
+    {
+        let mut app = App::new(DemoFixture::load());
+        app.handle_input(Input::Character('l'));
+        app.handle_input(Input::Character('P'));
+        assert!(app.status().contains("No saved"));
+        app.handle_input(Input::Character('C'));
+        assert!(matches!(app.mode(), Mode::Comments { .. }));
+        assert!(matches!(
+            app.current_comments(),
+            Some(CommentListState::Loading)
+        ));
+        let CommentEffect::Load {
+            request_id, key, ..
+        } = app.take_comment_effects().remove(0)
+        else {
+            panic!()
+        };
+        app.apply_comment_result(CommentResult {
+            request_id,
+            key: key.clone(),
+            target: None,
+            outcome: CommentResultOutcome::Loaded(Ok(ExistingComments {
+                comments: Vec::new(),
+                complete: true,
+                marker_found: false,
+            })),
+        });
+        assert!(
+            matches!(app.current_comments(), Some(CommentListState::Loaded(list)) if list.comments.is_empty())
+        );
+        app.handle_input(Input::Character('r'));
+        let CommentEffect::Load { request_id, .. } = app.take_comment_effects().remove(0) else {
+            panic!()
+        };
+        app.apply_comment_result(CommentResult {
+            request_id,
+            key,
+            target: None,
+            outcome: CommentResultOutcome::Loaded(Err(CommentFailure {
+                kind: crate::github::CommentFailureKind::Api,
+                http_status: Some(500),
+            })),
+        });
+        assert!(matches!(
+            app.current_comments(),
+            Some(CommentListState::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn restart_with_submission_is_visibly_locked_and_quit_or_selection_change_never_reposts() {
+        let store = MemoryDraftStore::default();
+        let inbox = DemoFixture::load();
+        let target = CommentTarget::commit(
+            inbox.repositories[0].identity.id,
+            &inbox.repositories[0].commits[0].sha,
+        )
+        .unwrap();
+        store
+            .save(&CommentDraft::new(target.clone(), "durable pending body").unwrap())
+            .unwrap();
+        store
+            .begin_submission(
+                &target,
+                SubmissionAttempt::new(
+                    "0123456789abcdef0123456789abcdef",
+                    Utc.with_ymd_and_hms(2024, 1, 15, 12, 0, 0).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut app = App::with_stores(
+            inbox,
+            Box::new(MemoryReviewStore::default()),
+            Box::new(store),
+        );
+        assert!(app.status().contains("unverified"));
+        app.handle_input(Input::Character('l'));
+        app.handle_input(Input::Character('c'));
+        assert_eq!(app.mode(), Mode::Normal);
+        app.handle_input(Input::Character('E'));
+        assert!(app.take_editor_requests().is_empty());
+        app.handle_input(Input::Character('P'));
+        assert!(matches!(
+            app.take_comment_effects().as_slice(),
+            [CommentEffect::Load { .. }]
+        ));
+
+        let mut publishing = app_with_commit_draft();
+        let _ = begin_publish(&mut publishing);
+        publishing.handle_input(Input::Character('j'));
+        assert!(
+            publishing.take_comment_effects().is_empty(),
+            "selection changes must not cancel or repeat a publish"
+        );
+        publishing.handle_input(Input::Quit);
+        assert!(matches!(
+            publishing.take_comment_effects().as_slice(),
+            [CommentEffect::Cancel { .. }]
+        ));
+        assert!(
+            publishing
+                .drafts
+                .iter()
+                .any(|draft| draft.submission.is_some())
+        );
+    }
+
+    #[test]
+    fn changing_commits_cancels_only_comment_loading_and_stale_load_is_ignored() {
+        let mut app = App::new(DemoFixture::load());
+        app.handle_input(Input::Character('l'));
+        app.handle_input(Input::Character('C'));
+        let CommentEffect::Load {
+            request_id, key, ..
+        } = app.take_comment_effects().remove(0)
+        else {
+            panic!()
+        };
+        app.handle_input(Input::Escape);
+        app.handle_input(Input::Character('j'));
+        assert!(
+            matches!(app.take_comment_effects().as_slice(), [CommentEffect::Cancel { request_id: id }] if *id == request_id)
+        );
+        app.apply_comment_result(CommentResult {
+            request_id,
+            key,
+            target: None,
+            outcome: CommentResultOutcome::Loaded(Ok(ExistingComments {
+                comments: Vec::new(),
+                complete: true,
+                marker_found: false,
+            })),
+        });
+        assert!(app.current_comments().is_none());
+        assert!(!app.should_quit());
     }
 }

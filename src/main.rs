@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod comment;
 pub mod comment_draft;
 mod day;
 mod detail;
@@ -21,6 +22,7 @@ use std::process::ExitCode;
 
 use app::App;
 use cli::Command;
+use comment::CommentSession;
 use comment_draft::{DraftStore, FileDraftStore};
 use detail::DetailSession;
 use event::{CrosstermEventSource, DetailRequester, ExternalEditorSession};
@@ -103,16 +105,19 @@ fn run_inbox(inbox: Inbox) -> io::Result<()> {
         if let Some(selection) = selection {
             let mut loader = LoaderSession::start(selection);
             let mut details = DetailSession::new();
-            let result = event::run_with_loader_and_editor(
+            let mut comments = CommentSession::new();
+            let result = event::run_with_services_and_editor(
                 &mut terminal,
                 &mut app,
                 &mut events,
                 &mut loader,
                 &mut details,
+                &mut comments,
                 &mut editor,
             );
             loader.shutdown();
             details.shutdown();
+            event::CommentRequester::shutdown(&mut comments);
             result
         } else {
             event::run_with_editor(&mut terminal, &mut app, &mut events, &mut editor)

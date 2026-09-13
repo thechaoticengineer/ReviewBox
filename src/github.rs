@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,8 +14,8 @@ use std::thread;
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::day::DaySelection;
 use crate::inbox::{
@@ -34,6 +34,8 @@ pub const MAX_FILE_PATCH_BYTES: usize = 256 * 1024;
 pub const MAX_FILE_PATCH_LINES: usize = 5_000;
 pub const MAX_DIFF_LINE_CHARS: usize = 2_000;
 pub const MAX_COMMIT_PATCH_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_COMMENT_BODY_CHARS: usize = 8_000;
+pub const MAX_COMMENT_PAGES: usize = 10;
 
 /// A bounded byte buffer returned by a process runner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +95,20 @@ pub trait ProcessRunner {
             self.run(executable, arguments)
         }
     }
+
+    fn run_with_stdin_cancellable(
+        &self,
+        _executable: &OsStr,
+        _arguments: &[OsString],
+        _stdin: &[u8],
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, ProcessError> {
+        if cancellation.is_cancelled() {
+            Err(ProcessError::Cancelled)
+        } else {
+            Err(ProcessError::Transport)
+        }
+    }
 }
 
 /// Production runner. It invokes `gh` directly, never through a shell, and
@@ -115,64 +131,180 @@ impl ProcessRunner for CommandRunner {
         arguments: &[OsString],
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
+        run_command(executable, arguments, None, cancellation)
+    }
+
+    fn run_with_stdin_cancellable(
+        &self,
+        executable: &OsStr,
+        arguments: &[OsString],
+        stdin: &[u8],
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, ProcessError> {
+        run_command(executable, arguments, Some(stdin), cancellation)
+    }
+}
+
+fn run_command(
+    executable: &OsStr,
+    arguments: &[OsString],
+    stdin: Option<&[u8]>,
+    cancellation: &CancellationToken,
+) -> Result<ProcessOutput, ProcessError> {
+    if cancellation.is_cancelled() {
+        return Err(ProcessError::Cancelled);
+    }
+    let mut child = Command::new(executable)
+        .args(arguments)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                ProcessError::NotFound
+            } else {
+                ProcessError::Transport
+            }
+        })?;
+
+    let stdin_writer = stdin.map(|bytes| {
+        let mut pipe = child.stdin.take().expect("piped stdin is available");
+        let bytes = bytes.to_vec();
+        thread::spawn(move || pipe.write_all(&bytes))
+    });
+
+    let stdout = child.stdout.take().ok_or(ProcessError::Transport)?;
+    let stderr = child.stderr.take().ok_or(ProcessError::Transport)?;
+    let stdout_reader = thread::spawn(move || read_bounded(stdout, MAX_STDOUT_BYTES));
+    let stderr_reader = thread::spawn(move || read_bounded(stderr, MAX_STDERR_BYTES));
+
+    let status = loop {
         if cancellation.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            if let Some(writer) = stdin_writer {
+                let _ = writer.join();
+            }
             return Err(ProcessError::Cancelled);
         }
-        let mut child = Command::new(executable)
-            .args(arguments)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::NotFound {
-                    ProcessError::NotFound
-                } else {
-                    ProcessError::Transport
-                }
-            })?;
-
-        let stdout = child.stdout.take().ok_or(ProcessError::Transport)?;
-        let stderr = child.stderr.take().ok_or(ProcessError::Transport)?;
-        let stdout_reader = thread::spawn(move || read_bounded(stdout, MAX_STDOUT_BYTES));
-        let stderr_reader = thread::spawn(move || read_bounded(stderr, MAX_STDERR_BYTES));
-
-        let status = loop {
-            if cancellation.is_cancelled() {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                return Err(ProcessError::Cancelled);
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => thread::sleep(Duration::from_millis(10)),
-                Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
-                    return Err(ProcessError::Transport);
+                if let Some(writer) = stdin_writer {
+                    let _ = writer.join();
                 }
+                return Err(ProcessError::Transport);
             }
-        };
-        let stdout = stdout_reader
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| ProcessError::Transport)?
+        .map_err(|_| ProcessError::Transport)?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| ProcessError::Transport)?
+        .map_err(|_| ProcessError::Transport)?;
+    if let Some(writer) = stdin_writer {
+        writer
             .join()
             .map_err(|_| ProcessError::Transport)?
             .map_err(|_| ProcessError::Transport)?;
-        let stderr = stderr_reader
-            .join()
-            .map_err(|_| ProcessError::Transport)?
-            .map_err(|_| ProcessError::Transport)?;
-
-        Ok(ProcessOutput {
-            success: status.success(),
-            exit_code: status.code(),
-            stdout,
-            stderr,
-        })
     }
+
+    Ok(ProcessOutput {
+        success: status.success(),
+        exit_code: status.code(),
+        stdout,
+        stderr,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExistingCommentAnchor {
+    Commit,
+    Line {
+        path: String,
+        position: Option<u32>,
+        line: Option<u32>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingComment {
+    pub id: u64,
+    pub author: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub anchor: ExistingCommentAnchor,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingComments {
+    pub comments: Vec<ExistingComment>,
+    pub complete: bool,
+    pub marker_found: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentFailureKind {
+    Authentication,
+    MissingGh,
+    PermissionOrNotFound,
+    RateLimit,
+    Malformed,
+    Offline,
+    Transport,
+    Api,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentFailure {
+    pub kind: CommentFailureKind,
+    pub http_status: Option<u16>,
+}
+
+impl fmt::Display for CommentFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self.kind {
+            CommentFailureKind::Authentication => "GitHub authentication failed",
+            CommentFailureKind::MissingGh => "GitHub CLI is unavailable",
+            CommentFailureKind::PermissionOrNotFound => {
+                "GitHub comments are unavailable or access was denied"
+            }
+            CommentFailureKind::RateLimit => "GitHub API rate limit was reached",
+            CommentFailureKind::Malformed => "GitHub returned an unreadable comment response",
+            CommentFailureKind::Offline => "GitHub appears to be offline",
+            CommentFailureKind::Transport => "GitHub CLI transport failed",
+            CommentFailureKind::Api => "GitHub comment request failed",
+            CommentFailureKind::Cancelled => "GitHub comment request was cancelled",
+        };
+        formatter.write_str(message)?;
+        if let Some(status) = self.http_status {
+            write!(formatter, " (HTTP {status})")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishOutcome {
+    Created { id: u64 },
+    DefinitelyNotCreated(CommentFailure),
+    Unverified(CommentFailure),
 }
 
 fn read_bounded(mut reader: impl Read, limit: usize) -> io::Result<BoundedBytes> {
@@ -783,6 +915,175 @@ impl<R: ProcessRunner> GitHubLoader<R> {
         Ok(commit_detail_from_api(response.value, &response.headers))
     }
 
+    pub fn list_commit_comments(
+        &self,
+        repository: &RepositoryIdentity,
+        sha: &str,
+        marker: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<ExistingComments, CommentFailure> {
+        if !valid_full_sha(sha) {
+            return Err(CommentFailure {
+                kind: CommentFailureKind::Malformed,
+                http_status: None,
+            });
+        }
+        let endpoint = format!(
+            "/repos/{}/{}/commits/{}/comments",
+            encode_path_segment(&repository.owner),
+            encode_path_segment(&repository.name),
+            encode_path_segment(sha)
+        );
+        let mut comments = Vec::new();
+        let mut marker_found = false;
+        for page in 1..=MAX_COMMENT_PAGES {
+            let output = self
+                .run_get(
+                    &endpoint,
+                    &[
+                        ("per_page", PAGE_SIZE.to_string()),
+                        ("page", page.to_string()),
+                    ],
+                    FailureScope::CommitDetail,
+                    cancellation,
+                )
+                .map_err(comment_failure_from_load)?;
+            if output.stdout.truncated {
+                return Ok(ExistingComments {
+                    comments,
+                    complete: false,
+                    marker_found,
+                });
+            }
+            let response: JsonResponse<Vec<ApiCommitComment>> = self
+                .decode_json_output(output, FailureScope::CommitDetail)
+                .map_err(comment_failure_from_load)?;
+            let page_len = response.value.len();
+            let oversized_page = page_len > PAGE_SIZE;
+            if let Some(needle) = marker {
+                marker_found |= response
+                    .value
+                    .iter()
+                    .any(|value| value.body.contains(needle));
+            }
+            for value in response.value.into_iter().take(PAGE_SIZE) {
+                comments.push(existing_comment_from_api(value));
+            }
+            if oversized_page {
+                return Ok(ExistingComments {
+                    comments,
+                    complete: false,
+                    marker_found,
+                });
+            }
+            if page_len < PAGE_SIZE {
+                return Ok(ExistingComments {
+                    comments,
+                    complete: true,
+                    marker_found,
+                });
+            }
+        }
+        Ok(ExistingComments {
+            comments,
+            complete: false,
+            marker_found,
+        })
+    }
+
+    pub fn create_commit_comment(
+        &self,
+        repository: &RepositoryIdentity,
+        sha: &str,
+        body_with_marker: &str,
+        line: Option<(&str, u32)>,
+        cancellation: &CancellationToken,
+    ) -> PublishOutcome {
+        if !valid_full_sha(sha)
+            || line.is_some_and(|(path, position)| {
+                path.is_empty()
+                    || path.len() > crate::comment_draft::MAX_PATH_BYTES
+                    || path.chars().any(char::is_control)
+                    || position == 0
+            })
+        {
+            return PublishOutcome::DefinitelyNotCreated(CommentFailure {
+                kind: CommentFailureKind::Malformed,
+                http_status: None,
+            });
+        }
+        let endpoint = format!(
+            "/repos/{}/{}/commits/{}/comments",
+            encode_path_segment(&repository.owner),
+            encode_path_segment(&repository.name),
+            encode_path_segment(sha)
+        );
+        let request = CreateCommentRequest {
+            body: body_with_marker,
+            path: line.map(|value| value.0),
+            position: line.map(|value| value.1),
+        };
+        let Ok(stdin) = serde_json::to_vec(&request) else {
+            return PublishOutcome::DefinitelyNotCreated(CommentFailure {
+                kind: CommentFailureKind::Malformed,
+                http_status: None,
+            });
+        };
+        let arguments = [
+            OsString::from("api"),
+            OsString::from("--method"),
+            OsString::from("POST"),
+            OsString::from("--include"),
+            OsString::from("--input"),
+            OsString::from("-"),
+            OsString::from(endpoint),
+        ];
+        let output = match self.runner.run_with_stdin_cancellable(
+            &self.executable,
+            &arguments,
+            &stdin,
+            cancellation,
+        ) {
+            Ok(output) => output,
+            Err(error) => return PublishOutcome::Unverified(comment_failure_from_process(error)),
+        };
+        if output.stdout.truncated {
+            return PublishOutcome::Unverified(CommentFailure {
+                kind: CommentFailureKind::Malformed,
+                http_status: None,
+            });
+        }
+        let envelope = match parse_http_envelope(&output.stdout.bytes) {
+            Ok(value) => value,
+            Err(()) => {
+                return PublishOutcome::Unverified(CommentFailure {
+                    kind: CommentFailureKind::Malformed,
+                    http_status: None,
+                });
+            }
+        };
+        if envelope.status == 201 {
+            return serde_json::from_slice::<CreatedComment>(envelope.body)
+                .ok()
+                .filter(|created| created.id > 0)
+                .map_or_else(
+                    || {
+                        PublishOutcome::Unverified(CommentFailure {
+                            kind: CommentFailureKind::Malformed,
+                            http_status: Some(201),
+                        })
+                    },
+                    |created| PublishOutcome::Created { id: created.id },
+                );
+        }
+        let failure = comment_failure_from_status(envelope.status, &envelope.headers);
+        if matches!(envelope.status, 400 | 401 | 403 | 404 | 410 | 422) {
+            PublishOutcome::DefinitelyNotCreated(failure)
+        } else {
+            PublishOutcome::Unverified(failure)
+        }
+    }
+
     fn get_json<T: DeserializeOwned>(
         &self,
         endpoint: &str,
@@ -889,6 +1190,92 @@ impl<R: ProcessRunner> GitHubLoader<R> {
             headers: envelope.headers,
         })
     }
+}
+
+fn comment_failure_from_process(error: ProcessError) -> CommentFailure {
+    CommentFailure {
+        kind: match error {
+            ProcessError::NotFound => CommentFailureKind::MissingGh,
+            ProcessError::Transport => CommentFailureKind::Transport,
+            ProcessError::Cancelled => CommentFailureKind::Cancelled,
+        },
+        http_status: None,
+    }
+}
+
+fn comment_failure_from_load(failure: LoadFailure) -> CommentFailure {
+    CommentFailure {
+        kind: match failure.category {
+            FailureCategory::Authentication => CommentFailureKind::Authentication,
+            FailureCategory::MissingGh => CommentFailureKind::MissingGh,
+            FailureCategory::PermissionOrNotFound => CommentFailureKind::PermissionOrNotFound,
+            FailureCategory::RateLimit => CommentFailureKind::RateLimit,
+            FailureCategory::MalformedResponse | FailureCategory::MalformedJson => {
+                CommentFailureKind::Malformed
+            }
+            FailureCategory::Offline => CommentFailureKind::Offline,
+            FailureCategory::Transport | FailureCategory::Command => CommentFailureKind::Transport,
+            FailureCategory::Api => CommentFailureKind::Api,
+            FailureCategory::Cancelled => CommentFailureKind::Cancelled,
+        },
+        http_status: failure.http_status,
+    }
+}
+
+fn comment_failure_from_status(status: u16, headers: &HashMap<String, String>) -> CommentFailure {
+    let category = classify_failure(Some(status), Some(headers));
+    comment_failure_from_load(LoadFailure {
+        category,
+        scope: FailureScope::CommitDetail,
+        http_status: Some(status),
+    })
+}
+
+fn existing_comment_from_api(value: ApiCommitComment) -> ExistingComment {
+    let path = value
+        .path
+        .map(|path| cap_sanitized(&path, crate::comment_draft::MAX_PATH_BYTES));
+    let anchor = path.map_or(ExistingCommentAnchor::Commit, |path| {
+        ExistingCommentAnchor::Line {
+            path,
+            position: value.position,
+            line: value.line,
+        }
+    });
+    ExistingComment {
+        id: value.id,
+        author: value.user.map(|user| cap_sanitized(&user.login, 256)),
+        created_at: value.created_at,
+        anchor,
+        body: cap_sanitized(&value.body, MAX_COMMENT_BODY_CHARS),
+    }
+}
+
+fn cap_sanitized(value: &str, maximum: usize) -> String {
+    let sanitized = sanitize_api_text(value);
+    if sanitized.chars().count() <= maximum {
+        return sanitized;
+    }
+    let mut result = sanitized
+        .chars()
+        .take(maximum.saturating_sub(1))
+        .collect::<String>();
+    result.push('…');
+    result
+}
+
+#[derive(Serialize)]
+struct CreateCommentRequest<'a> {
+    body: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct CreatedComment {
+    id: u64,
 }
 
 struct JsonResponse<T> {
@@ -1337,6 +1724,17 @@ struct ApiFileChange {
     deletions: u64,
     changes: u64,
     patch: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiCommitComment {
+    id: u64,
+    user: Option<ApiUser>,
+    created_at: DateTime<Utc>,
+    path: Option<String>,
+    position: Option<u32>,
+    line: Option<u32>,
+    body: String,
 }
 
 #[cfg(test)]
@@ -2637,6 +3035,276 @@ mod tests {
         ));
     }
 
+    #[derive(Default)]
+    struct CommentRunner {
+        outputs: Mutex<VecDeque<Result<ProcessOutput, ProcessError>>>,
+        calls: Mutex<Vec<(Vec<OsString>, Vec<u8>)>>,
+    }
+
+    impl CommentRunner {
+        fn with(outputs: Vec<Result<ProcessOutput, ProcessError>>) -> Self {
+            Self {
+                outputs: Mutex::new(outputs.into()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ProcessRunner for CommentRunner {
+        fn run(
+            &self,
+            _executable: &OsStr,
+            _arguments: &[OsString],
+        ) -> Result<ProcessOutput, ProcessError> {
+            panic!("comments must use cancellable methods")
+        }
+        fn run_cancellable(
+            &self,
+            executable: &OsStr,
+            arguments: &[OsString],
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessError> {
+            assert_eq!(executable, OsStr::new("gh"));
+            assert!(!cancellation.is_cancelled());
+            self.calls
+                .lock()
+                .unwrap()
+                .push((arguments.to_vec(), Vec::new()));
+            self.outputs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted comment GET")
+        }
+        fn run_with_stdin_cancellable(
+            &self,
+            executable: &OsStr,
+            arguments: &[OsString],
+            stdin: &[u8],
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessError> {
+            assert_eq!(executable, OsStr::new("gh"));
+            assert!(!cancellation.is_cancelled());
+            self.calls
+                .lock()
+                .unwrap()
+                .push((arguments.to_vec(), stdin.to_vec()));
+            self.outputs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted comment POST")
+        }
+    }
+
+    fn unusual_identity() -> RepositoryIdentity {
+        RepositoryIdentity {
+            id: 7,
+            owner: "owner space".to_owned(),
+            name: "repo/name".to_owned(),
+        }
+    }
+
+    #[test]
+    fn commit_comments_get_is_encoded_paginated_bounded_and_checks_raw_marker() {
+        let marker = "<!-- reviewbox-attempt:0123456789abcdef0123456789abcdef -->";
+        let comment = |id| json!({"id": id, "user": {"login": "octo\tcat"}, "created_at": "2024-01-15T12:00:00Z", "path": "src/lib.rs", "position": null, "line": 9, "body": format!("{marker}{}", "x".repeat(MAX_COMMENT_BODY_CHARS + 10))});
+        let first = Value::Array((0..100).map(comment).collect());
+        let second = json!([comment(101)]);
+        let runner = CommentRunner::with(vec![
+            Ok(http_output(200, &[], first.to_string().as_bytes(), true)),
+            Ok(http_output(200, &[], second.to_string().as_bytes(), true)),
+        ]);
+        let result = GitHubLoader::new(&runner)
+            .list_commit_comments(
+                &unusual_identity(),
+                detail_sha(),
+                Some(marker),
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert!(result.complete && result.marker_found);
+        assert_eq!(result.comments.len(), 101);
+        assert!(result.comments[0].body.chars().count() <= MAX_COMMENT_BODY_CHARS);
+        assert_eq!(result.comments[0].author.as_deref(), Some("octo    cat"));
+        assert!(matches!(
+            result.comments[0].anchor,
+            ExistingCommentAnchor::Line {
+                position: None,
+                line: Some(9),
+                ..
+            }
+        ));
+        let calls = runner.calls.lock().unwrap();
+        for (page, (args, stdin)) in calls.iter().enumerate() {
+            assert!(stdin.is_empty());
+            assert_eq!(
+                args,
+                &vec![
+                    OsString::from("api"),
+                    OsString::from("--method"),
+                    OsString::from("GET"),
+                    OsString::from("--include"),
+                    OsString::from(format!(
+                        "/repos/owner%20space/repo%2Fname/commits/{}/comments",
+                        detail_sha()
+                    )),
+                    OsString::from("--raw-field"),
+                    OsString::from("per_page=100"),
+                    OsString::from("--raw-field"),
+                    OsString::from(format!("page={}", page + 1))
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn commit_comment_posts_exact_fields_and_classifies_responses_without_running_gh() {
+        let outputs = vec![
+            Ok(http_output(201, &[], br#"{"id":91}"#, true)),
+            Ok(http_output(201, &[], br#"{"unexpected":1}"#, true)),
+            Ok(http_output(422, &[], b"{}", false)),
+            Ok(http_output(403, &[], b"{}", false)),
+            Ok(http_output(500, &[], b"{}", false)),
+            Err(ProcessError::Transport),
+            Err(ProcessError::Cancelled),
+        ];
+        let runner = CommentRunner::with(outputs);
+        let loader = GitHubLoader::new(&runner);
+        let token = CancellationToken::default();
+        assert_eq!(
+            loader.create_commit_comment(
+                &unusual_identity(),
+                detail_sha(),
+                "body\n\nmarker",
+                None,
+                &token
+            ),
+            PublishOutcome::Created { id: 91 }
+        );
+        assert!(matches!(
+            loader.create_commit_comment(
+                &unusual_identity(),
+                detail_sha(),
+                "body",
+                Some(("src/a b.rs", 7)),
+                &token
+            ),
+            PublishOutcome::Unverified(_)
+        ));
+        assert!(matches!(
+            loader.create_commit_comment(&unusual_identity(), detail_sha(), "body", None, &token),
+            PublishOutcome::DefinitelyNotCreated(CommentFailure {
+                http_status: Some(422),
+                ..
+            })
+        ));
+        assert!(matches!(
+            loader.create_commit_comment(&unusual_identity(), detail_sha(), "body", None, &token),
+            PublishOutcome::DefinitelyNotCreated(CommentFailure {
+                http_status: Some(403),
+                ..
+            })
+        ));
+        assert!(matches!(
+            loader.create_commit_comment(&unusual_identity(), detail_sha(), "body", None, &token),
+            PublishOutcome::Unverified(CommentFailure {
+                http_status: Some(500),
+                ..
+            })
+        ));
+        assert!(matches!(
+            loader.create_commit_comment(&unusual_identity(), detail_sha(), "body", None, &token),
+            PublishOutcome::Unverified(CommentFailure {
+                kind: CommentFailureKind::Transport,
+                ..
+            })
+        ));
+        assert!(matches!(
+            loader.create_commit_comment(&unusual_identity(), detail_sha(), "body", None, &token),
+            PublishOutcome::Unverified(CommentFailure {
+                kind: CommentFailureKind::Cancelled,
+                ..
+            })
+        ));
+        let call_count = runner.calls.lock().unwrap().len();
+        assert!(matches!(
+            loader.create_commit_comment(
+                &unusual_identity(),
+                detail_sha(),
+                "body",
+                Some(("src/lib.rs", 0)),
+                &token
+            ),
+            PublishOutcome::DefinitelyNotCreated(CommentFailure {
+                kind: CommentFailureKind::Malformed,
+                ..
+            })
+        ));
+        assert_eq!(runner.calls.lock().unwrap().len(), call_count);
+        let calls = runner.calls.lock().unwrap();
+        let expected_args = vec![
+            OsString::from("api"),
+            OsString::from("--method"),
+            OsString::from("POST"),
+            OsString::from("--include"),
+            OsString::from("--input"),
+            OsString::from("-"),
+            OsString::from(format!(
+                "/repos/owner%20space/repo%2Fname/commits/{}/comments",
+                detail_sha()
+            )),
+        ];
+        assert!(calls.iter().all(|(args, _)| args == &expected_args));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&calls[0].1).unwrap(),
+            json!({"body":"body\n\nmarker"})
+        );
+        assert_eq!(calls[0].1, br#"{"body":"body\n\nmarker"}"#);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&calls[1].1).unwrap(),
+            json!({"body":"body","path":"src/a b.rs","position":7})
+        );
+        assert_eq!(
+            calls[1].1,
+            br#"{"body":"body","path":"src/a b.rs","position":7}"#
+        );
+    }
+
+    #[test]
+    fn comment_pagination_cap_and_truncation_are_incomplete() {
+        let full = Value::Array((0..100).map(|id| json!({"id":id+1,"user":null,"created_at":"2024-01-15T12:00:00Z","path":null,"position":null,"line":null,"body":"safe"})).collect()).to_string();
+        let runner = CommentRunner::with(
+            (0..MAX_COMMENT_PAGES)
+                .map(|_| Ok(http_output(200, &[], full.as_bytes(), true)))
+                .collect(),
+        );
+        let result = GitHubLoader::new(&runner)
+            .list_commit_comments(
+                &unusual_identity(),
+                detail_sha(),
+                None,
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert!(!result.complete);
+        assert_eq!(runner.calls.lock().unwrap().len(), MAX_COMMENT_PAGES);
+        let mut truncated = http_output(200, &[], b"[]", true);
+        truncated.stdout.truncated = true;
+        let runner = CommentRunner::with(vec![Ok(truncated)]);
+        assert!(
+            !GitHubLoader::new(&runner)
+                .list_commit_comments(
+                    &unusual_identity(),
+                    detail_sha(),
+                    None,
+                    &CancellationToken::default()
+                )
+                .unwrap()
+                .complete
+        );
+    }
+
     impl<T: ProcessRunner + ?Sized> ProcessRunner for &T {
         fn run(
             &self,
@@ -2653,6 +3321,16 @@ mod tests {
             cancellation: &CancellationToken,
         ) -> Result<ProcessOutput, ProcessError> {
             (**self).run_cancellable(executable, arguments, cancellation)
+        }
+
+        fn run_with_stdin_cancellable(
+            &self,
+            executable: &OsStr,
+            arguments: &[OsString],
+            stdin: &[u8],
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessError> {
+            (**self).run_with_stdin_cancellable(executable, arguments, stdin, cancellation)
         }
     }
 }
