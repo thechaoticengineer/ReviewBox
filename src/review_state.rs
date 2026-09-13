@@ -3,17 +3,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use crate::private_file::{atomic_replace, data_file_path};
+
 const FORMAT_VERSION: u64 = 1;
+#[cfg(test)]
 const APPLICATION_DIRECTORY: &str = "reviewbox";
 const STATE_FILE_NAME: &str = "review-state.json";
-static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReviewKey {
@@ -146,22 +147,8 @@ pub struct FileReviewStore {
 
 impl FileReviewStore {
     pub fn from_env(lookup: impl Fn(&str) -> Option<OsString>) -> Result<Self, ReviewStateError> {
-        let data_home = lookup("XDG_DATA_HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .or_else(|| {
-                lookup("HOME")
-                    .filter(|value| !value.is_empty())
-                    .map(PathBuf::from)
-                    .filter(|path| path.is_absolute())
-                    .map(|home| home.join(".local").join("share"))
-            })
-            .ok_or(ReviewStateError::Unavailable)?;
-
-        Ok(Self::at_absolute(
-            data_home.join(APPLICATION_DIRECTORY).join(STATE_FILE_NAME),
-        ))
+        let path = data_file_path(lookup, STATE_FILE_NAME).ok_or(ReviewStateError::Unavailable)?;
+        Ok(Self::at_absolute(path))
     }
 
     pub fn from_process_env() -> Result<Self, ReviewStateError> {
@@ -203,37 +190,15 @@ impl FileReviewStore {
     }
 
     fn write_marks(&self, marks: &ReviewMarks) -> Result<(), ReviewStateError> {
-        let parent = self
-            .path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .ok_or(ReviewStateError::Write(io::ErrorKind::InvalidInput))?;
-
-        create_private_directory(parent).map_err(|error| ReviewStateError::Write(error.kind()))?;
-
         let bytes = encode(marks)?;
-        let (temporary_path, mut temporary_file) = create_private_temp_file(parent)?;
-        let result: io::Result<()> = (|| {
-            temporary_file.write_all(&bytes)?;
-            temporary_file.sync_all()?;
-            drop(temporary_file);
-
+        atomic_replace(&self.path, STATE_FILE_NAME, &bytes, || {
             #[cfg(test)]
             if self.fail_before_rename {
                 return Err(io::Error::other("injected review-state write failure"));
             }
-
-            fs::rename(&temporary_path, &self.path)?;
-            sync_directory_best_effort(parent);
             Ok(())
-        })();
-
-        if let Err(error) = result {
-            let _ = fs::remove_file(&temporary_path);
-            return Err(ReviewStateError::Write(error.kind()));
-        }
-
-        Ok(())
+        })
+        .map_err(|error| ReviewStateError::Write(error.kind()))
     }
 }
 
@@ -352,49 +317,6 @@ fn encode(marks: &ReviewMarks) -> Result<Vec<u8>, ReviewStateError> {
 fn is_full_sha(sha: &str) -> bool {
     matches!(sha.len(), 40 | 64) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
-
-fn create_private_directory(path: &Path) -> io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(path)
-}
-
-fn create_private_temp_file(parent: &Path) -> Result<(PathBuf, File), ReviewStateError> {
-    loop {
-        let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
-        let path = parent.join(format!(
-            ".{STATE_FILE_NAME}.tmp-{}-{sequence}",
-            std::process::id()
-        ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&path) {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(ReviewStateError::Write(error.kind())),
-        }
-    }
-}
-
-#[cfg(unix)]
-fn sync_directory_best_effort(path: &Path) {
-    if let Ok(directory) = File::open(path) {
-        let _ = directory.sync_all();
-    }
-}
-
-#[cfg(not(unix))]
-fn sync_directory_best_effort(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {

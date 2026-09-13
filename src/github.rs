@@ -916,6 +916,8 @@ fn commit_detail_from_api(
         .into_iter()
         .take(MAX_DETAIL_FILES)
         .map(|file| {
+            let path = sanitize_api_text(&file.filename);
+            let api_path_is_commentable = path == file.filename;
             let patch = match file.patch {
                 Some(patch) if patch.is_empty() => PatchContent::Empty,
                 Some(patch) if commit_budget_exhausted => commit_budget_cap(&patch),
@@ -934,7 +936,8 @@ fn commit_detail_from_api(
                 None => PatchContent::Unavailable,
             };
             FileChange {
-                path: sanitize_api_text(&file.filename),
+                path,
+                api_path_is_commentable,
                 previous_path: file.previous_filename.as_deref().map(sanitize_api_text),
                 status: FileStatus::from_api(&file.status),
                 additions: file.additions,
@@ -2171,6 +2174,12 @@ mod tests {
 
         assert_eq!(detail.files.len(), 4);
         assert_eq!(detail.files[0].path, "src/�first    .rs");
+        assert!(!detail.files[0].api_path_is_commentable);
+        assert!(
+            detail.files[1..]
+                .iter()
+                .all(|file| file.api_path_is_commentable)
+        );
         assert_eq!(
             detail.files[0].previous_path.as_deref(),
             Some("src/old    .rs")
@@ -2285,6 +2294,31 @@ mod tests {
         };
         assert_eq!(omitted_lines, 3);
         runner.assert_finished();
+    }
+
+    #[test]
+    fn patch_rows_remain_one_for_one_when_a_retained_line_is_character_capped() {
+        let long_addition = format!("+{}", "x".repeat(MAX_DIFF_LINE_CHARS + 20));
+        let patch = format!(
+            "@@ -1,2 +1,2 @@\n context\n{long_addition}\n-old\n@@ -9 +9 @@\n+later\n\\ No newline at end of file"
+        );
+        let raw_lines = patch.split_terminator('\n').collect::<Vec<_>>();
+        let parsed = parse_patch_text(&patch);
+
+        assert_eq!(parsed.lines().len(), raw_lines.len());
+        assert_eq!(parsed.lines()[0].kind, DiffLineKind::Hunk);
+        assert_eq!(parsed.lines()[2].kind, DiffLineKind::Addition);
+        assert!(parsed.lines()[2].text.ends_with('…'));
+        assert_eq!(parsed.lines()[4].kind, DiffLineKind::Hunk);
+        assert_eq!(parsed.lines()[5].kind, DiffLineKind::Addition);
+        assert_eq!(parsed.lines()[6].kind, DiffLineKind::NoNewline);
+        assert!(matches!(
+            parsed,
+            PatchContent::Capped {
+                reason: PatchCapReason::FileLimit,
+                ..
+            }
+        ));
     }
 
     #[test]

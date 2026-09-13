@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use ratatui::layout::Rect;
 
+use crate::comment_draft::{CommentDrafts, DraftStateError, DraftStore, MemoryDraftStore};
 use crate::github::{
     DetailFailure, DetailState, FailureCategory, LoadEvent, LoadFailure, LoadProgress, LoadStatus,
     LoadedRepository, RepositoryCoverage,
@@ -328,6 +329,9 @@ pub struct App {
     review_store: Option<Box<dyn ReviewStore>>,
     review_marks: ReviewMarks,
     review_warning: Option<String>,
+    draft_store: Option<Box<dyn DraftStore>>,
+    drafts: CommentDrafts,
+    draft_warning: Option<String>,
     remaining_only: bool,
     visible: Vec<VisibleRepository>,
     detail_cache: HashMap<DetailKey, DetailState>,
@@ -339,24 +343,61 @@ pub struct App {
 
 impl App {
     pub fn new(inbox: Inbox) -> Self {
-        Self::with_review_store(inbox, Box::new(MemoryReviewStore::default()))
+        Self::with_stores(
+            inbox,
+            Box::new(MemoryReviewStore::default()),
+            Box::new(MemoryDraftStore::default()),
+        )
     }
 
     pub fn with_review_store(inbox: Inbox, store: Box<dyn ReviewStore>) -> Self {
-        match store.load() {
-            Ok(marks) => Self::build(inbox, Some(store), marks, None),
-            Err(error) => Self::build(inbox, None, ReviewMarks::default(), Some(error.to_string())),
-        }
+        Self::with_stores(inbox, store, Box::new(MemoryDraftStore::default()))
     }
 
+    pub fn with_stores(
+        inbox: Inbox,
+        review_store: Box<dyn ReviewStore>,
+        draft_store: Box<dyn DraftStore>,
+    ) -> Self {
+        Self::with_store_results(inbox, Ok(review_store), Ok(draft_store))
+    }
+
+    #[cfg(test)]
     pub fn with_review_store_result(
         inbox: Inbox,
         store: Result<Box<dyn ReviewStore>, ReviewStateError>,
     ) -> Self {
-        match store {
-            Ok(store) => Self::with_review_store(inbox, store),
-            Err(error) => Self::build(inbox, None, ReviewMarks::default(), Some(error.to_string())),
-        }
+        Self::with_store_results(inbox, store, Ok(Box::new(MemoryDraftStore::default())))
+    }
+
+    pub fn with_store_results(
+        inbox: Inbox,
+        review_store: Result<Box<dyn ReviewStore>, ReviewStateError>,
+        draft_store: Result<Box<dyn DraftStore>, DraftStateError>,
+    ) -> Self {
+        let (review_store, review_marks, review_warning) = match review_store {
+            Ok(store) => match store.load() {
+                Ok(marks) => (Some(store), marks, None),
+                Err(error) => (None, ReviewMarks::default(), Some(error.to_string())),
+            },
+            Err(error) => (None, ReviewMarks::default(), Some(error.to_string())),
+        };
+        let (draft_store, drafts, draft_warning) = match draft_store {
+            Ok(store) => match store.load() {
+                Ok(drafts) => (Some(store), drafts, None),
+                Err(error) => (None, CommentDrafts::default(), Some(error.to_string())),
+            },
+            Err(error) => (None, CommentDrafts::default(), Some(error.to_string())),
+        };
+        Self::build(
+            inbox,
+            review_store,
+            review_marks,
+            review_warning,
+            draft_store,
+            drafts,
+            draft_warning,
+        )
     }
 
     fn build(
@@ -364,6 +405,9 @@ impl App {
         review_store: Option<Box<dyn ReviewStore>>,
         review_marks: ReviewMarks,
         review_warning: Option<String>,
+        draft_store: Option<Box<dyn DraftStore>>,
+        drafts: CommentDrafts,
+        draft_warning: Option<String>,
     ) -> Self {
         let status = match &inbox.source {
             InboxSource::Demo => "Offline fictional demo".to_owned(),
@@ -393,6 +437,9 @@ impl App {
             review_store,
             review_marks,
             review_warning,
+            draft_store,
+            drafts,
+            draft_warning,
             remaining_only: false,
             visible: Vec::new(),
             detail_cache: HashMap::new(),
@@ -1411,6 +1458,18 @@ impl App {
         self.review_warning.as_deref()
     }
 
+    pub fn draft_warning(&self) -> Option<&str> {
+        self.draft_warning.as_deref()
+    }
+
+    pub fn draft_store_available(&self) -> bool {
+        self.draft_store.is_some()
+    }
+
+    pub fn draft_count(&self) -> usize {
+        self.drafts.len()
+    }
+
     #[cfg(test)]
     pub fn detail_cache_len(&self) -> usize {
         self.detail_cache.len()
@@ -1630,6 +1689,7 @@ fn normalize_list(position: &mut ListPosition, length: usize, viewport_height: u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::comment_draft::{CommentDraft, CommentTarget, DraftStore, MemoryDraftStore};
     use crate::fixture::DemoFixture;
     use crate::github::{DetailFailure, FailureCategory, FailureScope};
     use crate::inbox::{ChildPane, FileStatus, GitHubAuthor, RepositoryIdentity};
@@ -1641,11 +1701,47 @@ mod tests {
 
     static NEXT_STATE_TEST: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn demo_app_loads_drafts_from_an_injected_memory_only_store() {
+        let draft_store = MemoryDraftStore::default();
+        let draft = CommentDraft::new(
+            CommentTarget::commit(1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            "Fictional draft",
+        )
+        .unwrap();
+        draft_store.save(&draft).unwrap();
+
+        let app = App::with_stores(
+            DemoFixture::load(),
+            Box::new(MemoryReviewStore::default()),
+            Box::new(draft_store),
+        );
+
+        assert!(app.draft_store_available());
+        assert_eq!(app.draft_count(), 1);
+        assert!(app.draft_warning().is_none());
+    }
+
+    #[test]
+    fn draft_load_failure_is_sanitized_and_disables_only_draft_persistence() {
+        let app = App::with_store_results(
+            DemoFixture::load(),
+            Ok(Box::new(MemoryReviewStore::default())),
+            Err(DraftStateError::Malformed),
+        );
+
+        assert!(!app.draft_store_available());
+        assert_eq!(app.draft_count(), 0);
+        assert!(app.review_warning().is_none());
+        assert!(app.draft_warning().unwrap().contains("comment-drafts.json"));
+    }
+
     fn files() -> Vec<FileChange> {
         ["one.rs", "two.rs", "three.rs"]
             .into_iter()
             .map(|path| FileChange {
                 path: path.to_owned(),
+                api_path_is_commentable: true,
                 previous_path: None,
                 status: FileStatus::Modified,
                 additions: 0,
@@ -1851,6 +1947,7 @@ mod tests {
                 "only",
                 vec![FileChange {
                     path: "only.rs".to_owned(),
+                    api_path_is_commentable: true,
                     previous_path: None,
                     status: FileStatus::Modified,
                     additions: 0,

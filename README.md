@@ -4,7 +4,7 @@ A keyboard-first terminal review inbox for commits across GitHub projects.
 
 See [PRODUCT.md](PRODUCT.md) for the accepted requirements and delivery order.
 
-## Current status: diff review and progress
+## Current status: diff review, progress, and draft persistence
 
 Implemented now:
 
@@ -89,10 +89,16 @@ Implemented now:
   repository, commit, file, or diff pane. Repeats are case-insensitive, wrap in
   either direction, keep list matches visible, and highlight/scroll to diff
   matches. Search-entry keys remain isolated from normal-mode bindings.
+- A durable comment-draft persistence layer is initialized in live mode and kept
+  separate from reviewed progress. It supports commit-wide identities and
+  validated GitHub commit-diff line identities, reports sanitized load failures,
+  and shows the count of previously saved drafts. The keyboard editor that will
+  create and change these drafts is not part of this increment yet.
 
 Planned for later delivery increments, and not implemented yet:
 
-- Drafting, editing, persistence, and publishing of comments.
+- Keyboard drafting and editing, external-editor integration, loading existing
+  comments, and publishing comments.
 
 ## Launch configuration and demo
 
@@ -135,9 +141,9 @@ read-only `gh api --method GET` request. Press `q` or `Ctrl-c` at any time to
 cancel loading and exit.
 
 The demo needs no GitHub authentication. It performs no network requests or
-network writes and does not persist runtime state; reviewed marks exist only in
-memory for that process. All repository names, commit IDs, files, and diff-like
-content are fictional.
+network writes and does not persist runtime state; reviewed marks and comment
+draft state exist only in memory for that process. All repository names, commit
+IDs, files, and diff-like content are fictional.
 
 Run the same fixture/state/rendering integration noninteractively with:
 
@@ -218,6 +224,42 @@ changes for that run, and is never silently overwritten. Save failures leave the
 visible mark unchanged. The `f` filter itself is process-local and always starts
 in the all-commits view; only reviewed marks survive restart. Demo and demo-smoke
 use memory-only marks and never construct the file-backed store.
+
+## Comment-draft storage and targeting
+
+Live mode reads comment drafts from a separate versioned file:
+
+- If `XDG_DATA_HOME` is an absolute path:
+  `$XDG_DATA_HOME/reviewbox/comment-drafts.json`.
+- Otherwise, if `HOME` is an absolute path:
+  `$HOME/.local/share/reviewbox/comment-drafts.json`.
+- If neither location is usable, browsing continues with a sanitized warning and
+  file-backed drafts are disabled rather than written relative to the repository.
+
+Draft identities use GitHub's numeric repository ID, the complete lowercase
+commit SHA, and either the whole commit or a line target made from the API file
+path and GitHub commit-diff position. Bodies must contain non-whitespace text and
+are limited to 65,000 characters; line paths are limited to 4,096 bytes and may
+not contain control characters. The file is capped at 16 MiB when read.
+
+Only retained context, addition, and deletion rows in a textual patch beginning
+with a valid `@@` hunk header can become line targets. Hunk headers, no-newline
+markers, malformed/other rows, binary or unavailable patches, and content omitted
+by the commit-wide budget are ineligible. Rows retained by the per-file cap remain
+eligible. A filename changed by terminal sanitization is also ineligible, because
+the displayed path would not safely identify the API target. Positions count raw
+patch rows from the first hunk header, including intervening headers and notices,
+as required by GitHub's commit-comments API.
+
+Every file update re-reads the existing draft file, validates it, changes one
+target, and atomically replaces it through a same-directory private temporary
+file. The `reviewbox` directory is created with mode `0700` and the replacement
+file with mode `0600` on Unix. Deterministic ordering and a trailing newline make
+unchanged rewrites byte-identical. A malformed, unsupported, oversized, or
+unreadable file is reported and never overwritten; failed replacement preserves
+the previous bytes. No lock coordinates concurrent ReviewBox processes, so two
+simultaneous writers can still race. Drafts are never stored in
+`review-state.json`. Demo and demo-smoke construct only memory-backed draft state.
 
 ## GitHub loading behavior and limitations
 

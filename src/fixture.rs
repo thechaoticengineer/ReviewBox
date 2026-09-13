@@ -176,6 +176,7 @@ fn file(path: &str, lines: &[&str]) -> FileChange {
         .count() as u64;
     FileChange {
         path: path.to_owned(),
+        api_path_is_commentable: true,
         previous_path: None,
         status: FileStatus::Modified,
         additions,
@@ -188,6 +189,7 @@ fn file(path: &str, lines: &[&str]) -> FileChange {
 fn no_patch_file(path: &str) -> FileChange {
     FileChange {
         path: path.to_owned(),
+        api_path_is_commentable: true,
         previous_path: None,
         status: FileStatus::Modified,
         additions: 0,
@@ -203,6 +205,7 @@ fn capped_file(path: &str) -> FileChange {
     );
     FileChange {
         path: path.to_owned(),
+        api_path_is_commentable: true,
         previous_path: None,
         status: FileStatus::Modified,
         additions: 2,

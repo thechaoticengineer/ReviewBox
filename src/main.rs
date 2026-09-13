@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+pub mod comment_draft;
 mod day;
 mod detail;
 mod event;
@@ -7,6 +8,7 @@ mod fixture;
 pub mod github;
 mod inbox;
 mod loader;
+mod private_file;
 mod render;
 pub mod review_state;
 mod smoke;
@@ -18,6 +20,7 @@ use std::process::ExitCode;
 
 use app::App;
 use cli::Command;
+use comment_draft::{DraftStore, FileDraftStore};
 use detail::DetailSession;
 use event::{CrosstermEventSource, DetailRequester};
 use fixture::DemoFixture;
@@ -72,10 +75,11 @@ fn run_inbox(inbox: Inbox) -> io::Result<()> {
         InboxSource::Demo => None,
     };
     let mut app = match &inbox.source {
-        InboxSource::Live { .. } => App::with_review_store_result(
+        InboxSource::Live { .. } => App::with_store_results(
             inbox,
             FileReviewStore::from_process_env()
                 .map(|store| Box::new(store) as Box<dyn ReviewStore>),
+            FileDraftStore::from_process_env().map(|store| Box::new(store) as Box<dyn DraftStore>),
         ),
         InboxSource::Demo => App::new(inbox),
     };

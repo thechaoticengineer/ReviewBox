@@ -87,6 +87,7 @@ pub struct GitHubAuthor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileChange {
     pub path: String,
+    pub api_path_is_commentable: bool,
     pub previous_path: Option<String>,
     pub status: FileStatus,
     pub additions: u64,

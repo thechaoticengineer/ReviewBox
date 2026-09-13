@@ -167,6 +167,12 @@ fn draw_live_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(Color::Yellow),
         ));
     }
+    if let Some(warning) = app.draft_warning() {
+        lines.push(Line::styled(
+            format!("Comment draft warning: {warning}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     lines.push(Line::raw(if app.remaining_only() {
         "Inbox filter: remaining commits only"
     } else {
@@ -515,6 +521,15 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(Color::Yellow),
         ));
     }
+    if let Some(warning) = app.draft_warning() {
+        spans.push(Span::styled(
+            format!(" • COMMENT DRAFT WARNING: {warning}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if app.draft_store_available() && app.draft_count() > 0 {
+        spans.push(Span::raw(format!(" • {} drafts", app.draft_count())));
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -528,13 +543,17 @@ fn draw_compact(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Mode::SearchEntry { .. } => "SEARCH",
         Mode::Help { .. } => "HELP",
     };
-    let warning = app
+    let review_warning = app
         .review_warning()
         .map(|warning| format!("\nREVIEW STATE WARNING: {warning}"))
         .unwrap_or_default();
+    let draft_warning = app
+        .draft_warning()
+        .map(|warning| format!("\nCOMMENT DRAFT WARNING: {warning}"))
+        .unwrap_or_default();
     let (reviewed, total) = app.review_progress();
     let message = Paragraph::new(format!(
-        "{mode} • {} • {} {reviewed}/{total} reviewed\nterminal too small for panes\nresize to at least 60×16\nm review • f filter • / search • n/N match • ? help • q quit{warning}",
+        "{mode} • {} • {} {reviewed}/{total} reviewed\nterminal too small for panes\nresize to at least 60×16\nm review • f filter • / search • n/N match • ? help • q quit{review_warning}{draft_warning}",
         app.focus().title(),
         if app.remaining_only() { "remaining" } else { "all" },
     ))
@@ -754,6 +773,7 @@ mod tests {
                 authored_at: Utc.with_ymd_and_hms(2024, 1, 15, 12, 0, 0).unwrap(),
                 files: ChildPane::Available(vec![FileChange {
                     path: "src/patch.rs".to_owned(),
+                    api_path_is_commentable: true,
                     previous_path: None,
                     status: FileStatus::Modified,
                     additions: 1,
@@ -794,6 +814,7 @@ mod tests {
             outcome: Ok(CommitDetail {
                 files: vec![FileChange {
                     path: "src/notice.rs".to_owned(),
+                    api_path_is_commentable: true,
                     previous_path: None,
                     status: FileStatus::Modified,
                     additions: 13,
@@ -1061,6 +1082,7 @@ mod tests {
             outcome: Ok(CommitDetail {
                 files: vec![FileChange {
                     path: "assets/image.bin".to_owned(),
+                    api_path_is_commentable: true,
                     previous_path: None,
                     status: FileStatus::Modified,
                     additions: 0,
@@ -1143,6 +1165,7 @@ mod tests {
             outcome: Ok(CommitDetail {
                 files: vec![FileChange {
                     path: "src/kept.rs".to_owned(),
+                    api_path_is_commentable: true,
                     previous_path: None,
                     status: FileStatus::Modified,
                     additions: 1,

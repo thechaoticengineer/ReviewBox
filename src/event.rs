@@ -273,6 +273,7 @@ mod tests {
                     outcome: Ok(CommitDetail {
                         files: vec![FileChange {
                             path: "src/live.rs".to_owned(),
+                            api_path_is_commentable: true,
                             previous_path: None,
                             status: FileStatus::Modified,
                             additions: 1,
