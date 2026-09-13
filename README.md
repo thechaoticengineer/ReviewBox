@@ -267,9 +267,13 @@ requested only when a live commit is explicitly opened; file lists beyond 300
 entries and command responses beyond 16 MiB are disclosed as incomplete rather
 than presented as complete.
 
-GitHub's commit response can omit a textual `patch`, notably for binary or large
-changes. ReviewBox labels that file as “binary or too large” because the omitted
-response does not reliably distinguish those causes; it never invents content.
+GitHub's commit response can omit a textual `patch`. When it also reports zero
+changes, ReviewBox labels the file as having no textual patch and explains that
+it may be binary, rename/mode-only, or empty: “No GitHub text patch (binary,
+rename/mode-only, or empty file).” When GitHub reports changes but omits the
+patch, ReviewBox labels it as “binary or too large.” Neither state invents
+content, and a present-but-empty patch remains a distinct “No textual changes”
+state.
 Locally retained details are limited to the first 300 files, 256 KiB or 5,000
 patch lines per file, 2,000 characters per logical diff line, and 2 MiB of patch
 text per commit. The in-process detail cache retains at most 16 commits. A file

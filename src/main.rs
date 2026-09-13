@@ -11,6 +11,7 @@ mod render;
 pub mod review_state;
 mod smoke;
 mod terminal;
+mod ui_layout;
 
 use std::io;
 use std::process::ExitCode;

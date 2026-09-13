@@ -25,6 +25,9 @@ use crate::inbox::{
 
 const PAGE_SIZE: usize = 100;
 const MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
+/// User-facing explanation for a commit-detail response exceeding [`MAX_STDOUT_BYTES`].
+pub(crate) const RESPONSE_TRUNCATED_LABEL: &str =
+    "GitHub response exceeded 16 MiB; details unavailable";
 const MAX_STDERR_BYTES: usize = 8 * 1024;
 pub const MAX_DETAIL_FILES: usize = 300;
 pub const MAX_FILE_PATCH_BYTES: usize = 256 * 1024;
@@ -927,7 +930,7 @@ fn commit_detail_from_api(
                         parsed
                     }
                 }
-                None if file.changes == 0 => PatchContent::Empty,
+                None if file.changes == 0 => PatchContent::NoPatch,
                 None => PatchContent::Unavailable,
             };
             FileChange {
@@ -2144,6 +2147,15 @@ mod tests {
                         "additions": 0,
                         "deletions": 4,
                         "changes": 4
+                    },
+                    {
+                        "filename": "empty.txt",
+                        "previous_filename": null,
+                        "status": "modified",
+                        "additions": 0,
+                        "deletions": 0,
+                        "changes": 0,
+                        "patch": ""
                     }
                 ]
             }),
@@ -2157,7 +2169,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(detail.files.len(), 3);
+        assert_eq!(detail.files.len(), 4);
         assert_eq!(detail.files[0].path, "src/�first    .rs");
         assert_eq!(
             detail.files[0].previous_path.as_deref(),
@@ -2176,8 +2188,9 @@ mod tests {
         assert_eq!(lines[2].text, "+new    value�");
         assert_eq!((lines[3].old_line, lines[3].new_line), (Some(11), Some(21)));
         assert_eq!(lines[4].kind, DiffLineKind::NoNewline);
-        assert_eq!(detail.files[1].patch, PatchContent::Empty);
+        assert_eq!(detail.files[1].patch, PatchContent::NoPatch);
         assert_eq!(detail.files[2].patch, PatchContent::Unavailable);
+        assert_eq!(detail.files[3].patch, PatchContent::Empty);
         assert!(!detail.more_files_available);
         assert_eq!(detail.omitted_files, 0);
         assert_eq!(runner.calls().len(), 1);

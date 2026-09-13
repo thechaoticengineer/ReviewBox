@@ -119,6 +119,7 @@ pub enum PatchContent {
         reason: PatchCapReason,
     },
     Empty,
+    NoPatch,
     Unavailable,
 }
 
@@ -126,7 +127,7 @@ impl PatchContent {
     pub fn lines(&self) -> &[DiffLine] {
         match self {
             Self::Text { lines } | Self::Capped { lines, .. } => lines,
-            Self::Empty | Self::Unavailable => &[],
+            Self::Empty | Self::NoPatch | Self::Unavailable => &[],
         }
     }
 }

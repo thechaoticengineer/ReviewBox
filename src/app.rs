@@ -1,18 +1,20 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
-use unicode_width::UnicodeWidthStr;
+use ratatui::layout::Rect;
 
 use crate::github::{
     DetailFailure, DetailState, FailureCategory, LoadEvent, LoadFailure, LoadProgress, LoadStatus,
     LoadedRepository, RepositoryCoverage,
 };
 use crate::inbox::{
-    Commit, CommitDetail, DiffLine, FileChange, Inbox, InboxSource, Repository, RepositoryIdentity,
+    Commit, CommitDetail, DiffLine, FileChange, Inbox, InboxSource, PatchCapReason, PatchContent,
+    Repository, RepositoryIdentity,
 };
 use crate::review_state::{
     MemoryReviewStore, ReviewKey, ReviewMarks, ReviewStateError, ReviewStore,
 };
+use crate::ui_layout::{ReviewPaneLayout, wrap_text};
 
 pub const MIN_FULL_WIDTH: u16 = 60;
 pub const MIN_FULL_HEIGHT: u16 = 16;
@@ -407,8 +409,14 @@ impl App {
     pub fn resize(&mut self, width: u16, height: u16) {
         self.terminal_width = width;
         self.terminal_height = height;
-        self.viewport_heights = pane_viewport_heights(width, height);
-        self.diff_viewport_width = diff_viewport_width(width);
+        if width < MIN_FULL_WIDTH || height < MIN_FULL_HEIGHT {
+            self.viewport_heights = [0; 4];
+            self.diff_viewport_width = 0;
+        } else {
+            let layout = ReviewPaneLayout::from_area(Rect::new(0, 0, width, height));
+            self.viewport_heights = layout.content_heights();
+            self.diff_viewport_width = layout.diff_content_width();
+        }
         self.normalize();
     }
 
@@ -1117,7 +1125,7 @@ impl App {
     }
 
     fn max_diff_scroll(&self) -> usize {
-        let capacity = self.viewport_heights[Pane::Diff.index()].max(1);
+        let capacity = self.diff_patch_capacity();
         let lines = self.current_diff_lines();
         let mut rows: usize = 0;
         for index in (0..lines.len()).rev() {
@@ -1130,7 +1138,7 @@ impl App {
     }
 
     fn ensure_diff_line_visible(&mut self, index: usize) {
-        let capacity = self.viewport_heights[Pane::Diff.index()].max(1);
+        let capacity = self.diff_patch_capacity();
         if index < self.diff_scroll {
             self.diff_scroll = index;
             self.diff_row_offset = 0;
@@ -1156,7 +1164,7 @@ impl App {
     }
 
     fn tail_diff_row_offset(&self) -> usize {
-        let capacity = self.viewport_heights[Pane::Diff.index()].max(1);
+        let capacity = self.diff_patch_capacity();
         let total_rows = (self.diff_scroll..self.current_diff_lines().len())
             .map(|index| self.diff_line_rows(index))
             .sum::<usize>();
@@ -1195,10 +1203,48 @@ impl App {
             .max(1)
     }
 
+    pub(crate) fn diff_viewport_width(&self) -> usize {
+        self.diff_viewport_width.max(1)
+    }
+
     pub fn diff_line_rows(&self, index: usize) -> usize {
         self.current_diff_lines().get(index).map_or(0, |line| {
-            wrapped_row_count(&line.text, self.diff_content_width())
+            wrap_text(&line.text, self.diff_content_width()).len()
         })
+    }
+
+    pub(crate) fn diff_notice_texts(&self) -> Vec<String> {
+        let mut notices = Vec::with_capacity(2);
+        if let Some(DetailState::Ready(detail)) = self.current_detail_state()
+            && (detail.omitted_files > 0 || detail.more_files_available)
+        {
+            notices.push("Only first 300 files shown".to_owned());
+        }
+        if let Some(file) = self.current_file()
+            && let PatchContent::Capped {
+                omitted_lines,
+                omitted_bytes,
+                reason: PatchCapReason::FileLimit,
+                ..
+            } = &file.patch
+        {
+            notices.push(format!(
+                "Patch capped locally: {omitted_lines} lines / {} KiB omitted",
+                omitted_bytes.div_ceil(1024)
+            ));
+        }
+        notices
+    }
+
+    fn diff_patch_capacity(&self) -> usize {
+        let notice_rows = self
+            .diff_notice_texts()
+            .iter()
+            .map(|notice| wrap_text(notice, self.diff_viewport_width).len())
+            .sum::<usize>();
+        self.viewport_heights[Pane::Diff.index()]
+            .saturating_sub(notice_rows)
+            .max(1)
     }
 
     pub fn inbox(&self) -> &Inbox {
@@ -1553,12 +1599,6 @@ fn decimal_width(number: u32) -> usize {
     number.to_string().len().max(1)
 }
 
-fn wrapped_row_count(text: &str, width: usize) -> usize {
-    let width = width.max(1);
-    let display_width = UnicodeWidthStr::width(text);
-    display_width.div_ceil(width).max(1)
-}
-
 fn moved_index(current: usize, length: usize, upward: bool, amount: usize) -> usize {
     if length == 0 {
         return 0;
@@ -1585,34 +1625,6 @@ fn normalize_list(position: &mut ListPosition, length: usize, viewport_height: u
         position.scroll = position.selected.saturating_add(1).saturating_sub(capacity);
     }
     position.scroll = position.scroll.min(max_scroll);
-}
-
-fn pane_viewport_heights(width: u16, height: u16) -> [usize; 4] {
-    if width < MIN_FULL_WIDTH || height < MIN_FULL_HEIGHT {
-        return [0; 4];
-    }
-
-    let pane_height = height.saturating_sub(1);
-    let repository_outer = pane_height.saturating_mul(34) / 100;
-    let commit_outer = pane_height.saturating_mul(33) / 100;
-    let file_outer = pane_height
-        .saturating_sub(repository_outer)
-        .saturating_sub(commit_outer);
-    [
-        repository_outer.saturating_sub(2) as usize,
-        commit_outer.saturating_sub(2) as usize,
-        file_outer.saturating_sub(2) as usize,
-        pane_height.saturating_sub(2) as usize,
-    ]
-}
-
-fn diff_viewport_width(width: u16) -> usize {
-    if width < MIN_FULL_WIDTH {
-        return 0;
-    }
-    width
-        .saturating_sub(width.saturating_mul(44) / 100)
-        .saturating_sub(2) as usize
 }
 
 #[cfg(test)]

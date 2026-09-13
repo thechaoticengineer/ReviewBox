@@ -6,7 +6,9 @@ use ratatui::layout::Rect;
 
 use crate::app::{App, Input, Mode, Pane};
 use crate::fixture::DemoFixture;
+use crate::github::RESPONSE_TRUNCATED_LABEL;
 use crate::render;
+use crate::render::NO_PATCH_LABEL;
 use crate::review_state::MemoryReviewStore;
 
 const FULL_WIDTH: u16 = 120;
@@ -183,13 +185,13 @@ pub fn run() -> io::Result<SmokeReport> {
     search(&mut app, "fictional-orbit-map.bin")?;
     ensure(
         app.current_file().map(|file| file.path.as_str()) == Some("assets/fictional-orbit-map.bin"),
-        "file search must select the unavailable binary fixture",
+        "file search must select the no-patch binary fixture",
     )?;
     app.handle_input(Input::Enter);
     ensure_contains(
         &render_frame(&mut terminal, &mut app, &mut frames)?,
-        "Patch not provided by GitHub (binary or too large)",
-        "unavailable patch frame",
+        NO_PATCH_LABEL,
+        "no-patch frame",
     )?;
 
     app.handle_input(Input::Escape);
@@ -211,7 +213,7 @@ pub fn run() -> io::Result<SmokeReport> {
     )?;
     ensure_contains(
         &render_frame(&mut terminal, &mut app, &mut frames)?,
-        "GitHub response exceeded 16 MiB; details unavailable",
+        RESPONSE_TRUNCATED_LABEL,
         "truncated response frame",
     )?;
 

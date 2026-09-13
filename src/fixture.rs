@@ -145,7 +145,7 @@ fn primary_files() -> Vec<FileChange> {
         file("src/routes.rs", ROUTES_DIFF),
         file("tests/routes.rs", TEST_DIFF),
         file("README.md", DOC_DIFF),
-        unavailable_file("assets/fictional-orbit-map.bin"),
+        no_patch_file("assets/fictional-orbit-map.bin"),
         capped_file("generated/fictional-catalog.rs"),
         file("notes/empty-placeholder.txt", &[]),
     ]
@@ -185,15 +185,15 @@ fn file(path: &str, lines: &[&str]) -> FileChange {
     }
 }
 
-fn unavailable_file(path: &str) -> FileChange {
+fn no_patch_file(path: &str) -> FileChange {
     FileChange {
         path: path.to_owned(),
         previous_path: None,
         status: FileStatus::Modified,
         additions: 0,
         deletions: 0,
-        changes: 1,
-        patch: PatchContent::Unavailable,
+        changes: 0,
+        patch: PatchContent::NoPatch,
     }
 }
 
@@ -360,7 +360,7 @@ mod tests {
                 .files
                 .as_slice()
                 .iter()
-                .any(|file| { matches!(&file.patch, PatchContent::Unavailable) })
+                .any(|file| { matches!(&file.patch, PatchContent::NoPatch) })
         );
         assert!(
             primary

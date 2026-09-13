@@ -1,14 +1,17 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, HELP_BINDINGS, LivePhase, MIN_FULL_HEIGHT, MIN_FULL_WIDTH, Mode, Pane};
 use crate::day::TimezoneSource;
-use crate::github::{DetailFailure, DetailState, FailureCategory};
+use crate::github::{DetailFailure, DetailState, FailureCategory, RESPONSE_TRUNCATED_LABEL};
 use crate::inbox::{DiffLineKind, InboxSource, PatchContent};
+use crate::ui_layout::{ReviewPaneLayout, wrap_text};
+
+pub(crate) const NO_PATCH_LABEL: &str =
+    "No GitHub text patch (binary, rename/mode-only, or empty file)";
 
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
@@ -21,31 +24,15 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn draw_panes(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(1)])
-        .split(area);
-    draw_review_panes(frame, rows[0], app);
-    draw_status(frame, rows[1], app);
+    let layout = ReviewPaneLayout::from_area(area);
+    draw_review_panes(frame, layout, app);
+    draw_status(frame, layout.status, app);
 }
 
-fn draw_review_panes(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
-        .split(area);
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ])
-        .split(columns[0]);
-
+fn draw_review_panes(frame: &mut Frame<'_>, layout: ReviewPaneLayout, app: &App) {
     draw_list_pane(
         frame,
-        left[0],
+        layout.repository,
         Pane::Repository,
         app,
         app.visible_repositories()
@@ -60,7 +47,7 @@ fn draw_review_panes(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
     draw_list_pane(
         frame,
-        left[1],
+        layout.commit,
         Pane::Commit,
         app,
         app.current_commits()
@@ -77,7 +64,7 @@ fn draw_review_panes(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
     draw_list_pane(
         frame,
-        left[2],
+        layout.file,
         Pane::File,
         app,
         app.current_files()
@@ -86,7 +73,7 @@ fn draw_review_panes(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .collect(),
         "files",
     );
-    draw_diff_pane(frame, columns[1], app);
+    draw_diff_pane(frame, layout.diff, app);
 }
 
 fn draw_live_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -298,72 +285,85 @@ fn draw_diff_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     let lines = if matches!(app.current_detail_state(), Some(DetailState::Loading)) {
-        vec![Line::styled(
-            "  Loading commit details…",
+        diff_message(
+            app,
+            area,
+            "Loading commit details…",
             Style::default().fg(Color::Cyan),
-        )]
+        )
     } else if let Some(DetailState::Failed(failure)) = app.current_detail_state() {
         let label = match failure {
-            DetailFailure::ResponseTruncated => {
-                "GitHub response exceeded 16 MiB; details unavailable".to_owned()
-            }
+            DetailFailure::ResponseTruncated => RESPONSE_TRUNCATED_LABEL.to_owned(),
             DetailFailure::Load(failure) => format!(
                 "Commit details unavailable: {}",
                 failure_category_label(failure.category)
             ),
         };
-        vec![Line::styled(
-            format!("  {label}"),
-            Style::default().fg(Color::Red),
-        )]
+        diff_message(app, area, &label, Style::default().fg(Color::Red))
     } else if matches!(app.inbox().source, InboxSource::Demo)
         && matches!(
             app.current_commit().map(|commit| &commit.files),
             Some(crate::inbox::ChildPane::ResponseTruncated)
         )
     {
-        vec![Line::styled(
-            "  GitHub response exceeded 16 MiB; details unavailable",
+        diff_message(
+            app,
+            area,
+            RESPONSE_TRUNCATED_LABEL,
             Style::default().fg(Color::Red),
-        )]
+        )
     } else if matches!(app.inbox().source, InboxSource::Demo)
         && matches!(
             app.current_commit().map(|commit| &commit.files),
             Some(crate::inbox::ChildPane::Unavailable)
         )
     {
-        vec![Line::styled(
-            "  Commit file list unavailable",
+        diff_message(
+            app,
+            area,
+            "Commit file list unavailable",
             Style::default().fg(Color::Yellow),
-        )]
+        )
     } else if let Some(file) = app.current_file() {
         match &file.patch {
-            PatchContent::Empty => vec![Line::styled(
-                "  No textual changes",
+            PatchContent::Empty => diff_message(
+                app,
+                area,
+                "No textual changes",
                 Style::default().fg(Color::DarkGray),
-            )],
-            PatchContent::Unavailable => vec![Line::styled(
-                "  Patch not provided by GitHub (binary or too large)",
+            ),
+            PatchContent::NoPatch => diff_message(
+                app,
+                area,
+                NO_PATCH_LABEL,
                 Style::default().fg(Color::Yellow),
-            )],
+            ),
+            PatchContent::Unavailable => diff_message(
+                app,
+                area,
+                "Patch not provided by GitHub (binary or too large)",
+                Style::default().fg(Color::Yellow),
+            ),
             PatchContent::Capped {
                 reason: crate::inbox::PatchCapReason::CommitBudget,
                 ..
-            } => {
-                vec![Line::styled(
-                    "  Omitted by per-commit budget",
-                    Style::default().fg(Color::Yellow),
-                )]
-            }
+            } => diff_message(
+                app,
+                area,
+                "Omitted by per-commit budget",
+                Style::default().fg(Color::Yellow),
+            ),
             PatchContent::Text { .. } | PatchContent::Capped { .. } => {
                 diff_lines(app, area.height.saturating_sub(2) as usize)
             }
         }
     } else if app.current_diff_lines().is_empty() {
-        vec![Line::styled(
-            "  No textual changes",
+        diff_message(
+            app,
+            area,
+            "No textual changes",
             Style::default().fg(Color::DarkGray),
-        )]
+        )
     } else {
         diff_lines(app, area.height.saturating_sub(2) as usize)
     };
@@ -372,6 +372,16 @@ fn draw_diff_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(lines).block(pane_block(Pane::Diff, app.focus() == Pane::Diff, app)),
         area,
     );
+}
+
+fn diff_message(app: &App, area: Rect, message: &str, style: Style) -> Vec<Line<'static>> {
+    let mut lines = diff_notice(app);
+    lines.extend(
+        wrap_text(message, area.width.saturating_sub(2) as usize)
+            .into_iter()
+            .map(|row| Line::styled(row, style)),
+    );
+    lines
 }
 
 fn diff_lines(app: &App, available_rows: usize) -> Vec<Line<'static>> {
@@ -387,7 +397,7 @@ fn diff_lines(app: &App, available_rows: usize) -> Vec<Line<'static>> {
     {
         let style = diff_style(content.kind);
         let matched = app.diff_match() == Some(index);
-        for (row, text) in wrap_diff_text(&content.text, content_width)
+        for (row, text) in wrap_text(&content.text, content_width)
             .into_iter()
             .enumerate()
             .skip(if index == app.scroll(Pane::Diff) {
@@ -419,34 +429,14 @@ fn diff_lines(app: &App, available_rows: usize) -> Vec<Line<'static>> {
 }
 
 fn diff_notice(app: &App) -> Vec<Line<'static>> {
-    if app.scroll(Pane::Diff) != 0 || app.diff_row_offset() != 0 {
-        return Vec::new();
-    }
-    if let Some(file) = app.current_file()
-        && let PatchContent::Capped {
-            omitted_lines,
-            omitted_bytes,
-            reason: crate::inbox::PatchCapReason::FileLimit,
-            ..
-        } = &file.patch
-    {
-        return vec![Line::styled(
-            format!(
-                "  Patch capped locally: {omitted_lines} lines / {} KiB omitted",
-                omitted_bytes.div_ceil(1024)
-            ),
-            Style::default().fg(Color::Yellow),
-        )];
-    }
-    if let Some(DetailState::Ready(detail)) = app.current_detail_state()
-        && (detail.omitted_files > 0 || detail.more_files_available)
-    {
-        return vec![Line::styled(
-            "  Only first 300 files shown",
-            Style::default().fg(Color::Yellow),
-        )];
-    }
-    Vec::new()
+    app.diff_notice_texts()
+        .iter()
+        .flat_map(|notice| {
+            wrap_text(notice, app.diff_viewport_width())
+                .into_iter()
+                .map(|row| Line::styled(row, Style::default().fg(Color::Yellow)))
+        })
+        .collect()
 }
 
 fn diff_style(kind: DiffLineKind) -> Style {
@@ -463,28 +453,6 @@ fn format_diff_gutter(old: Option<u32>, new: Option<u32>, width: usize) -> Strin
     let old = old.map_or_else(String::new, |number| number.to_string());
     let new = new.map_or_else(String::new, |number| number.to_string());
     format!("{old:>width$} {new:>width$} ")
-}
-
-fn wrap_diff_text(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut rows = Vec::new();
-    let mut row = String::new();
-    let mut row_width: usize = 0;
-    for character in text.chars() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if row_width > 0 && row_width.saturating_add(character_width) > width {
-            rows.push(std::mem::take(&mut row));
-            row_width = 0;
-        }
-        row.push(character);
-        row_width = row_width.saturating_add(character_width);
-    }
-    if row.is_empty() && rows.is_empty() {
-        rows.push(String::new());
-    } else if !row.is_empty() {
-        rows.push(row);
-    }
-    rows
 }
 
 fn sanitize_display_text(value: &str) -> String {
@@ -682,6 +650,29 @@ mod tests {
             .collect()
     }
 
+    fn rendered_diff_prefix(app: &mut App, width: u16, height: u16, rows: usize) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        app.resize(width, height);
+        terminal.draw(|frame| draw(frame, app)).expect("draw");
+
+        let diff = ReviewPaneLayout::from_area(Rect::new(0, 0, width, height)).diff;
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in diff.y.saturating_add(1)
+            ..diff
+                .y
+                .saturating_add(1)
+                .saturating_add(rows as u16)
+                .min(diff.bottom().saturating_sub(1))
+        {
+            for x in diff.x.saturating_add(1)..diff.right().saturating_sub(1) {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+        }
+        text
+    }
+
     fn live_app() -> App {
         let selection = crate::day::select_day(
             crate::day::parse_date("2024-01-15").unwrap(),
@@ -772,6 +763,75 @@ mod tests {
                 }]),
             }],
         }]))
+    }
+
+    fn notice_patch_lines() -> Vec<DiffLine> {
+        (1..=13)
+            .map(|number| DiffLine {
+                kind: DiffLineKind::Addition,
+                old_line: None,
+                new_line: Some(number),
+                text: format!(
+                    "+LINE{number:02}{}",
+                    if number == 1 || number == 13 {
+                        " MATCH"
+                    } else {
+                        ""
+                    }
+                ),
+            })
+            .collect()
+    }
+
+    fn live_file_notice_app(patch: PatchContent) -> App {
+        let mut app = live_commit_app();
+        app.apply(Command::Open);
+        app.apply(Command::Open);
+        let (request_id, key) = request_identity(&mut app);
+        app.apply_detail_result(DetailResult {
+            request_id,
+            key,
+            outcome: Ok(CommitDetail {
+                files: vec![FileChange {
+                    path: "src/notice.rs".to_owned(),
+                    previous_path: None,
+                    status: FileStatus::Modified,
+                    additions: 13,
+                    deletions: 0,
+                    changes: 13,
+                    patch,
+                }],
+                omitted_files: 1,
+                more_files_available: true,
+            }),
+        });
+        app.apply(Command::Open);
+        app
+    }
+
+    fn assert_notice_tail_navigation(app: &mut App, notice: &str) {
+        let initial = rendered_text(app, 120, 16);
+        assert!(initial.contains(notice));
+        assert!(!initial.contains("LINE13"));
+
+        app.handle_input(Input::Character('/'));
+        for character in "MATCH".chars() {
+            app.handle_input(Input::Character(character));
+        }
+        app.handle_input(Input::Enter);
+        let searched = rendered_text(app, 120, 16);
+        assert!(searched.contains(notice));
+        assert!(searched.contains("LINE13"));
+
+        app.handle_input(Input::Character('n'));
+        assert!(rendered_text(app, 120, 16).contains("LINE01"));
+        app.handle_input(Input::Character('N'));
+        assert!(rendered_text(app, 120, 16).contains("LINE13"));
+
+        app.apply(Command::Last);
+        let tail = rendered_text(app, 120, 16);
+        assert!(tail.contains(notice));
+        assert!(tail.contains("LINE13"));
     }
 
     #[test]
@@ -990,10 +1050,7 @@ mod tests {
             key,
             outcome: Err(DetailFailure::ResponseTruncated),
         });
-        assert!(
-            rendered_text(&mut app, 120, 32)
-                .contains("GitHub response exceeded 16 MiB; details unavailable")
-        );
+        assert!(rendered_text(&mut app, 120, 32).contains(RESPONSE_TRUNCATED_LABEL));
 
         app.apply(Command::Back);
         app.apply(Command::Open);
@@ -1009,7 +1066,7 @@ mod tests {
                     additions: 0,
                     deletions: 0,
                     changes: 0,
-                    patch: PatchContent::Unavailable,
+                    patch: PatchContent::NoPatch,
                 }],
                 omitted_files: 0,
                 more_files_available: false,
@@ -1017,13 +1074,14 @@ mod tests {
         });
         let unavailable = rendered_text(&mut app, 120, 32);
         assert!(unavailable.contains("assets/image.bin"));
-        assert!(unavailable.contains("Patch not provided by GitHub"));
+        assert!(unavailable.contains(NO_PATCH_LABEL));
     }
 
     #[test]
     fn every_patch_cap_and_detail_failure_state_has_a_precise_presentation() {
         let states = [
             (PatchContent::Empty, "No textual changes"),
+            (PatchContent::NoPatch, NO_PATCH_LABEL),
             (
                 PatchContent::Unavailable,
                 "Patch not provided by GitHub (binary or too large)",
@@ -1107,6 +1165,30 @@ mod tests {
     }
 
     #[test]
+    fn demo_response_truncation_uses_the_live_label_at_minimum_full_size() {
+        let mut app = App::new(Inbox::demo(vec![Repository {
+            identity: RepositoryIdentity {
+                id: 92,
+                owner: "fixture".to_owned(),
+                name: "truncated".to_owned(),
+            },
+            commits: vec![Commit {
+                sha: "cccccccccccccccccccccccccccccccccccccccc".to_owned(),
+                subject: "render truncated response".to_owned(),
+                author: GitHubAuthor {
+                    login: "fixture-user".to_owned(),
+                },
+                authored_at: Utc.with_ymd_and_hms(2024, 1, 15, 12, 0, 0).unwrap(),
+                files: ChildPane::ResponseTruncated,
+            }],
+        }]));
+
+        let output = rendered_text(&mut app, MIN_FULL_WIDTH, MIN_FULL_HEIGHT);
+        assert!(output.contains("GitHub response exceeded 16 MiB;"));
+        assert!(output.contains("details unavailable"));
+    }
+
+    #[test]
     fn long_diff_lines_wrap_resize_and_reach_the_tail_without_panicking() {
         let mut app = demo_patch_app(PatchContent::Text {
             lines: vec![DiffLine {
@@ -1127,6 +1209,139 @@ mod tests {
         app.apply(Command::Last);
         let tail = rendered_text(&mut app, 60, 16);
         assert!(tail.contains("TAIL"));
+    }
+
+    #[test]
+    fn odd_width_diff_layout_preserves_wrapped_characters_and_true_tail() {
+        for width in [61, 79, 120] {
+            let mut visible = demo_patch_app(PatchContent::Text {
+                lines: vec![DiffLine {
+                    kind: DiffLineKind::Addition,
+                    old_line: None,
+                    new_line: Some(1),
+                    text: format!("+{}", "#".repeat(300)),
+                }],
+            });
+            let output = rendered_text(&mut visible, width, 40);
+            assert_eq!(
+                output.matches('#').count(),
+                300,
+                "wrapped characters were clipped at width {width}"
+            );
+
+            let mut tail = demo_patch_app(PatchContent::Text {
+                lines: vec![DiffLine {
+                    kind: DiffLineKind::Addition,
+                    old_line: None,
+                    new_line: Some(1),
+                    text: format!("+{}TRUE-TAIL", "x".repeat(1_200)),
+                }],
+            });
+            rendered_text(&mut tail, width, 16);
+            tail.apply(Command::Open);
+            tail.apply(Command::Open);
+            tail.apply(Command::Open);
+            tail.apply(Command::Last);
+            assert!(
+                rendered_text(&mut tail, width, 16).contains("TRUE-TAIL"),
+                "G did not reach the true wrapped tail at width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_capped_notice_preserves_omitted_size_at_supported_widths() {
+        let label = "Patch capped locally: 1234 lines / 300 KiB omitted";
+        for width in [60, 80] {
+            let mut app = demo_patch_app(PatchContent::Capped {
+                lines: notice_patch_lines(),
+                omitted_lines: 1_234,
+                omitted_bytes: 300 * 1024,
+                reason: PatchCapReason::FileLimit,
+            });
+            let notice_rows = wrap_text(
+                label,
+                ReviewPaneLayout::from_area(Rect::new(0, 0, width, 24)).diff_content_width(),
+            )
+            .len();
+            let output = rendered_diff_prefix(&mut app, width, 24, notice_rows);
+            assert!(output.contains(label), "width {width}: {output:?}");
+            assert_eq!(app.diff_notice_texts(), vec![label]);
+        }
+    }
+
+    #[test]
+    fn file_list_truncation_is_visible_for_every_selected_patch_state() {
+        let cases = [
+            (PatchContent::Empty, "No textual changes"),
+            (PatchContent::NoPatch, NO_PATCH_LABEL),
+            (
+                PatchContent::Unavailable,
+                "Patch not provided by GitHub (binary or too large)",
+            ),
+            (
+                PatchContent::Capped {
+                    lines: Vec::new(),
+                    omitted_lines: 12,
+                    omitted_bytes: 1_024,
+                    reason: PatchCapReason::CommitBudget,
+                },
+                "Omitted by per-commit budget",
+            ),
+        ];
+
+        for (patch, patch_label) in cases {
+            let mut app = live_file_notice_app(patch);
+            let output = rendered_text(&mut app, 120, 32);
+            assert!(
+                output.contains("Only first 300 files shown"),
+                "missing file-list disclosure for {patch_label}: {output:?}"
+            );
+            assert!(
+                output.contains(patch_label),
+                "missing {patch_label}: {output:?}"
+            );
+        }
+
+        let mut file_capped = live_file_notice_app(PatchContent::Capped {
+            lines: notice_patch_lines(),
+            omitted_lines: 1_234,
+            omitted_bytes: 300 * 1024,
+            reason: PatchCapReason::FileLimit,
+        });
+        let output = rendered_text(&mut file_capped, 120, 32);
+        assert!(output.contains("Only first 300 files shown"));
+        assert!(output.contains("Patch capped locally: 1234 lines / 300 KiB omitted"));
+    }
+
+    #[test]
+    fn exact_fit_diff_tail_is_reachable_below_all_notices() {
+        let mut capped = demo_patch_app(PatchContent::Capped {
+            lines: notice_patch_lines(),
+            omitted_lines: 1_234,
+            omitted_bytes: 300 * 1024,
+            reason: PatchCapReason::FileLimit,
+        });
+        capped.apply(Command::Open);
+        capped.apply(Command::Open);
+        capped.apply(Command::Open);
+        assert_notice_tail_navigation(&mut capped, "Patch capped locally");
+
+        let mut files_omitted = live_file_notice_app(PatchContent::Text {
+            lines: notice_patch_lines(),
+        });
+        assert_notice_tail_navigation(&mut files_omitted, "Only first 300 files shown");
+
+        let mut both = live_file_notice_app(PatchContent::Capped {
+            lines: notice_patch_lines(),
+            omitted_lines: 1_234,
+            omitted_bytes: 300 * 1024,
+            reason: PatchCapReason::FileLimit,
+        });
+        let initial = rendered_text(&mut both, 120, 16);
+        assert!(initial.contains("Only first 300 files shown"));
+        assert!(initial.contains("Patch capped locally"));
+        assert_notice_tail_navigation(&mut both, "Only first 300 files shown");
     }
 
     #[test]
