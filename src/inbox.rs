@@ -166,13 +166,14 @@ pub struct CommitDetail {
 pub enum ChildPane<T> {
     Available(Vec<T>),
     Unavailable,
+    ResponseTruncated,
 }
 
 impl<T> ChildPane<T> {
     pub fn as_slice(&self) -> &[T] {
         match self {
             Self::Available(values) => values,
-            Self::Unavailable => &[],
+            Self::Unavailable | Self::ResponseTruncated => &[],
         }
     }
 }

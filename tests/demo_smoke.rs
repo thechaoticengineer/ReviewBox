@@ -38,6 +38,8 @@ fn demo_smoke_binary_succeeds_without_authentication_network_or_persistent_write
         .env("HOME", isolated.path())
         .env("XDG_CONFIG_HOME", isolated.path())
         .env("XDG_DATA_HOME", isolated.path())
+        .env("XDG_STATE_HOME", isolated.path())
+        .env("XDG_CACHE_HOME", isolated.path())
         .current_dir(isolated.path())
         .output()
         .expect("launch smoke command");
@@ -50,7 +52,7 @@ fn demo_smoke_binary_succeeds_without_authentication_network_or_persistent_write
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        "ReviewBox demo smoke: ok (12 frames)"
+        "ReviewBox demo smoke: ok (25 frames)"
     );
     assert!(output.stderr.is_empty());
     assert_eq!(

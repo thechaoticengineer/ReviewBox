@@ -7,6 +7,7 @@ use ratatui::layout::Rect;
 use crate::app::{App, Input, Mode, Pane};
 use crate::fixture::DemoFixture;
 use crate::render;
+use crate::review_state::MemoryReviewStore;
 
 const FULL_WIDTH: u16 = 120;
 const FULL_HEIGHT: u16 = 32;
@@ -24,7 +25,11 @@ pub fn run() -> io::Result<SmokeReport> {
 
     let backend = TestBackend::new(FULL_WIDTH, FULL_HEIGHT);
     let mut terminal = Terminal::new(backend).map_err(io::Error::other)?;
-    let mut app = App::new(fixture);
+    let mut app = App::with_review_store(fixture, Box::new(MemoryReviewStore::default()));
+    ensure(
+        app.fixture().repositories.len() >= 2,
+        "application must retain the demo fixture",
+    )?;
     let mut frames = 0;
 
     let initial = render_frame(&mut terminal, &mut app, &mut frames)?;
@@ -45,19 +50,6 @@ pub fn run() -> io::Result<SmokeReport> {
         "fictional-studio/pixel-garden-demo",
         "j navigation frame",
     )?;
-    input(&mut app, 'k');
-    ensure(app.selected(Pane::Repository) == 0, "k must move up")?;
-
-    input(&mut app, 'G');
-    ensure(
-        app.selected(Pane::Repository) == app.fixture().repositories.len() - 1,
-        "G must move to the last repository",
-    )?;
-    ensure_contains(
-        &render_frame(&mut terminal, &mut app, &mut frames)?,
-        "fictional-foundry/quiet-signal-demo",
-        "G navigation frame",
-    )?;
     input(&mut app, 'g');
     input(&mut app, 'g');
     ensure(
@@ -70,81 +62,193 @@ pub fn run() -> io::Result<SmokeReport> {
         "gg navigation frame",
     )?;
 
-    app.handle_input(Input::HalfPageDown);
+    app.handle_input(Input::Enter);
     ensure(
-        app.selected(Pane::Repository) > 0,
-        "Ctrl-d must move by a bounded half page",
+        app.focus() == Pane::Commit,
+        "Enter must open the commit pane",
     )?;
     ensure_contains(
         &render_frame(&mut terminal, &mut app, &mut frames)?,
-        "Moved down",
-        "half-page navigation frame",
+        "Refine fictional launch screen",
+        "commit navigation frame",
     )?;
-    app.handle_input(Input::HalfPageUp);
-    ensure(
-        app.selected(Pane::Repository) == 0,
-        "Ctrl-u must move back toward the first item",
-    )?;
-
-    app.handle_input(Input::Enter);
-    ensure(
-        app.focus() == Pane::Commit,
-        "Enter must open the child pane",
-    )?;
-    input(&mut app, 'l');
-    ensure(app.focus() == Pane::File, "l must focus the next pane")?;
-    input(&mut app, 'h');
-    ensure(
-        app.focus() == Pane::Commit,
-        "h must focus the previous pane",
-    )?;
-    app.handle_input(Input::Escape);
-    ensure(
-        app.focus() == Pane::Repository,
-        "Escape must return to the parent pane",
-    )?;
-    app.handle_input(Input::Enter);
     app.handle_input(Input::Enter);
     ensure(app.focus() == Pane::File, "Enter must descend to files")?;
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "src/welcome.rs",
+        "file navigation frame",
+    )?;
+    app.handle_input(Input::Enter);
+    ensure(app.focus() == Pane::Diff, "Enter must open the diff pane")?;
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "Welcome aboard",
+        "opened substantial diff frame",
+    )?;
 
+    resize(&mut terminal, 60, 16)?;
+    ensure(
+        app.current_diff_lines().len() > 32,
+        "fixture diff must exceed the 60x16 viewport",
+    )?;
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "Diff",
+        "60x16 diff frame",
+    )?;
+
+    input(&mut app, 'G');
+    ensure(app.scroll(Pane::Diff) > 0, "G must scroll to the diff end")?;
+    let tail = render_frame(&mut terminal, &mut app, &mut frames)?;
+    ensure_contains(&tail, "launch revie", "diff tail frame")?;
+    input(&mut app, 'g');
+    input(&mut app, 'g');
+    ensure(
+        app.scroll(Pane::Diff) == 0,
+        "gg must scroll to the diff start",
+    )?;
+    let head = render_frame(&mut terminal, &mut app, &mut frames)?;
+    ensure_contains(&head, "@@ -1,12 +1,27 @@", "diff head frame")?;
+
+    resize(&mut terminal, FULL_WIDTH, FULL_HEIGHT)?;
     input(&mut app, '/');
-    for character in "routes".chars() {
+    for character in "beacon".chars() {
         input(&mut app, character);
     }
     ensure(
-        app.mode() == Mode::SearchEntry { target: Pane::File },
-        "slash must enter search mode for the focused pane",
+        app.mode() == Mode::SearchEntry { target: Pane::Diff },
+        "slash must enter diff search mode",
     )?;
     ensure_contains(
         &render_frame(&mut terminal, &mut app, &mut frames)?,
-        "/routes",
-        "search entry frame",
+        "/beacon",
+        "diff search-entry frame",
     )?;
     app.handle_input(Input::Enter);
     ensure(
-        app.mode() == Mode::Normal
-            && app.current_file().map(|file| file.path.as_str()) == Some("src/routes.rs"),
-        "Enter must apply search and select the matching fixture file",
+        app.mode() == Mode::Normal && app.status().contains("Match for 'beacon'"),
+        "Enter must apply diff search",
     )?;
     ensure_contains(
         &render_frame(&mut terminal, &mut app, &mut frames)?,
-        "Match for 'routes'",
-        "applied search frame",
+        "Match for 'beacon'",
+        "applied diff search frame",
     )?;
     input(&mut app, 'n');
-    ensure(
-        app.current_file().map(|file| file.path.as_str()) == Some("tests/routes.rs"),
-        "n must select the next matching file",
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "next match for 'beacon'",
+        "forward repeated search frame",
+    )?;
+    for _ in 0..app.current_diff_lines().len() {
+        if app.status().contains("wrapped") {
+            break;
+        }
+        input(&mut app, 'n');
+    }
+    ensure(app.status().contains("wrapped"), "n must wrap forward")?;
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "(wrapped)",
+        "wrapped forward search frame",
     )?;
     input(&mut app, 'N');
     ensure(
-        app.current_file().map(|file| file.path.as_str()) == Some("src/routes.rs"),
-        "N must return to the previous matching file",
+        app.status().contains("previous match") && app.status().contains("wrapped"),
+        "N must wrap backward",
     )?;
     ensure_contains(
         &render_frame(&mut terminal, &mut app, &mut frames)?,
-        "previous match for 'routes'",
-        "repeated search frame",
+        "previous match for 'beacon'",
+        "wrapped backward search frame",
+    )?;
+
+    input(&mut app, 'm');
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "✓",
+        "reviewed marker frame",
+    )?;
+    input(&mut app, 'm');
+    let unreviewed = render_frame(&mut terminal, &mut app, &mut frames)?;
+    ensure_not_contains(&unreviewed, "✓", "unreviewed marker frame")?;
+    ensure_contains(
+        &unreviewed,
+        "Marked commit unreviewed",
+        "unreviewed status frame",
+    )?;
+
+    app.handle_input(Input::Escape);
+    search(&mut app, "fictional-orbit-map.bin")?;
+    ensure(
+        app.current_file().map(|file| file.path.as_str()) == Some("assets/fictional-orbit-map.bin"),
+        "file search must select the unavailable binary fixture",
+    )?;
+    app.handle_input(Input::Enter);
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "Patch not provided by GitHub (binary or too large)",
+        "unavailable patch frame",
+    )?;
+
+    app.handle_input(Input::Escape);
+    search(&mut app, "fictional-catalog.rs")?;
+    app.handle_input(Input::Enter);
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "Patch capped locally",
+        "locally capped patch frame",
+    )?;
+
+    app.handle_input(Input::Escape);
+    app.handle_input(Input::Escape);
+    input(&mut app, 'j');
+    ensure(
+        app.current_commit()
+            .is_some_and(|commit| commit.subject == "Simulate a fictional oversized response"),
+        "commit navigation must select the truncated-detail fixture",
+    )?;
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "GitHub response exceeded 16 MiB; details unavailable",
+        "truncated response frame",
+    )?;
+
+    input(&mut app, 'm');
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "✓",
+        "reviewed truncated commit frame",
+    )?;
+    input(&mut app, 'f');
+    let remaining = render_frame(&mut terminal, &mut app, &mut frames)?;
+    ensure_contains(
+        &remaining,
+        "Showing remaining commits only",
+        "remaining-only filter frame",
+    )?;
+    ensure_not_contains(
+        &remaining,
+        "Simulate a fictional oversized response",
+        "remaining-only filter frame",
+    )?;
+
+    let (_, total) = app.review_progress();
+    for _ in 0..total {
+        if app.all_reviewed_empty() {
+            break;
+        }
+        input(&mut app, 'm');
+    }
+    ensure(
+        app.all_reviewed_empty() && app.review_progress() == (total, total),
+        "marking every remaining commit must reach all-reviewed state",
+    )?;
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "ALL REVIEWED",
+        "all-reviewed frame",
     )?;
 
     input(&mut app, '?');
@@ -152,42 +256,25 @@ pub fn run() -> io::Result<SmokeReport> {
         matches!(app.mode(), Mode::Help { .. }),
         "question mark must open help",
     )?;
-    ensure_contains(
-        &render_frame(&mut terminal, &mut app, &mut frames)?,
-        "Keyboard help",
-        "help frame",
-    )?;
+    let help = render_frame(&mut terminal, &mut app, &mut frames)?;
+    for binding in [
+        "n / N",
+        "mark commit reviewed / unreviewed",
+        "show remaining / all commits",
+    ] {
+        ensure_contains(&help, binding, "help frame")?;
+    }
     app.handle_input(Input::Escape);
-    ensure(
-        app.mode() == Mode::Normal && app.focus() == Pane::File,
-        "Escape must close help and restore focus",
-    )?;
+    ensure(app.mode() == Mode::Normal, "Escape must close help")?;
 
-    app.handle_input(Input::Enter);
-    ensure(app.focus() == Pane::Diff, "Enter must open the diff pane")?;
-    resize(&mut terminal, 60, 16)?;
-    let resized = render_frame(&mut terminal, &mut app, &mut frames)?;
-    ensure_contains(&resized, "Diff", "resized full layout")?;
-    input(&mut app, 'G');
-    ensure(app.scroll(Pane::Diff) > 0, "G must scroll to the diff end")?;
+    input(&mut app, 'f');
+    let restored = render_frame(&mut terminal, &mut app, &mut frames)?;
     ensure_contains(
-        &render_frame(&mut terminal, &mut app, &mut frames)?,
-        "Moved to last position",
-        "diff-end navigation frame",
+        &restored,
+        "Refine fictional launch screen",
+        "restored all-commits frame",
     )?;
-    input(&mut app, 'g');
-    input(&mut app, 'g');
-    ensure(
-        app.scroll(Pane::Diff) == 0,
-        "gg must scroll to the diff start",
-    )?;
-    app.handle_input(Input::HalfPageDown);
-    ensure(app.scroll(Pane::Diff) > 0, "Ctrl-d must scroll the diff")?;
-    app.handle_input(Input::HalfPageUp);
-    ensure(
-        app.scroll(Pane::Diff) == 0,
-        "Ctrl-u must scroll the diff up",
-    )?;
+    ensure_contains(&restored, "all", "restored filter label")?;
 
     resize(&mut terminal, 40, 8)?;
     ensure_contains(
@@ -200,6 +287,22 @@ pub fn run() -> io::Result<SmokeReport> {
     ensure(app.should_quit(), "q must request a clean normal-mode exit")?;
 
     Ok(SmokeReport { frames })
+}
+
+fn search(app: &mut App, query: &str) -> io::Result<()> {
+    input(app, '/');
+    for character in query.chars() {
+        input(app, character);
+    }
+    ensure(
+        matches!(app.mode(), Mode::SearchEntry { .. }),
+        "slash must enter search mode",
+    )?;
+    app.handle_input(Input::Enter);
+    ensure(
+        app.mode() == Mode::Normal && app.status().contains("Match for"),
+        "search must find its fictional target",
+    )
 }
 
 fn input(app: &mut App, character: char) {
@@ -250,5 +353,12 @@ fn ensure_contains(frame: &str, expected: &str, context: &str) -> io::Result<()>
     ensure(
         frame.contains(expected),
         &format!("{context} must contain {expected:?}"),
+    )
+}
+
+fn ensure_not_contains(frame: &str, unexpected: &str, context: &str) -> io::Result<()> {
+    ensure(
+        !frame.contains(unexpected),
+        &format!("{context} must not contain {unexpected:?}"),
     )
 }

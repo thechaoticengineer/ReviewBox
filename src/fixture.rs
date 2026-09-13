@@ -2,8 +2,8 @@ use chrono::{TimeZone, Utc};
 
 use crate::github::parse_patch_text;
 use crate::inbox::{
-    ChildPane, Commit, DiffLineKind, FileChange, FileStatus, GitHubAuthor, Inbox, PatchContent,
-    Repository, RepositoryIdentity,
+    ChildPane, Commit, DiffLineKind, FileChange, FileStatus, GitHubAuthor, Inbox, PatchCapReason,
+    PatchContent, Repository, RepositoryIdentity,
 };
 
 /// Builds the fictional, fully populated inbox used by `--demo` and tests.
@@ -65,6 +65,10 @@ fn repository(id: u64, owner: &str, name: &str, commits: Vec<Commit>) -> Reposit
 }
 
 fn commit(sha: &str, subject: &str, files: Vec<FileChange>) -> Commit {
+    commit_with_files(sha, subject, ChildPane::Available(files))
+}
+
+fn commit_with_files(sha: &str, subject: &str, files: ChildPane<FileChange>) -> Commit {
     Commit {
         sha: sha.to_owned(),
         subject: subject.to_owned(),
@@ -72,7 +76,7 @@ fn commit(sha: &str, subject: &str, files: Vec<FileChange>) -> Commit {
             login: "fictional-reviewer".to_owned(),
         },
         authored_at: Utc.with_ymd_and_hms(2024, 1, 15, 12, 0, 0).unwrap(),
-        files: ChildPane::Available(files),
+        files,
     }
 }
 
@@ -83,10 +87,10 @@ fn primary_commits() -> Vec<Commit> {
             "Refine fictional launch screen",
             primary_files(),
         ),
-        commit(
+        commit_with_files(
             "b2c3d4e000000000000000000000000000000000",
-            "Tune sample twilight palette",
-            small_files(),
+            "Simulate a fictional oversized response",
+            ChildPane::ResponseTruncated,
         ),
         commit(
             "c3d4e5f000000000000000000000000000000000",
@@ -141,6 +145,8 @@ fn primary_files() -> Vec<FileChange> {
         file("src/routes.rs", ROUTES_DIFF),
         file("tests/routes.rs", TEST_DIFF),
         file("README.md", DOC_DIFF),
+        unavailable_file("assets/fictional-orbit-map.bin"),
+        capped_file("generated/fictional-catalog.rs"),
         file("notes/empty-placeholder.txt", &[]),
     ]
 }
@@ -179,21 +185,83 @@ fn file(path: &str, lines: &[&str]) -> FileChange {
     }
 }
 
+fn unavailable_file(path: &str) -> FileChange {
+    FileChange {
+        path: path.to_owned(),
+        previous_path: None,
+        status: FileStatus::Modified,
+        additions: 0,
+        deletions: 0,
+        changes: 1,
+        patch: PatchContent::Unavailable,
+    }
+}
+
+fn capped_file(path: &str) -> FileChange {
+    let retained = parse_patch_text(
+        "@@ -1,2 +1,4 @@\n pub fn catalog() {\n+    add_fictional_entry(\"Aster\");\n+    add_fictional_entry(\"Brindle\");\n }",
+    );
+    FileChange {
+        path: path.to_owned(),
+        previous_path: None,
+        status: FileStatus::Modified,
+        additions: 2,
+        deletions: 0,
+        changes: 2,
+        patch: PatchContent::Capped {
+            lines: retained.lines().to_vec(),
+            omitted_lines: 4_992,
+            omitted_bytes: 263_168,
+            reason: PatchCapReason::FileLimit,
+        },
+    }
+}
+
 const WELCOME_DIFF: &[&str] = &[
-    "@@ -1,8 +1,12 @@",
+    "@@ -1,12 +1,27 @@",
     " pub fn greeting(name: &str) -> String {",
     "-    format!(\"Hello, {name}\")",
     "+    let heading = \"Welcome aboard\";",
     "+    format!(\"{heading}, {name}!\")",
     " }",
     "+",
-    "+#[cfg(test)]",
-    "+mod tests {",
-    "+    // Fictional example assertion.",
+    "+pub fn beacon_sequence() -> Vec<&'static str> {",
+    "+    vec![",
+    "+        \"first fictional beacon\",",
+    "+        \"second fictional beacon\",",
+    "+        \"third fictional beacon\",",
+    "+    ]",
+    "+}",
+    "+",
+    "+pub fn launch_checklist() -> Vec<&'static str> {",
+    "+    vec![",
+    "+        \"seal the sample hatch\",",
+    "+        \"count the paper satellites\",",
+    "+        \"tune the imaginary receiver\",",
+    "+        \"confirm the painted horizon\",",
+    "+        \"wave to the cardboard moon\",",
+    "+    ]",
     "+}",
     " ",
     " pub fn version() -> &'static str {",
     "     \"demo-1\"",
+    " }",
+    "@@ -24,6 +39,22 @@ pub fn launch() -> LaunchState {",
+    "     let state = LaunchState::Preparing;",
+    "+    record(\"first fictional beacon acknowledged\");",
+    "+    record(\"second fictional beacon acknowledged\");",
+    "+    record(\"third fictional beacon acknowledged\");",
+    "+    record(\"crew manifest checked\");",
+    "+    record(\"sample route selected\");",
+    "+    record(\"practice countdown started\");",
+    "+    record(\"practice countdown paused\");",
+    "+    record(\"paper map unfolded\");",
+    "+    record(\"fictional weather accepted\");",
+    "+    record(\"demonstration telemetry enabled\");",
+    "+    record(\"this deliberately long fictional telemetry message demonstrates Unicode-safe soft wrapping across a narrow diff pane without hiding any review content from the reader\");",
+    "+    record(\"all systems remain imaginary\");",
+    "+    record(\"launch review complete\");",
+    "     state",
     " }",
 ];
 const THEME_DIFF: &[&str] = &[
@@ -272,10 +340,44 @@ mod tests {
                     commit.sha.len() == 40
                         && commit.sha.bytes().all(|byte| byte.is_ascii_hexdigit())
                         && !commit.subject.is_empty()
-                        && !commit.files.as_slice().is_empty()
+                        && (!commit.files.as_slice().is_empty()
+                            || matches!(&commit.files, ChildPane::ResponseTruncated))
                 })
         );
         assert!(fixture.child_panes_available());
-        assert!(WELCOME_DIFF.len() > 10);
+        assert!(WELCOME_DIFF.len() > 32);
+        assert!(
+            WELCOME_DIFF
+                .iter()
+                .filter(|line| line.contains("@@"))
+                .count()
+                > 1
+        );
+
+        let primary = &fixture.repositories[0].commits[0];
+        assert!(
+            primary
+                .files
+                .as_slice()
+                .iter()
+                .any(|file| { matches!(&file.patch, PatchContent::Unavailable) })
+        );
+        assert!(
+            primary
+                .files
+                .as_slice()
+                .iter()
+                .any(|file| { matches!(&file.patch, PatchContent::Capped { .. }) })
+        );
+        assert!(primary.files.as_slice().iter().any(|file| {
+            file.patch
+                .lines()
+                .iter()
+                .any(|line| line.text.chars().count() > 160)
+        }));
+        assert!(matches!(
+            &fixture.repositories[0].commits[1].files,
+            ChildPane::ResponseTruncated
+        ));
     }
 }

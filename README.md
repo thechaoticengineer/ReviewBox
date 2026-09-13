@@ -4,12 +4,12 @@ A keyboard-first terminal review inbox for commits across GitHub projects.
 
 See [PRODUCT.md](PRODUCT.md) for the accepted requirements and delivery order.
 
-## Current status: polished diff review workflow
+## Current status: diff review and progress
 
 Implemented now:
 
-- A runnable Rust terminal application with repository, commit, file, and
-  diff-like panes populated from deterministic fictional fixtures.
+- A runnable Rust terminal application with repository, commit, file, and diff
+  panes populated from deterministic fictional fixtures or live GitHub data.
 - Neovim-style normal-mode focus, selection, scrolling, open/back, repeated
   search, and contextual help behavior.
 - Bounded selections and scrolling, resize-aware redraws, and a compact fallback
@@ -74,13 +74,11 @@ Implemented now:
   GitHub numeric repository IDs and complete lowercase commit SHAs in a
   deterministic, versioned JSON file at
   `$XDG_DATA_HOME/reviewbox/review-state.json`, or
-  `$HOME/.local/share/reviewbox/review-state.json` when XDG data home is not an
-  absolute path. Updates use same-directory atomic replacement and refuse to
-  overwrite malformed or unsupported state. Marks load before the terminal UI,
-  remain visible in the unfiltered inbox, and a failed save leaves the displayed
-  mark unchanged with an error. The remaining-only view hides reviewed commits
-  and repositories without remaining work and reports an explicit all-reviewed
-  state.
+  `$HOME/.local/share/reviewbox/review-state.json` when `XDG_DATA_HOME` is unset,
+  empty, or not absolute. Marks load before the terminal UI, remain visible in
+  the unfiltered inbox, and a failed save leaves the displayed mark unchanged
+  with an error. The remaining-only view hides reviewed commits and repositories
+  without remaining work and reports an explicit all-reviewed state.
 - A shared live/demo unified-diff viewer with old/new-number gutters,
   syntax-aware hunk/addition/deletion styling, Unicode-safe soft wrapping, and
   scroll behavior that reaches the actual tail of long patches after resize.
@@ -147,11 +145,13 @@ Run the same fixture/state/rendering integration noninteractively with:
 cargo run -- --demo-smoke
 ```
 
-The smoke command does not initialize a real terminal or event reader. It
-renders representative frames in memory, exercises navigation, search, help,
-resize, and clean exit transitions, prints a short success message, and exits
-nonzero if an invariant or render operation fails. It also needs no credentials,
-network, or persistent storage.
+The smoke command does not initialize a real terminal or event reader. It uses
+the in-memory review store and renders representative frames for repository,
+commit, file, and long-diff navigation; forward/backward wrapped search;
+reviewed toggling and remaining filtering; binary, capped, and oversized
+responses; help; resize; and clean exit. It prints a short success message and
+exits nonzero if an invariant or render operation fails. It needs no credentials
+or network and does not write persistent state.
 
 ## Implemented modes and keybindings
 
@@ -160,56 +160,64 @@ normal navigation keys do not navigate while either overlay is active. The
 status line shows the mode, focused pane, a pending `g` prefix, and the latest
 action.
 
-Normal mode:
+| Mode | Keys | Action |
+| --- | --- | --- |
+| Normal | `h` / `l` | Focus the previous / next meaningful pane. |
+| Normal | `j` / `k` | Move a list selection or scroll the focused diff down / up. |
+| Normal | `gg` / `G` | Move to the first / last position. A lone `g` waits for a second `g`; another key cancels the prefix, then performs its normal action. |
+| Normal | `Ctrl-d` / `Ctrl-u` | Move down / up by half the focused pane's usable height, with a minimum movement of one. |
+| Normal | `Enter` | Open repository → commit → file → diff. Opening a live commit starts an asynchronous detail request; `Enter` retries a failed request. |
+| Normal | `Escape` | Return to the parent pane. At Repository it stays put. |
+| Normal | `/` | Enter search for the focused pane. |
+| Normal | `n` / `N` | Repeat the saved case-insensitive search forward / backward, wrapping at either end. |
+| Normal | `m` | Toggle the selected commit reviewed/unreviewed from Commit, File, or Diff. A live mark changes only after a successful save. |
+| Normal | `f` | Toggle all commits / remaining commits. This filter is not persisted. |
+| Normal | `?` | Open contextual keyboard help. |
+| Normal | `q` | Quit and restore the terminal. |
+| Search | Printable characters | Append text, including characters that are navigation keys in Normal mode. |
+| Search | `Backspace` | Remove the last query character. |
+| Search | `Enter` | Apply the query in the focused pane and return to Normal mode. The query remains available to `n` / `N`, even after no match. |
+| Search | `Escape` | Cancel without moving and return to Normal mode. |
+| Help | `Escape` | Close help and restore its prior focus. Other non-global keys are ignored. |
+| Global | `Ctrl-c` | Quit from Normal, Search, or Help and restore the terminal. |
 
-- `h` / `l`: focus the previous / next meaningful pane.
-- `j` / `k`: move the selection in a list, or scroll the focused diff.
-- `gg` / `G`: move to the first / last position in the focused pane. A lone
-  `g` waits for one more `g`; any unrelated key safely cancels the prefix before
-  performing its own action.
-- `Ctrl-d` / `Ctrl-u`: move down / up by half of the focused pane's usable
-  height, with a minimum movement of one.
-- `Enter`: descend from repository to commit to file to diff when a child is
-  available. Opening a live commit starts its detail request without blocking
-  input; a failed request can be retried with `Enter`.
-- `Escape`: return to the parent pane. At the repository pane it stays put and
-  never quits unexpectedly.
-- `/`: enter search-entry mode for the focused pane. Typed characters—including
-  normal-mode navigation letters—edit the query. `Backspace` edits, `Enter`
-  selects or scrolls to the first case-insensitive match with one wrap, and
-  `Escape` cancels. Empty and no-match searches leave the current position
-  unchanged and report their result in the status line.
-- `n` / `N`: repeat the last search forward / backward in the currently focused
-  pane. Repeats use the saved case-insensitive query, wrap at either end, and
-  report when there is no prior query or no match in that pane.
-- `?`: open contextual keyboard help. `Escape` closes it and restores the prior
-  pane focus.
-- `m`: toggle the selected commit reviewed/unreviewed from the commit, file, or
-  diff pane. Live changes are reported only after the state file is saved.
-- `f`: toggle between all commits and remaining commits. This view preference is
-  intentionally not persisted.
-- `q`: quit from normal mode and restore the terminal.
-- `Ctrl-c`: quit globally, including from search or help, and restore the
-  terminal.
-
-Search mode:
-
-- Printable characters, including normal-mode binding characters, append to the
-  query; `Backspace` removes the last character.
-- `Enter` searches the focused pane case-insensitively from the current position
-  with one wrap, then returns to normal mode. The entered query remains available
-  for `n` / `N`, including after a no-match result. A match selects or scrolls to
-  its first occurrence. Empty and no-match searches keep the previous position.
-- `Escape` cancels the query and returns to normal mode without moving.
-
-Help mode:
-
-- `Escape` closes help and restores the pane that was focused when help opened.
-- Other keys are ignored, except global `Ctrl-c`.
+Search starts after the current list selection or diff position, selects or
+scrolls to the first match, and wraps once. Empty and no-match searches do not
+move. Results, missing prior queries, and wraparound are reported in the status
+line. Search text is retained only for the current process.
 
 The status line shows the active mode, a pending `g`, the focused pane, and the
 most recent action. Search and help remain usable after a resize and fall back
 to clipped, panic-free overlays in very small terminals.
+
+## Reviewed-state storage and privacy
+
+Live mode reads reviewed progress from exactly one XDG user-data file:
+
+- If `XDG_DATA_HOME` is an absolute path:
+  `$XDG_DATA_HOME/reviewbox/review-state.json`.
+- Otherwise, if `HOME` is an absolute path:
+  `$HOME/.local/share/reviewbox/review-state.json`.
+- If neither location is usable, browsing continues with a warning and review
+  marks are disabled rather than written relative to the working directory or a
+  repository.
+
+Each mark is keyed by GitHub's numeric repository ID and the complete commit SHA,
+not by owner/name, repository position, abbreviated SHA, subject, or selected
+day. A repository rename therefore does not invalidate progress. The versioned
+JSON contains no tokens, repository names, owners, branches, subjects, file
+paths, patches, comment drafts, or other repository content.
+
+Each toggle re-reads the current file, applies one mark change, and atomically
+replaces the file from a same-directory temporary file. This narrows, but does
+not eliminate, a last-writer race if two ReviewBox instances save at nearly the
+same time; no inter-process file lock is used. Missing state is treated as empty.
+A malformed file, unsupported version, permission error, or read error leaves
+live browsing available, displays a persistent sanitized warning, disables mark
+changes for that run, and is never silently overwritten. Save failures leave the
+visible mark unchanged. The `f` filter itself is process-local and always starts
+in the all-commits view; only reviewed marks survive restart. Demo and demo-smoke
+use memory-only marks and never construct the file-backed store.
 
 ## GitHub loading behavior and limitations
 
@@ -258,6 +266,23 @@ repository/commit/file/diff workflow and typed patch model. Commit details are
 requested only when a live commit is explicitly opened; file lists beyond 300
 entries and command responses beyond 16 MiB are disclosed as incomplete rather
 than presented as complete.
+
+GitHub's commit response can omit a textual `patch`, notably for binary or large
+changes. ReviewBox labels that file as “binary or too large” because the omitted
+response does not reliably distinguish those causes; it never invents content.
+Locally retained details are limited to the first 300 files, 256 KiB or 5,000
+patch lines per file, 2,000 characters per logical diff line, and 2 MiB of patch
+text per commit. The in-process detail cache retains at most 16 commits. A file
+or commit-budget cap, additional file page, or response over the 16 MiB command
+limit is shown explicitly. Available diff text remains scrollable and long lines
+soft-wrap instead of being horizontally discarded.
+
+Authentication, missing `gh`, offline/transport, permission/not-found,
+rate-limit, malformed-response, malformed-JSON, and other API/command failures
+are separate sanitized states. These displays never include stderr, response
+bodies, repository names, owners, branches, commit SHAs, or subjects. Partial
+repository/branch failures retain usable results and mark coverage incomplete;
+fatal discovery failures and genuinely empty successful loads remain distinct.
 
 Implementation assumptions were checked against the official GitHub
 documentation for the [authenticated user](https://docs.github.com/en/rest/users/users#get-the-authenticated-user),

@@ -316,6 +316,26 @@ fn draw_diff_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
             format!("  {label}"),
             Style::default().fg(Color::Red),
         )]
+    } else if matches!(app.inbox().source, InboxSource::Demo)
+        && matches!(
+            app.current_commit().map(|commit| &commit.files),
+            Some(crate::inbox::ChildPane::ResponseTruncated)
+        )
+    {
+        vec![Line::styled(
+            "  GitHub response exceeded 16 MiB; details unavailable",
+            Style::default().fg(Color::Red),
+        )]
+    } else if matches!(app.inbox().source, InboxSource::Demo)
+        && matches!(
+            app.current_commit().map(|commit| &commit.files),
+            Some(crate::inbox::ChildPane::Unavailable)
+        )
+    {
+        vec![Line::styled(
+            "  Commit file list unavailable",
+            Style::default().fg(Color::Yellow),
+        )]
     } else if let Some(file) = app.current_file() {
         match &file.patch {
             PatchContent::Empty => vec![Line::styled(
