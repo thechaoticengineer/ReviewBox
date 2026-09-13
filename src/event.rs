@@ -101,9 +101,53 @@ pub trait CommentRequester {
 }
 
 /// Network-incapable comment service for demo, smoke, and fixture runs.
-#[derive(Default)]
 pub struct FakeComments {
     results: VecDeque<CommentResult>,
+    comments: Vec<ExistingComment>,
+    publish_outcomes: VecDeque<PublishOutcome>,
+    publish_count: usize,
+}
+
+impl Default for FakeComments {
+    fn default() -> Self {
+        Self {
+            results: VecDeque::new(),
+            comments: vec![
+                ExistingComment {
+                    id: 1,
+                    author: Some("fictional-reviewer".to_owned()),
+                    created_at: chrono::DateTime::from_timestamp(1_704_110_400, 0)
+                        .expect("fixed demo timestamp"),
+                    anchor: ExistingCommentAnchor::Commit,
+                    body: "Fictional existing feedback for the offline demo.".to_owned(),
+                },
+                ExistingComment {
+                    id: 2,
+                    author: Some("fictional-line-reviewer".to_owned()),
+                    created_at: chrono::DateTime::from_timestamp(1_704_110_460, 0)
+                        .expect("fixed demo timestamp"),
+                    anchor: ExistingCommentAnchor::Line {
+                        path: "src/welcome.rs".to_owned(),
+                        position: Some(3),
+                        line: Some(2),
+                    },
+                    body: "Fictional existing line feedback for the offline demo.".to_owned(),
+                },
+            ],
+            publish_outcomes: VecDeque::new(),
+            publish_count: 0,
+        }
+    }
+}
+
+impl FakeComments {
+    pub fn queue_publish_outcome(&mut self, outcome: PublishOutcome) {
+        self.publish_outcomes.push_back(outcome);
+    }
+
+    pub fn publish_count(&self) -> usize {
+        self.publish_count
+    }
 }
 
 impl CommentRequester for FakeComments {
@@ -115,36 +159,66 @@ impl CommentRequester for FakeComments {
                 reconcile_target,
                 marker,
                 ..
-            } => self.results.push_back(CommentResult {
-                request_id,
-                key,
-                target: reconcile_target,
-                outcome: crate::app::CommentResultOutcome::Loaded(Ok(ExistingComments {
-                    comments: vec![ExistingComment {
-                        id: 1,
-                        author: Some("fictional-reviewer".to_owned()),
-                        created_at: chrono::DateTime::from_timestamp(1_704_110_400, 0)
-                            .expect("fixed demo timestamp"),
-                        anchor: ExistingCommentAnchor::Commit,
-                        body: "Fictional existing feedback for the offline demo.".to_owned(),
-                    }],
-                    complete: true,
-                    marker_found: marker.is_some(),
-                })),
-            }),
+            } => {
+                let marker_found = marker.as_ref().is_some_and(|marker| {
+                    self.comments
+                        .iter()
+                        .any(|comment| comment.body.contains(marker))
+                });
+                self.results.push_back(CommentResult {
+                    request_id,
+                    key,
+                    target: reconcile_target,
+                    outcome: crate::app::CommentResultOutcome::Loaded(Ok(ExistingComments {
+                        comments: self.comments.clone(),
+                        complete: true,
+                        marker_found,
+                    })),
+                });
+            }
             CommentEffect::Publish {
                 request_id,
                 key,
                 target,
+                body_with_marker,
                 ..
-            } => self.results.push_back(CommentResult {
-                request_id,
-                key,
-                target: Some(target),
-                outcome: crate::app::CommentResultOutcome::Published(PublishOutcome::Created {
-                    id: 1,
-                }),
-            }),
+            } => {
+                self.publish_count = self.publish_count.saturating_add(1);
+                let outcome =
+                    self.publish_outcomes
+                        .pop_front()
+                        .unwrap_or(PublishOutcome::Created {
+                            id: self.publish_count as u64 + 2,
+                        });
+                if let PublishOutcome::Created { id } = &outcome {
+                    let anchor = match target.anchor() {
+                        crate::comment_draft::CommentAnchor::Commit => {
+                            ExistingCommentAnchor::Commit
+                        }
+                        crate::comment_draft::CommentAnchor::Line(line) => {
+                            ExistingCommentAnchor::Line {
+                                path: line.path.clone(),
+                                position: Some(line.position),
+                                line: None,
+                            }
+                        }
+                    };
+                    self.comments.push(ExistingComment {
+                        id: *id,
+                        author: Some("fictional-publisher".to_owned()),
+                        created_at: chrono::DateTime::from_timestamp(1_704_110_520, 0)
+                            .expect("fixed demo timestamp"),
+                        anchor,
+                        body: body_with_marker,
+                    });
+                }
+                self.results.push_back(CommentResult {
+                    request_id,
+                    key,
+                    target: Some(target),
+                    outcome: crate::app::CommentResultOutcome::Published(outcome),
+                });
+            }
             CommentEffect::Cancel { .. } => {}
         }
     }

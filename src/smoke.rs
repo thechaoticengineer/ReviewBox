@@ -1,19 +1,135 @@
 use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
+use chrono::{TimeZone, Utc};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 
-use crate::app::{App, Input, Mode, Pane};
+use crate::app::{App, AttemptSource, Input, Mode, Pane};
+use crate::comment_draft::{MemoryDraftStore, SubmissionAttempt};
 use crate::event::{CommentRequester, FakeComments};
+use crate::external_editor::{
+    EditorCommand, EditorError, EditorOutcome, EditorProcess, EditorTempFiles, edit_draft,
+};
 use crate::fixture::DemoFixture;
-use crate::github::RESPONSE_TRUNCATED_LABEL;
+use crate::github::{CommentFailure, CommentFailureKind, PublishOutcome, RESPONSE_TRUNCATED_LABEL};
 use crate::render;
 use crate::render::NO_PATCH_LABEL;
 use crate::review_state::MemoryReviewStore;
+use crate::terminal::{TerminalGuard, TerminalOps};
 
 const FULL_WIDTH: u16 = 120;
 const FULL_HEIGHT: u16 = 32;
+const FIXED_ATTEMPTS: [&str; 2] = [
+    "0123456789abcdef0123456789abcdef",
+    "fedcba9876543210fedcba9876543210",
+];
+const EDITOR_REPLACEMENT: &str = "Fictional external-editor replacement.";
+
+#[derive(Debug, Default)]
+struct SmokeAttemptSource(AtomicUsize);
+
+impl AttemptSource for SmokeAttemptSource {
+    fn next(&self) -> Result<SubmissionAttempt, ()> {
+        let index = self.0.fetch_add(1, Ordering::Relaxed);
+        SubmissionAttempt::new(
+            FIXED_ATTEMPTS.get(index).copied().ok_or(())?,
+            Utc.with_ymd_and_hms(2024, 1, 15, 12, 3, 0).unwrap(),
+        )
+        .map_err(|_| ())
+    }
+
+    fn now(&self) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2024, 1, 15, 12, 3, 0).unwrap()
+    }
+}
+
+struct RecordingTerminalOps(Arc<Mutex<Vec<&'static str>>>);
+
+impl RecordingTerminalOps {
+    fn record(&self, operation: &'static str) {
+        self.0.lock().expect("smoke terminal log").push(operation);
+    }
+}
+
+impl TerminalOps for RecordingTerminalOps {
+    fn enable_raw_mode(&mut self) -> io::Result<()> {
+        self.record("enable_raw_mode");
+        Ok(())
+    }
+
+    fn enter_alternate_screen(&mut self) -> io::Result<()> {
+        self.record("enter_alternate_screen");
+        Ok(())
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.record("hide_cursor");
+        Ok(())
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.record("show_cursor");
+        Ok(())
+    }
+
+    fn leave_alternate_screen(&mut self) -> io::Result<()> {
+        self.record("leave_alternate_screen");
+        Ok(())
+    }
+
+    fn disable_raw_mode(&mut self) -> io::Result<()> {
+        self.record("disable_raw_mode");
+        Ok(())
+    }
+}
+
+struct MemoryEditorFiles {
+    body: Arc<Mutex<String>>,
+    log: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl EditorTempFiles for MemoryEditorFiles {
+    fn create(&mut self, body: &str) -> Result<PathBuf, EditorError> {
+        self.log.lock().expect("smoke editor log").push("create");
+        *self.body.lock().expect("smoke editor body") = body.to_owned();
+        Ok(PathBuf::from("/fictional-private/draft.md"))
+    }
+
+    fn read(&mut self, _path: &Path) -> Result<String, EditorError> {
+        self.log.lock().expect("smoke editor log").push("read");
+        Ok(self.body.lock().expect("smoke editor body").clone())
+    }
+
+    fn cleanup(&mut self, _path: &Path) -> Result<(), EditorError> {
+        self.log.lock().expect("smoke editor log").push("cleanup");
+        Ok(())
+    }
+}
+
+struct ReplacingEditor {
+    body: Arc<Mutex<String>>,
+    log: Arc<Mutex<Vec<&'static str>>>,
+    runs: usize,
+}
+
+impl EditorProcess for ReplacingEditor {
+    fn run(&mut self, command: &EditorCommand, path: &Path) -> Result<bool, EditorError> {
+        self.log.lock().expect("smoke editor log").push("launch");
+        self.runs = self.runs.saturating_add(1);
+        if command.program != "nvim"
+            || command.args != ["--clean"]
+            || path != Path::new("/fictional-private/draft.md")
+        {
+            return Err(EditorError::Launch);
+        }
+        *self.body.lock().expect("smoke editor body") = EDITOR_REPLACEMENT.to_owned();
+        Ok(true)
+    }
+}
 
 pub struct SmokeReport {
     pub frames: usize,
@@ -28,7 +144,12 @@ pub fn run() -> io::Result<SmokeReport> {
 
     let backend = TestBackend::new(FULL_WIDTH, FULL_HEIGHT);
     let mut terminal = Terminal::new(backend).map_err(io::Error::other)?;
-    let mut app = App::with_review_store(fixture, Box::new(MemoryReviewStore::default()));
+    let mut app = App::with_stores(
+        fixture,
+        Box::new(MemoryReviewStore::default()),
+        Box::new(MemoryDraftStore::default()),
+    );
+    app.set_attempt_source(Box::new(SmokeAttemptSource::default()));
     ensure(
         app.fixture().repositories.len() >= 2,
         "application must retain the demo fixture",
@@ -80,7 +201,7 @@ pub fn run() -> io::Result<SmokeReport> {
         matches!(app.mode(), Mode::Edit { .. }),
         "c must open the commit draft editor",
     )?;
-    for character in "fictional\nreview".chars() {
+    for character in "fictional hjklq\nreview".chars() {
         app.handle_input(if character == '\n' {
             Input::Enter
         } else {
@@ -100,6 +221,11 @@ pub fn run() -> io::Result<SmokeReport> {
         "commit draft marker frame",
     )?;
     input(&mut app, 'c');
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "fictional hjklq",
+        "reopened commit draft frame",
+    )?;
     app.handle_input(Input::Cancel);
     ensure(
         app.mode() == Mode::Normal && app.draft_count() == 1,
@@ -130,20 +256,53 @@ pub fn run() -> io::Result<SmokeReport> {
         matches!(app.mode(), Mode::Edit { .. }),
         "c must open an eligible line draft",
     )?;
-    input(&mut app, 'q');
+    for character in "fictional q line draft".chars() {
+        input(&mut app, character);
+    }
     app.handle_input(Input::Escape);
     ensure(
         !app.should_quit() && app.draft_count() == 2,
         "q must insert in EDIT and Escape must save the line draft",
     )?;
 
-    let mut comments = FakeComments::default();
-    input(&mut app, 'C');
-    drain_fake_comments(&mut app, &mut comments);
+    input(&mut app, 'E');
+    exercise_mock_editor(&mut app)?;
+    ensure(
+        app.status()
+            .contains("Comment draft saved from external editor"),
+        "mock external-editor replacement must be saved",
+    )?;
+    input(&mut app, 'c');
     ensure_contains(
         &render_frame(&mut terminal, &mut app, &mut frames)?,
+        EDITOR_REPLACEMENT,
+        "externally replaced line draft frame",
+    )?;
+    app.handle_input(Input::Escape);
+
+    let mut comments = FakeComments::default();
+    comments.queue_publish_outcome(PublishOutcome::Created { id: 101 });
+    comments.queue_publish_outcome(PublishOutcome::DefinitelyNotCreated(CommentFailure {
+        kind: CommentFailureKind::Api,
+        http_status: Some(422),
+    }));
+    input(&mut app, 'C');
+    drain_fake_comments(&mut app, &mut comments);
+    let existing_comments = render_frame(&mut terminal, &mut app, &mut frames)?;
+    ensure_contains(
+        &existing_comments,
         "fictional-reviewer",
         "network-free comments frame",
+    )?;
+    ensure_contains(
+        &existing_comments,
+        "fictional-line-reviewer",
+        "existing line comment frame",
+    )?;
+    ensure_contains(
+        &existing_comments,
+        "src/welcome.rs:3",
+        "existing line comment target frame",
     )?;
     app.handle_input(Input::Escape);
     input(&mut app, 'P');
@@ -159,7 +318,7 @@ pub fn run() -> io::Result<SmokeReport> {
     input(&mut app, 'y');
     drain_fake_comments(&mut app, &mut comments);
     ensure(
-        app.draft_count() == 1,
+        app.draft_count() == 1 && comments.publish_count() == 1,
         "fake publish must clear only its line draft",
     )?;
     ensure_contains(
@@ -168,6 +327,52 @@ pub fn run() -> io::Result<SmokeReport> {
         "fake publish success frame",
     )?;
     drain_fake_comments(&mut app, &mut comments);
+    input(&mut app, 'C');
+    drain_fake_comments(&mut app, &mut comments);
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        EDITOR_REPLACEMENT,
+        "refreshed published comment frame",
+    )?;
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "src/welcome.rs:1",
+        "refreshed published line target frame",
+    )?;
+    app.handle_input(Input::Escape);
+
+    app.handle_input(Input::Escape);
+    ensure(
+        app.focus() == Pane::File,
+        "Escape must return to the file pane",
+    )?;
+    input(&mut app, 'P');
+    ensure(
+        matches!(app.mode(), Mode::ConfirmPublish { .. }),
+        "the remaining commit draft must require confirmation",
+    )?;
+    input(&mut app, 'y');
+    drain_fake_comments(&mut app, &mut comments);
+    ensure(
+        app.draft_count() == 1 && comments.publish_count() == 2,
+        "a mocked 422 must retain the commit draft without a duplicate request",
+    )?;
+    ensure(
+        app.status().contains("draft preserved") && app.status().contains("HTTP 422"),
+        "a mocked 422 must report failure retention",
+    )?;
+    input(&mut app, 'c');
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "fictional hjklq",
+        "failed publish retained draft frame",
+    )?;
+    app.handle_input(Input::Cancel);
+    app.handle_input(Input::Enter);
+    ensure(
+        app.focus() == Pane::Diff,
+        "the keyboard flow must return to the diff after failure",
+    )?;
 
     resize(&mut terminal, 60, 16)?;
     ensure(
@@ -390,6 +595,78 @@ fn search(app: &mut App, query: &str) -> io::Result<()> {
 
 fn input(app: &mut App, character: char) {
     app.handle_input(Input::Character(character));
+}
+
+fn exercise_mock_editor(app: &mut App) -> io::Result<()> {
+    let mut requests = app.take_editor_requests();
+    ensure(
+        requests.len() == 1,
+        "E must queue exactly one external-editor request",
+    )?;
+    let request = requests.remove(0);
+    ensure(
+        request.body == "fictional q line draft",
+        "external editor must receive the saved line draft",
+    )?;
+
+    let operation_log = Arc::new(Mutex::new(Vec::new()));
+    let mut terminal_guard =
+        TerminalGuard::acquire(RecordingTerminalOps(Arc::clone(&operation_log)))?;
+    operation_log.lock().expect("smoke operation log").clear();
+
+    let editor_body = Arc::new(Mutex::new(String::new()));
+    let mut temp_files = MemoryEditorFiles {
+        body: Arc::clone(&editor_body),
+        log: Arc::clone(&operation_log),
+    };
+    let mut process = ReplacingEditor {
+        body: editor_body,
+        log: Arc::clone(&operation_log),
+        runs: 0,
+    };
+    let command = EditorCommand {
+        program: "nvim".into(),
+        args: vec!["--clean".into()],
+    };
+    let result = edit_draft(
+        &request.body,
+        &command,
+        &mut terminal_guard,
+        &mut process,
+        &mut temp_files,
+    );
+
+    ensure(result.resume.is_ok(), "mock terminal must be reacquired")?;
+    ensure(
+        result.terminal_touched,
+        "mock editor must exercise terminal suspension",
+    )?;
+    ensure(
+        result.outcome == EditorOutcome::Replaced(EDITOR_REPLACEMENT.to_owned()),
+        "mock editor must replace the draft body",
+    )?;
+    ensure(
+        process.runs == 1,
+        "smoke must invoke only its in-process editor double once",
+    )?;
+    ensure(
+        *operation_log.lock().expect("smoke operation log")
+            == [
+                "create",
+                "show_cursor",
+                "leave_alternate_screen",
+                "disable_raw_mode",
+                "launch",
+                "read",
+                "cleanup",
+                "enable_raw_mode",
+                "enter_alternate_screen",
+                "hide_cursor",
+            ],
+        "terminal must restore before mock launch and reacquire afterward",
+    )?;
+    app.apply_editor_outcome(request, result.outcome);
+    Ok(())
 }
 
 fn drain_fake_comments(app: &mut App, comments: &mut FakeComments) {

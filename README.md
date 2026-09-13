@@ -4,7 +4,7 @@ A keyboard-first terminal review inbox for commits across GitHub projects.
 
 See [PRODUCT.md](PRODUCT.md) for the accepted requirements and delivery order.
 
-## Current status: diff review and commit comments
+## Current status: delivery increment 4 — commit comments
 
 Implemented now:
 
@@ -140,16 +140,17 @@ fallback happen before the terminal is changed.
 The live inbox starts loading immediately in the background. It requires the
 `gh` executable and an existing authenticated GitHub CLI session, normally set
 up with [`gh auth login`](https://cli.github.com/manual/gh_auth_login). The
-credential must be allowed to see each desired repository: GitHub documents
-Metadata (read) permission for authenticated repository discovery and Contents
-(read) permission for listing private-repository branches and commits. A
-classic token needs the `repo` scope to include private repositories; a
-fine-grained token must select the desired repositories and grant those read
-permissions. Repositories hidden from the credential cannot be discovered.
-ReviewBox does not inspect or persist the credential. Inbox, detail, and comment
-loading use explicit `gh api --method GET` requests. The only write request is
-the user-confirmed commit-comment `POST` described below. Press `q` or `Ctrl-c`
-at any time to cancel active work and exit.
+credential must be allowed to see each desired repository and its commit
+comments. With a classic token, use the `repo` scope for private repositories or
+`public_repo` when only public repositories are needed. A fine-grained token
+must select the desired repositories and grant Contents read access to browse
+and list comments, plus Contents read/write access to publish. Metadata read
+access is also used for authenticated repository discovery. Repositories hidden
+from the credential cannot be discovered. ReviewBox does not inspect or persist
+the credential. Inbox, detail, and comment loading use explicit
+`gh api --method GET` requests. The only write request is the user-confirmed
+commit-comment `POST` described below. In Normal mode, `q` exits; `Ctrl-c` exits
+globally, saving an Edit buffer first and staying open if that save fails.
 
 The demo needs no GitHub authentication. It performs no network requests or
 network writes and does not persist runtime state; reviewed marks and comment
@@ -165,12 +166,15 @@ cargo run -- --demo-smoke
 ```
 
 The smoke command does not initialize a real terminal or event reader. It uses
-the in-memory review store and renders representative frames for repository,
-commit, file, and long-diff navigation; forward/backward wrapped search;
-reviewed toggling and remaining filtering; binary, capped, and oversized
-responses; help; resize; and clean exit. It prints a short success message and
-exits nonzero if an invariant or render operation fails. It needs no credentials
-or network and does not write persistent state.
+memory-only review and draft stores, an in-process fake comment service, a mock
+editor/temp-file pair, and recording terminal operations. In addition to pane,
+search, review-state, limitation, help, resize, and exit coverage, it validates
+the complete keyboard comment journey: modal commit and supported-line edits,
+an ineligible line, external replacement and terminal restoration, existing
+commit and line comments, confirmed success and refresh, and mocked `422`
+failure retention. It never launches a real editor, reads credentials, invokes
+`gh`, accesses the network, or writes persistent state. It prints a short
+success message and exits nonzero if an invariant or render operation fails.
 
 ## Implemented modes and keybindings
 
@@ -262,9 +266,12 @@ Live mode reads comment drafts from a separate versioned file:
 
 Draft identities use GitHub's numeric repository ID, the complete lowercase
 commit SHA, and either the whole commit or a line target made from the API file
-path and GitHub commit-diff position. Bodies must contain non-whitespace text and
-are limited to 65,000 characters; line paths are limited to 4,096 bytes and may
-not contain control characters. The file is capped at 16 MiB when read.
+path and GitHub commit-diff position. The file contains private comment bodies,
+line paths, and unresolved submission-attempt records; it contains no tokens and
+stays outside Git repositories, but should still be treated as sensitive local
+data. Bodies must contain non-whitespace text and are limited to 65,000
+characters; line paths are limited to 4,096 bytes and may not contain control
+characters. The file is capped at 16 MiB when read.
 
 Press `c` in the Commit or File pane to edit the selected commit-wide draft.
 In the Diff pane, `j`, `k`, `gg`, `G`, `Ctrl-d`, and `Ctrl-u` move a highlighted
@@ -276,13 +283,14 @@ whether the draft is new or saved, wraps text, and exposes the terminal cursor
 in both full and compact layouts.
 
 Only retained context, addition, and deletion rows in a textual patch beginning
-with a valid `@@` hunk header can become line targets. Hunk headers, no-newline
-markers, malformed/other rows, binary or unavailable patches, and content omitted
-by the commit-wide budget are ineligible. Rows retained by the per-file cap remain
-eligible. A filename changed by terminal sanitization is also ineligible, because
-the displayed path would not safely identify the API target. Positions count raw
-patch rows from the first hunk header, including intervening headers and notices,
-as required by GitHub's commit-comments API.
+with a valid `@@` hunk header can become line targets. Hunk/file headers,
+no-newline notices, malformed/other rows, binary or unavailable patches,
+capped-only rows, and content omitted by the commit-wide budget are ineligible.
+Rows retained before the per-file cap remain eligible. A path GitHub returns
+with control characters is also ineligible because its sanitized display form
+would not safely identify the API target. Positions count raw patch rows from
+the first hunk header, including intervening headers and notices, as required by
+GitHub's commit-comments API.
 
 Every file update re-reads the existing draft file, validates it, changes one
 target, and atomically replaces it through a same-directory private temporary
@@ -294,21 +302,26 @@ the previous bytes. No lock coordinates concurrent ReviewBox processes, so two
 simultaneous writers can still race. Drafts are never stored in
 `review-state.json`. Demo and demo-smoke construct only memory-backed draft state.
 
-External editing selects the first nonblank value from `$VISUAL`, then `$EDITOR`.
-The value is split into an executable and arguments with quote and backslash
-support, but is never passed through a shell; the private draft body and temporary
-path are not interpolated into a command string. The temporary `draft.md` is
+External editing selects nonblank `$VISUAL` first, then nonblank `$EDITOR`; no
+other editor discovery is performed. The selected value is split into an
+executable and arguments with single quotes, double quotes, and backslash
+escapes, but is never passed through a shell, expanded, or globbed. The private
+draft body is not placed in the command line, and the temporary path is appended
+as the final argument. The temporary `draft.md` is
 created outside the repository under an absolute `$XDG_RUNTIME_DIR`, when set,
 or the system temporary directory. Its new directory uses mode `0700` and its
 file mode `0600` on Unix. Input and output are capped at 1 MiB and decoded as
 strict UTF-8, with the durable 65,000-character draft limit enforced. The file
 and directory are removed best-effort after every launch path. A successful
-blank result or a nonzero editor exit leaves the previous draft unchanged.
+blank result, nonzero editor exit, invalid configuration, or launch/read/decode
+failure leaves the previous draft unchanged.
 
-Publishing sends `POST /repos/{owner}/{repo}/commits/{full_sha}/comments` with
-the body alone for a commit draft, or body, path, and validated GitHub diff
-position for a line draft. ReviewBox does not use pull-request review or issue
-comment APIs. Before posting, it appends a unique HTML marker and atomically
+Publishing starts only when the user presses `P` on a saved draft and then `y`
+in the separate confirmation overlay; every other confirmation key cancels.
+It sends `POST /repos/{owner}/{repo}/commits/{full_sha}/comments` with the body
+alone for a commit draft, or body, path, and validated GitHub diff position for
+a line draft. ReviewBox does not use pull-request review or issue comment APIs.
+Before posting, it appends a unique HTML marker and atomically
 stores that attempt and its start time in the draft file. A parsed `201 Created`
 response removes the draft. Definite client/authentication failures clear only
 the attempt lock; transport failures, cancellation, unexpected statuses, and
@@ -316,12 +329,28 @@ unreadable success responses keep it locked. `P` or `C` then lists comments and
 searches the raw API body for that exact marker before any display truncation.
 Only a match removes the draft. A complete not-found listing may unlock a retry
 after 60 seconds; an incomplete or younger result never does. Editing and repeat
-publishing stay disabled while the outcome is unresolved.
+publishing stay disabled while the outcome is unresolved. The marker is hidden
+in rendered GitHub Markdown, but is visible in raw Markdown, edit views, and may
+appear in notifications; removing it on GitHub prevents exact reconciliation.
 
 Comment lists fetch up to ten pages of 100 comments and label capped results as
-incomplete. Displayed author, path, timestamp, and body text are sanitized, and
-bodies are capped at 8,000 characters. The demo and demo-smoke flows use an
-in-process fake comment service with no `gh` or network-write path.
+incomplete. They include commit-wide and line-associated commit comments;
+GitHub entries without a current position are labeled outdated. Displayed
+author, path, timestamp, and body text are sanitized, and bodies are capped at
+8,000 characters. The demo and demo-smoke flows use an in-process fake comment
+service with no `gh` or network-write path.
+
+These are GitHub commit comments, not pull-request review threads: ReviewBox
+does not create a review, attach comments to a pull request, resolve threads, or
+provide pull-request semantics. Concurrent ReviewBox instances do not lock the
+draft file and can overwrite one another. GitHub comment listings can be
+eventually consistent; an unresolved marker remains locked when a complete
+answer is unavailable, but an unusually delayed listing can still leave some
+duplicate risk after the 60-second reconciliation threshold. Repository
+renames or transfers during a session can also make the startup owner/name
+stale. Line positions are derived from GitHub's returned commit patch and are
+covered by fixtures rather than live test posts, so a GitHub mismatch is
+reported as a preserved-draft failure instead of silently retargeting.
 
 ## GitHub loading behavior and limitations
 
@@ -415,17 +444,20 @@ alternate screen, and disables raw mode. After the editor returns—even after a
 nonzero exit or launch/read failure—it enables raw mode, enters the alternate
 screen, hides the cursor, and fully redraws. If terminal reacquisition fails,
 already-read content is still offered to the draft store before ReviewBox exits
-with a sanitized error; final teardown remains idempotent.
+with a sanitized error; final teardown remains idempotent. Vim and Neovim manage
+terminal interrupt handling themselves. An editor that leaves terminal `ISIG`
+enabled can let `Ctrl-c` terminate ReviewBox's process group while the TUI is
+suspended, in which case best-effort temporary-file cleanup cannot run.
 
 ## Development checks
 
-Run the complete terminal-foundation verification set with:
+Run the complete verification set with:
 
 ```sh
 cargo fmt --check
 cargo build
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+cargo test
 cargo run -- --demo-smoke
 ```
 

@@ -548,6 +548,7 @@ impl App {
         )
     }
 
+    #[cfg(test)]
     pub fn with_review_store(inbox: Inbox, store: Box<dyn ReviewStore>) -> Self {
         Self::with_stores(inbox, store, Box::new(MemoryDraftStore::default()))
     }
@@ -1183,8 +1184,7 @@ impl App {
         self.editor_requests.drain(..).collect()
     }
 
-    #[cfg(test)]
-    pub fn set_attempt_source(&mut self, source: Box<dyn AttemptSource>) {
+    pub(crate) fn set_attempt_source(&mut self, source: Box<dyn AttemptSource>) {
         self.attempt_source = source;
     }
 
