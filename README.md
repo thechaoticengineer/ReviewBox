@@ -64,10 +64,19 @@ Implemented now:
   missing-`gh`, permission, and rate-limit outcomes.
 - Cancellation on quit. ReviewBox stops consuming updates, signals the loader,
   and kills and reaps an active `gh` subprocess before terminal teardown.
+- A focused review-progress store is implemented and tested. It records only
+  GitHub numeric repository IDs and complete lowercase commit SHAs in a
+  deterministic, versioned JSON file at
+  `$XDG_DATA_HOME/reviewbox/review-state.json`, or
+  `$HOME/.local/share/reviewbox/review-state.json` when XDG data home is not an
+  absolute path. Updates use same-directory atomic replacement and refuse to
+  overwrite malformed or unsupported state. The live UI does not construct this
+  store until the next workflow-wiring increment.
 
 Planned for later delivery increments, and not implemented yet:
 
-- Durable review state and reviewed/unreviewed filtering.
+- Reviewed/unreviewed controls, saved-state restoration in the live UI, and the
+  remaining-commits filter.
 - Wiring live repository/commit/file navigation to the on-demand detail loader
   and rendering its real GitHub diffs.
 - Drafting, editing, persistence, and publishing of comments.

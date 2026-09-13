@@ -7,6 +7,7 @@ pub mod github;
 mod inbox;
 mod loader;
 mod render;
+pub mod review_state;
 mod smoke;
 mod terminal;
 
