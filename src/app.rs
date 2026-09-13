@@ -1306,6 +1306,7 @@ impl App {
                 draft.target.repository_id() == key.repository_id
                     && draft.target.sha() == key.sha
                     && draft.submission.is_some()
+                    && !self.publish_is_active_for(&draft.target)
             })
             .map(|draft| draft.target.clone());
         let marker = reconcile_target
@@ -1330,6 +1331,10 @@ impl App {
     }
 
     fn reconcile_target(&mut self, target: CommentTarget) {
+        if self.publish_is_active_for(&target) {
+            self.status = "A comment publish is already in progress".to_owned();
+            return;
+        }
         let Some((key, repository)) = self.repository_for_target(&target) else {
             self.status = "Cannot reconcile while the repository is unavailable".to_owned();
             return;
@@ -1483,6 +1488,10 @@ impl App {
     }
 
     fn apply_reconciliation(&mut self, target: CommentTarget, found: bool, complete: bool) {
+        if self.publish_is_active_for(&target) {
+            self.status = "Comment publish is still in progress; publish lock retained".to_owned();
+            return;
+        }
         if found {
             match self
                 .draft_store
@@ -1532,6 +1541,12 @@ impl App {
         } else {
             self.status = "No matching comment yet; wait before retrying".to_owned();
         }
+    }
+
+    fn publish_is_active_for(&self, target: &CommentTarget) -> bool {
+        self.active_publish
+            .as_ref()
+            .is_some_and(|active| &active.target == target)
     }
 
     fn queue_comment_load(
@@ -4418,6 +4433,72 @@ mod tests {
         assert!(matches!(
             app.take_comment_effects().as_slice(),
             [CommentEffect::Load { .. }]
+        ));
+    }
+
+    #[test]
+    fn active_publish_cannot_be_reconciled_or_unlocked_by_comment_refresh() {
+        let mut app = app_with_commit_draft();
+        let (publish_id, key, target) = begin_publish(&mut app);
+        app.set_attempt_source(Box::new(FixedAttemptSource {
+            now: Utc.with_ymd_and_hms(2024, 1, 15, 12, 3, 1).unwrap(),
+            nonce: "fedcba9876543210fedcba9876543210",
+        }));
+
+        app.handle_input(Input::Character('C'));
+        let effects = app.take_comment_effects();
+        let [
+            CommentEffect::Load {
+                request_id,
+                marker,
+                reconcile_target,
+                ..
+            },
+        ] = effects.as_slice()
+        else {
+            panic!("comment load")
+        };
+        assert!(marker.is_none());
+        assert!(reconcile_target.is_none());
+        let comment_load_id = *request_id;
+
+        app.apply_comment_result(CommentResult {
+            request_id: comment_load_id,
+            key: key.clone(),
+            target: None,
+            outcome: CommentResultOutcome::Loaded(Ok(ExistingComments {
+                comments: Vec::new(),
+                complete: true,
+                marker_found: false,
+            })),
+        });
+        assert!(app.drafts.get(&target).unwrap().submission.is_some());
+
+        // Even a mismatched caller cannot clear an active publish's durable lock.
+        app.apply_reconciliation(target.clone(), false, true);
+        assert!(app.drafts.get(&target).unwrap().submission.is_some());
+        assert!(app.status().contains("lock retained"));
+
+        app.apply_comment_result(CommentResult {
+            request_id: publish_id,
+            key,
+            target: Some(target.clone()),
+            outcome: CommentResultOutcome::Published(PublishOutcome::Unverified(CommentFailure {
+                kind: crate::github::CommentFailureKind::Transport,
+                http_status: None,
+            })),
+        });
+        assert!(app.drafts.get(&target).unwrap().submission.is_some());
+        app.handle_input(Input::Escape);
+        app.handle_input(Input::Character('P'));
+        assert_eq!(app.mode(), Mode::Normal);
+        assert!(matches!(
+            app.take_comment_effects().as_slice(),
+            [CommentEffect::Load {
+                marker: Some(_),
+                reconcile_target: Some(reconciled),
+                ..
+            }] if reconciled == &target
         ));
     }
 
