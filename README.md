@@ -428,6 +428,7 @@ Unified:
 
 ```
 @@ -26,3 +21,3 @@
+
      pub fn version_tag() -> &'static str {
 -    "comparison-fixture-1"
 \ No newline at end of file
@@ -439,13 +440,14 @@ Split (`Old │ New`, active side underlined on the inactive column):
 
 ```
  Old                                │ New
- 26   pub fn version_tag() -> ... { │  21   pub fn version_tag() -> ... {
- 27  -    "comparison-fixture-1"    │  22  +    "comparison-fixture-2"
+ 26                                 │  21
+ 27   pub fn version_tag() -> ... { │  22   pub fn version_tag() -> ... {
+ 28  -    "comparison-fixture-1"    │  23  +    "comparison-fixture-2"
      \ No newline at end of file    │      \ No newline at end of file
 ```
 
 The deletion and the addition are separate GitHub positions even though they
-share one screen row; `<` targets old line 27 and `>` targets new line 22.
+share one screen row; `<` targets old line 28 and `>` targets new line 23.
 The no-newline marker stays attached to its own line and side and is never a
 comment target. Only the patch GitHub returned is shown; no full file content
 is fetched or invented.
