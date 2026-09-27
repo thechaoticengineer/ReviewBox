@@ -258,6 +258,7 @@ Normal mode:
 | `[ / ]` | diff: previous / next hunk |
 | `v` | diff: split / unified view |
 | `< / >` | diff: old / new side for line comments |
+| `z` | expand / restore diff view |
 | `Enter / Escape` | open child / return to parent |
 | `/` | search the focused pane |
 | `n / N` | next / previous search match |
@@ -380,7 +381,26 @@ selects the side that shows it (context matches keep the current side) and
 the wrapped row containing it. In the unified view every row has a single
 target and the active side does not apply.
 
-Planned, not yet available: an expanded full-terminal diff view.
+#### Expanded diff view
+
+`z` expands the diff pane to the whole terminal area above the status row,
+hiding the repository, commit, and file panes. In their place, a one-row
+header shows the repository, the commit's short SHA and reviewed marker, the
+file path (and previous path for a rename), its status, its `i/n` index among
+the commit's files, and the effective split or unified mode. The status row
+stays visible. Expanding moves focus to the diff pane and remembers where it
+was; `z` again or `Escape` collapses back to that focus with the list
+selections and scroll positions exactly as left, since they are never
+touched while expanded. Expanding, collapsing, and resizing while expanded
+keep the current logical line and wrapped offset, and the larger width is
+re-evaluated against the split/unified threshold like any other resize.
+While expanded, `h`/`l` and `Left`/`Right` do not change focus or move a
+hidden pane; the status line reports `Press z to show lists` instead. Below
+the 60x16 compact threshold the compact view is used regardless of the
+expanded flag, which resumes as soon as the terminal grows back. Overlays
+(help, search, edit, comments, publish, and bulk confirmation) still render
+over the expanded view with their own key isolation, and `q`, `Ctrl-c`, and
+`x` keep working.
 
 ## Terminal restoration
 

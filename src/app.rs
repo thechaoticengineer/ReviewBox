@@ -27,7 +27,7 @@ use crate::loader::{
 use crate::review_state::{
     MemoryReviewStore, ReviewKey, ReviewMarks, ReviewStateError, ReviewStore,
 };
-use crate::ui_layout::{ReviewPaneLayout, wrap_text};
+use crate::ui_layout::{ExpandedDiffLayout, ReviewPaneLayout, wrap_text};
 
 pub const MIN_FULL_WIDTH: u16 = 60;
 pub const MIN_FULL_HEIGHT: u16 = 16;
@@ -185,6 +185,7 @@ pub enum Command {
     NextHunk,
     PreviousHunk,
     ToggleDiffView,
+    ToggleExpandedDiff,
     SelectOldSide,
     SelectNewSide,
     Open,
@@ -263,6 +264,10 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
     HelpBinding {
         keys: "< / >",
         action: "diff: old / new side for line comments",
+    },
+    HelpBinding {
+        keys: "z",
+        action: "expand / restore diff view",
     },
     HelpBinding {
         keys: "Enter / Escape",
@@ -830,6 +835,11 @@ pub struct App {
     diff_side: DiffSide,
     #[cfg(test)]
     diff_projection_builds: usize,
+    /// Whether the diff pane is expanded to the full terminal area, hiding
+    /// the repository/commit/file panes. Transient view state.
+    diff_expanded: bool,
+    /// Focus to restore when the expanded diff view collapses.
+    expanded_previous_focus: Option<Pane>,
     viewport_heights: [usize; 4],
     pending_g: bool,
     search_query: String,
@@ -969,6 +979,8 @@ impl App {
             diff_projection_builds: 0,
             diff_view_mode: DiffViewMode::default(),
             diff_side: DiffSide::default(),
+            diff_expanded: false,
+            expanded_previous_focus: None,
             viewport_heights: [0; 4],
             pending_g: false,
             search_query: String::new(),
@@ -1011,15 +1023,32 @@ impl App {
     pub fn resize(&mut self, width: u16, height: u16) {
         self.terminal_width = width;
         self.terminal_height = height;
-        if width < MIN_FULL_WIDTH || height < MIN_FULL_HEIGHT {
+        self.recompute_viewport();
+        self.normalize();
+    }
+
+    /// Derives the pane viewport geometry from the terminal size and the
+    /// expanded flag. Below the compact threshold every pane collapses,
+    /// regardless of expansion. While expanded, only the diff pane's height
+    /// and width change; the hidden repository/commit/file viewport heights
+    /// are left as they were, so their selections and scroll positions are
+    /// never recomputed against a size they are not shown at.
+    fn recompute_viewport(&mut self) {
+        if self.terminal_width < MIN_FULL_WIDTH || self.terminal_height < MIN_FULL_HEIGHT {
             self.viewport_heights = [0; 4];
             self.diff_viewport_width = 0;
+            return;
+        }
+        let area = Rect::new(0, 0, self.terminal_width, self.terminal_height);
+        if self.diff_expanded {
+            let layout = ExpandedDiffLayout::from_area(area);
+            self.viewport_heights[Pane::Diff.index()] = layout.diff_content_height();
+            self.diff_viewport_width = layout.diff_content_width();
         } else {
-            let layout = ReviewPaneLayout::from_area(Rect::new(0, 0, width, height));
+            let layout = ReviewPaneLayout::from_area(area);
             self.viewport_heights = layout.content_heights();
             self.diff_viewport_width = layout.diff_content_width();
         }
-        self.normalize();
     }
 
     pub fn apply_load_event(&mut self, event: LoadEvent) {
@@ -1311,6 +1340,7 @@ impl App {
             Input::Character('v') => Command::ToggleDiffView,
             Input::Character('<') => Command::SelectOldSide,
             Input::Character('>') => Command::SelectNewSide,
+            Input::Character('z') => Command::ToggleExpandedDiff,
             Input::Character(_)
             | Input::Backspace
             | Input::Cancel
@@ -1456,6 +1486,9 @@ impl App {
             }
             Command::ToggleSelected => self.toggle_selected(),
             Command::SelectAll => self.select_all(),
+            Command::FocusPrevious | Command::FocusNext if self.diff_expanded => {
+                self.status = "Press z to show lists".to_owned();
+            }
             Command::FocusPrevious => self.focus_previous("Focus moved left"),
             Command::FocusNext => self.focus_next("Focus moved right"),
             Command::MoveDown => self.move_active(false, 1),
@@ -1471,7 +1504,9 @@ impl App {
             Command::ToggleDiffView => self.toggle_diff_view(),
             Command::SelectOldSide => self.select_diff_side(DiffSide::Old),
             Command::SelectNewSide => self.select_diff_side(DiffSide::New),
+            Command::ToggleExpandedDiff => self.toggle_expanded_diff(),
             Command::Open => self.open_selected(),
+            Command::Back if self.diff_expanded => self.toggle_expanded_diff(),
             Command::Back => self.focus_previous("Returned to parent pane"),
             Command::ToggleReviewed => self.toggle_reviewed(),
             Command::ToggleRemaining => self.toggle_remaining(),
@@ -3199,6 +3234,33 @@ impl App {
         };
     }
 
+    /// Toggles the expanded diff view. Expanding is only available when the
+    /// diff pane is the meaningful destination of navigation; it focuses the
+    /// diff pane and remembers the previous focus. Collapsing restores it.
+    /// The wider or narrower effective width feeds through the same
+    /// projection cache key as a resize, so the split/unified fallback and
+    /// the logical reading anchor are re-evaluated, not reinvented.
+    fn toggle_expanded_diff(&mut self) {
+        if self.diff_expanded {
+            self.diff_expanded = false;
+            self.focus = self.expanded_previous_focus.take().unwrap_or(self.focus);
+            self.status = "Collapsed diff view".to_owned();
+        } else if self.deepest_meaningful_pane() == Pane::Diff {
+            self.expanded_previous_focus = Some(self.focus);
+            self.focus = Pane::Diff;
+            self.diff_expanded = true;
+            self.status = "Expanded diff view — z or Esc returns".to_owned();
+        } else {
+            self.status = "No diff to expand yet".to_owned();
+            return;
+        }
+        self.recompute_viewport();
+    }
+
+    pub fn diff_expanded(&self) -> bool {
+        self.diff_expanded
+    }
+
     fn select_diff_side(&mut self, side: DiffSide) {
         self.diff_side = side;
         self.status = if self.effective_diff_mode() == DiffViewMode::Split {
@@ -3312,7 +3374,11 @@ impl App {
             .diff_cursor
             .min(self.diff_row_count().saturating_sub(1));
         self.ensure_diff_cursor_visible();
-        self.focus = self.focus.min(self.deepest_meaningful_pane());
+        self.focus = if self.diff_expanded {
+            Pane::Diff
+        } else {
+            self.focus.min(self.deepest_meaningful_pane())
+        };
         self.reconcile_selection();
     }
 
@@ -6629,6 +6695,18 @@ mod tests {
         )
     }
 
+    /// A demo app focused on the File pane after a real resize, so expanded
+    /// view tests have an actual terminal size to recompute layout from.
+    fn demo_file_app() -> App {
+        let mut app = App::new(DemoFixture::load());
+        app.resize(80, 24);
+        for _ in 0..2 {
+            app.handle_input(Input::Character('l'));
+        }
+        assert_eq!(app.focus(), Pane::File, "fixture must reach the File pane");
+        app
+    }
+
     fn demo_app_focused_on(pane: Pane) -> App {
         let mut app = App::new(DemoFixture::load());
         app.viewport_heights = [2; 4];
@@ -6693,6 +6771,120 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn expand_and_collapse_restore_focus_and_leave_other_panes_untouched() {
+        // A real resize (not the `[2; 4]` viewport fixture other tests use)
+        // so the expanded/normal layout recomputation this test exercises
+        // has an actual terminal size to work from.
+        let mut app = App::new(DemoFixture::load());
+        app.resize(60, 16);
+        for _ in 0..20 {
+            app.handle_input(Input::Character('j'));
+        }
+        let repo_before = (app.selected(Pane::Repository), app.scroll(Pane::Repository));
+        assert!(
+            repo_before.1 > 0,
+            "expected the repository pane to have scrolled: {repo_before:?}"
+        );
+
+        app.handle_input(Input::Character('l'));
+        for _ in 0..20 {
+            app.handle_input(Input::Character('j'));
+        }
+        let commit_before = (app.selected(Pane::Commit), app.scroll(Pane::Commit));
+
+        app.handle_input(Input::Character('l'));
+        let file_before = (app.selected(Pane::File), app.scroll(Pane::File));
+        assert_eq!(app.focus(), Pane::File);
+        assert!(!app.diff_expanded());
+
+        app.handle_input(Input::Character('z'));
+        assert!(app.diff_expanded());
+        assert_eq!(app.focus(), Pane::Diff);
+        assert_eq!(app.status(), "Expanded diff view — z or Esc returns");
+
+        // The hidden lists are never recomputed while expanded.
+        let unchanged = |app: &App| {
+            (app.selected(Pane::Repository), app.scroll(Pane::Repository)) == repo_before
+                && (app.selected(Pane::Commit), app.scroll(Pane::Commit)) == commit_before
+                && (app.selected(Pane::File), app.scroll(Pane::File)) == file_before
+        };
+        assert!(unchanged(&app));
+
+        // h/l and Left/Right move no hidden pane while expanded.
+        app.handle_input(Input::Character('h'));
+        assert_eq!(app.focus(), Pane::Diff);
+        assert_eq!(app.status(), "Press z to show lists");
+        app.handle_input(Input::Right);
+        assert_eq!(app.focus(), Pane::Diff);
+        assert_eq!(app.status(), "Press z to show lists");
+        assert!(app.diff_expanded());
+        assert!(unchanged(&app));
+
+        // Escape collapses while expanded and restores the previous focus.
+        app.handle_input(Input::Escape);
+        assert!(!app.diff_expanded());
+        assert_eq!(app.focus(), Pane::File);
+        assert_eq!(app.status(), "Collapsed diff view");
+        assert!(unchanged(&app));
+
+        // Escape keeps its existing meaning once no longer expanded.
+        app.handle_input(Input::Escape);
+        assert_eq!(app.focus(), Pane::Commit);
+    }
+
+    #[test]
+    fn overlays_render_over_the_expanded_view_and_keep_their_own_escape_semantics() {
+        let mut app = demo_file_app();
+        app.handle_input(Input::Character('z'));
+        assert!(app.diff_expanded());
+
+        app.handle_input(Input::Character('?'));
+        assert!(matches!(app.mode(), Mode::Help { .. }));
+        app.handle_input(Input::Character('z'));
+        assert!(
+            matches!(app.mode(), Mode::Help { .. }),
+            "z must stay isolated in Help mode"
+        );
+        assert!(
+            app.diff_expanded(),
+            "z inside a modal must not collapse the expanded view"
+        );
+        app.handle_input(Input::Escape);
+        assert_eq!(app.mode(), Mode::Normal);
+        assert!(
+            app.diff_expanded(),
+            "closing an overlay must not collapse the expanded view"
+        );
+        assert_eq!(app.focus(), Pane::Diff);
+    }
+
+    #[test]
+    fn q_and_ctrl_c_quit_while_expanded() {
+        let mut quitting = demo_file_app();
+        quitting.handle_input(Input::Character('z'));
+        assert!(quitting.diff_expanded());
+        quitting.handle_input(Input::Character('q'));
+        assert!(quitting.should_quit());
+
+        let mut ctrl_c = demo_file_app();
+        ctrl_c.handle_input(Input::Character('z'));
+        assert!(ctrl_c.diff_expanded());
+        ctrl_c.handle_input(Input::Quit);
+        assert!(ctrl_c.should_quit());
+    }
+
+    #[test]
+    fn expand_is_unavailable_without_a_meaningful_diff_pane() {
+        let mut app = App::new(Inbox::demo(Vec::new()));
+        assert_ne!(app.focus(), Pane::Diff);
+
+        app.handle_input(Input::Character('z'));
+
+        assert!(!app.diff_expanded());
+        assert_eq!(app.status(), "No diff to expand yet");
     }
 
     fn readme_keybinding_rows(readme: &str) -> Vec<(String, String)> {
@@ -8959,5 +9151,104 @@ mod diff_navigation_tests {
             assert_eq!(app.status(), "Publish cancelled");
             assert_eq!(snapshot(&app), before);
         }
+    }
+
+    #[test]
+    fn expand_key_stays_isolated_in_modal_modes() {
+        let mut app = split_app(REPLACEMENT, 60, 10);
+        press(&mut app, Input::Character('j'));
+        let snapshot = |app: &App| (app.diff_expanded(), app.focus(), state(app));
+        let before = snapshot(&app);
+
+        app.handle_input(Input::Character('/'));
+        app.handle_input(Input::Character('z'));
+        assert_eq!(app.search_query(), "z");
+        app.handle_input(Input::Escape);
+        assert_eq!(snapshot(&app), before);
+
+        app.handle_input(Input::Character('?'));
+        app.handle_input(Input::Character('z'));
+        assert!(matches!(app.mode(), Mode::Help { .. }));
+        app.handle_input(Input::Escape);
+        assert_eq!(snapshot(&app), before);
+
+        app.handle_input(Input::Character('C'));
+        app.handle_input(Input::Character('z'));
+        assert!(matches!(app.mode(), Mode::Comments { .. }));
+        app.handle_input(Input::Escape);
+        assert_eq!(snapshot(&app), before);
+
+        app.handle_input(Input::Character('c'));
+        app.handle_input(Input::Character('z'));
+        assert_eq!(app.edit_buffer().unwrap().text(), "z");
+        app.handle_input(Input::Escape);
+        assert_eq!(snapshot(&app), before);
+
+        app.handle_input(Input::Character('P'));
+        assert!(matches!(app.mode(), Mode::ConfirmPublish { .. }));
+        app.handle_input(Input::Character('z'));
+        assert_eq!(app.status(), "Publish cancelled");
+        assert_eq!(snapshot(&app), before);
+    }
+
+    #[test]
+    fn expanding_grows_the_diff_width_and_shrinks_height_by_exactly_the_header_row() {
+        let mut app = diff_app(&over_tall_patch(), 40, 10);
+        app.resize(90, 24);
+        let normal_width = app.diff_viewport_width();
+        let normal_height = app.viewport_heights[Pane::Diff.index()];
+
+        app.handle_input(Input::Character('z'));
+
+        assert!(app.diff_expanded());
+        assert!(
+            app.diff_viewport_width() > normal_width,
+            "expanded width {} should exceed the normal width {normal_width}",
+            app.diff_viewport_width()
+        );
+        assert_eq!(
+            app.viewport_heights[Pane::Diff.index()],
+            normal_height - 1,
+            "the one-row identity header costs exactly one diff row"
+        );
+
+        app.handle_input(Input::Character('z'));
+        assert!(!app.diff_expanded());
+        assert_eq!(app.diff_viewport_width(), normal_width);
+        assert_eq!(app.viewport_heights[Pane::Diff.index()], normal_height);
+    }
+
+    #[test]
+    fn expanded_resize_keeps_the_flag_and_the_logical_anchor_across_sizes() {
+        let mut app = diff_app(&over_tall_patch(), 17, 4);
+        app.resize(100, 30);
+        for _ in 0..7 {
+            press(&mut app, Input::Character('j'));
+        }
+        let raw_row_before = cursor_row(&app).raw_row;
+
+        app.handle_input(Input::Character('z'));
+        assert!(app.diff_expanded());
+        assert_eq!(cursor_row(&app).raw_row, raw_row_before);
+
+        for (width, height) in [(120, 32), (80, 24), (60, 16), (59, 15), (120, 32)] {
+            app.resize(width, height);
+            assert!(
+                app.diff_expanded(),
+                "expanded flag persists at {width}x{height}"
+            );
+            if width >= MIN_FULL_WIDTH && height >= MIN_FULL_HEIGHT {
+                assert_cursor_visible(&app);
+                assert_eq!(
+                    cursor_row(&app).raw_row,
+                    raw_row_before,
+                    "logical row preserved at {width}x{height}"
+                );
+            }
+        }
+
+        app.handle_input(Input::Character('z'));
+        assert!(!app.diff_expanded());
+        assert_eq!(cursor_row(&app).raw_row, raw_row_before);
     }
 }

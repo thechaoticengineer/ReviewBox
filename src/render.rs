@@ -16,8 +16,8 @@ use crate::github::{
     CommentFailureKind, DetailFailure, DetailState, ExistingCommentAnchor, FailureCategory,
     HistoryCoverage, RESPONSE_TRUNCATED_LABEL, failure_category_label,
 };
-use crate::inbox::{DiffLine, DiffLineKind, InboxSource, PatchContent, Repository};
-use crate::ui_layout::{ReviewPaneLayout, wrap_text};
+use crate::inbox::{DiffLine, DiffLineKind, FileStatus, InboxSource, PatchContent, Repository};
+use crate::ui_layout::{ExpandedDiffLayout, ReviewPaneLayout, wrap_text};
 use unicode_width::UnicodeWidthChar;
 
 const MAX_SUMMARY_FAILURES: usize = 3;
@@ -29,10 +29,81 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     if area.width < MIN_FULL_WIDTH || area.height < MIN_FULL_HEIGHT {
         draw_compact(frame, area, app);
+    } else if app.diff_expanded() {
+        draw_expanded_diff(frame, area, app);
     } else {
         draw_panes(frame, area, app);
     }
     draw_modal(frame, area, app);
+}
+
+/// The expanded diff view: a one-row file identity header replaces the
+/// repository/commit/file panes, the diff pane takes the rest of the area
+/// above the status row, and the status row is unchanged.
+fn draw_expanded_diff(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let layout = ExpandedDiffLayout::from_area(area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            expanded_identity_text(app),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        layout.header,
+    );
+    draw_diff_pane(frame, layout.diff, app);
+    draw_status(frame, layout.status, app);
+}
+
+/// One-row identity of what the expanded diff pane shows: repository, short
+/// SHA and reviewed marker, the file path (and previous path for a rename),
+/// status, index and the effective split/unified mode.
+fn expanded_identity_text(app: &App) -> String {
+    let mut segments = vec![app.current_repository().map_or_else(
+        || "no repository".to_owned(),
+        |repository| sanitize_display_text(&repository.display_name()),
+    )];
+    if let Some(commit) = app.current_commit() {
+        let reviewed = app
+            .current_repository()
+            .is_some_and(|repository| app.is_reviewed(repository.identity.id, &commit.sha));
+        segments.push(format!(
+            "{} • {}",
+            commit.display_sha(),
+            if reviewed {
+                "✓ reviewed"
+            } else {
+                "unreviewed"
+            }
+        ));
+    }
+    segments.push(app.current_file().map_or_else(
+        || "no file selected".to_owned(),
+        |file| {
+            let mut path = sanitize_display_text(&file.path);
+            if let Some(previous) = &file.previous_path {
+                path = format!("{path} (from {})", sanitize_display_text(previous));
+            }
+            let (index, total) = app.position(Pane::File);
+            format!(
+                "{path} • {} • {index}/{total}",
+                file_status_label(file.status)
+            )
+        },
+    ));
+    segments.push(app.effective_diff_mode().label().to_owned());
+    format!(" {} ", segments.join(" • "))
+}
+
+fn file_status_label(status: FileStatus) -> &'static str {
+    match status {
+        FileStatus::Added => "added",
+        FileStatus::Modified => "modified",
+        FileStatus::Removed => "removed",
+        FileStatus::Renamed => "renamed",
+        FileStatus::Copied => "copied",
+        FileStatus::Changed => "changed",
+        FileStatus::Unchanged => "unchanged",
+        FileStatus::Unknown => "unknown",
+    }
 }
 
 fn draw_panes(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -2009,6 +2080,99 @@ mod tests {
         assert!(output.contains("fictional-studio/pixel-garden-demo"));
         assert!(output.contains("13579bd"));
         assert!(output.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn expanded_view_shows_identity_header_and_hides_list_panes() {
+        let mut app = App::new(DemoFixture::load());
+        for _ in 0..3 {
+            app.handle_input(Input::Character('l'));
+        }
+        assert_eq!(app.focus(), Pane::Diff);
+        app.handle_input(Input::Character('z'));
+        assert!(app.diff_expanded());
+
+        let output = rendered_text(&mut app, 120, 32);
+
+        // The one-row identity header names the repository, the commit, the
+        // file (with its status and index) and the effective mode.
+        assert!(output.contains("fictional-labs/orbit-notes-demo"));
+        assert!(output.contains("a1b2c3d"));
+        assert!(output.contains("unreviewed"));
+        assert!(output.contains("src/welcome.rs"));
+        assert!(output.contains("modified"));
+        assert!(output.contains("1/8"));
+        assert!(output.contains("split") || output.contains("unified"));
+        // The diff pane itself is still shown, but the list panes are gone.
+        assert!(output.contains("Diff"));
+        assert!(!output.contains("Repository"));
+        assert!(!output.contains("Commit"));
+        assert!(!output.contains("File"));
+        // The status row stays.
+        assert!(output.contains("? help • q quit"));
+
+        // Collapsing restores the list panes.
+        app.handle_input(Input::Character('z'));
+        assert!(!app.diff_expanded());
+        let restored = rendered_text(&mut app, 120, 32);
+        for label in ["Repository", "Commit", "File"] {
+            assert!(restored.contains(label), "missing {label} after collapse");
+        }
+    }
+
+    #[test]
+    fn expanding_enables_split_where_the_normal_layout_forced_unified_fallback_and_collapse_returns()
+     {
+        let lines = crate::github::parse_patch_text(SPLIT_PATCH)
+            .lines()
+            .to_vec();
+        let normal_inner = |width: u16| {
+            ReviewPaneLayout::from_area(Rect::new(0, 0, width, 24)).diff_content_width()
+        };
+        let expanded_inner = |width: u16| {
+            ExpandedDiffLayout::from_area(Rect::new(0, 0, width, 24)).diff_content_width()
+        };
+        let width = (60..200)
+            .find(|width| {
+                let normal_width = normal_inner(*width);
+                // Wide enough that the fallback notice renders on a single
+                // row, so the assertion below can compare it verbatim.
+                normal_width >= crate::app::SPLIT_FALLBACK_NOTICE.len()
+                    && crate::diff_view::SplitLayout::fit(&lines, normal_width).is_none()
+                    && crate::diff_view::SplitLayout::fit(&lines, expanded_inner(*width)).is_some()
+            })
+            .expect("a width exists where expanding enables split");
+
+        let mut app = focused_patch_app(SPLIT_PATCH, width, 24);
+        let raw_row_before = app.diff_cursor_raw_row();
+        assert_eq!(app.effective_diff_mode(), DiffViewMode::Unified);
+        let (rows, _, _) = diff_pane_rows(&mut app, width, 24);
+        assert_eq!(rows[0].trim_end(), crate::app::SPLIT_FALLBACK_NOTICE);
+
+        app.handle_input(Input::Character('z'));
+        assert!(app.diff_expanded());
+        assert_eq!(app.effective_diff_mode(), DiffViewMode::Split);
+
+        let backend = TestBackend::new(width, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        app.resize(width, 24);
+        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        let output: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(output.contains("Old") && output.contains("New • comment side"));
+        assert!(!output.contains(crate::app::SPLIT_FALLBACK_NOTICE));
+
+        app.handle_input(Input::Character('z'));
+        assert!(!app.diff_expanded());
+        assert_eq!(app.effective_diff_mode(), DiffViewMode::Unified);
+        let (rows, _, _) = diff_pane_rows(&mut app, width, 24);
+        assert_eq!(rows[0].trim_end(), crate::app::SPLIT_FALLBACK_NOTICE);
+        assert_eq!(app.diff_cursor_raw_row(), raw_row_before);
     }
 
     #[test]

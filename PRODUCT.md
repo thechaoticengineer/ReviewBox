@@ -99,9 +99,12 @@ position feedback, wrapped-row comment targeting and search, and resize anchor
 preservation; the default labeled side-by-side view (`v` toggles unified) with
 positional alignment of deletion/addition runs within a hunk, independent
 per-side wrapping, attached no-newline markers and an automatic unified
-fallback with a notice below 20 text columns per side; and active-side
+fallback with a notice below 20 text columns per side; active-side
 selection for line comments (`<` old, `>` new) with refusal on alignment
-padding. The expanded diff view is still in progress.
+padding; and an in-app expanded diff view (`z`) that hides the
+repository/commit/file panes behind a one-row file identity header, keeps the
+status row, and restores the previous focus, selections and reading position
+exactly as left on collapse.
 
 ## Delivery order
 

@@ -26,6 +26,15 @@ pub enum DiffViewMode {
     Split,
 }
 
+impl DiffViewMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unified => "unified",
+            Self::Split => "split",
+        }
+    }
+}
+
 /// The side of a split row that line actions target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DiffSide {

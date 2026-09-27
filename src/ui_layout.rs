@@ -97,6 +97,43 @@ impl ReviewPaneLayout {
     }
 }
 
+/// The expanded diff layout: a one-row identity header, the diff pane using
+/// the rest of the area, and the status row. Replaces the three list panes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExpandedDiffLayout {
+    pub(crate) header: Rect,
+    pub(crate) diff: Rect,
+    pub(crate) status: Rect,
+}
+
+impl ExpandedDiffLayout {
+    pub(crate) fn from_area(area: Rect) -> Self {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        Self {
+            header: rows[0],
+            diff: rows[1],
+            status: rows[2],
+        }
+    }
+
+    /// Diff pane content rows, excluding its top and bottom border. The
+    /// header and status rows are already excluded by `from_area`.
+    pub(crate) fn diff_content_height(self) -> usize {
+        self.diff.height.saturating_sub(2) as usize
+    }
+
+    pub(crate) fn diff_content_width(self) -> usize {
+        self.diff.width.saturating_sub(2) as usize
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +186,26 @@ mod tests {
         );
         assert!(layout.diff_content_width() > 0);
         assert_eq!(layout.status.height, 1);
+    }
+
+    #[test]
+    fn expanded_layout_stays_in_bounds_and_has_a_one_row_header_and_status() {
+        for (width, height) in [(120, 32), (80, 24), (60, 16)] {
+            let area = Rect::new(0, 0, width, height);
+            let layout = ExpandedDiffLayout::from_area(area);
+
+            assert_eq!(layout.header.height, 1);
+            assert_eq!(layout.status.height, 1);
+            assert_eq!(layout.header.y, 0);
+            assert_eq!(layout.diff.y, 1);
+            assert_eq!(layout.status.bottom(), area.bottom());
+            assert_eq!(layout.diff.right(), area.right());
+            assert!(layout.diff_content_height() > 0, "at {width}x{height}");
+            assert!(layout.diff_content_width() > 0, "at {width}x{height}");
+            // The expanded diff pane gets far more width than the normal
+            // 56% column, so the split threshold is easier to satisfy.
+            let normal = ReviewPaneLayout::from_area(area);
+            assert!(layout.diff_content_width() > normal.diff_content_width());
+        }
     }
 }
