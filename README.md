@@ -250,9 +250,12 @@ Normal mode:
 | Keys | Action |
 | --- | --- |
 | `h / l or Left / Right` | focus previous / next pane |
-| `j / k or Down / Up` | move or scroll down / up |
+| `j / k or Down / Up` | move down / up; diff: one display row |
 | `gg / G` | first / last position |
+| `Home / End` | first / last position |
 | `Ctrl-d / Ctrl-u` | move down / up half a pane |
+| `PageDown / PageUp` | move down / up a full pane |
+| `[ / ]` | diff: previous / next hunk |
 | `Enter / Escape` | open child / return to parent |
 | `/` | search the focused pane |
 | `n / N` | next / previous search match |
@@ -308,6 +311,36 @@ Help, Edit, Comments, Publish, and Bulk confirmation modes isolate their keys
 from Normal mode; `Space`, `A`, and `m` cannot start a bulk change from them.
 Normal navigation letters are inserted literally in Edit mode.
 
+### Reading diffs
+
+The diff pane wraps long patch lines to the pane width and moves by
+**display row**: `j`/`k` and `Up`/`Down` step through every wrapped row,
+including the middle and end of a single line taller than the pane.
+`Ctrl-d`/`Ctrl-u` move half a pane and `PageDown`/`PageUp` a full pane; the
+viewport and cursor move together, so consecutive pages show adjacent rows
+without skipping any, and the last page stops at the patch end without blank
+overrun. `Home`/`End` (like `gg`/`G`) jump to the start or end of the patch;
+in the other panes they select the first or last item, and in Edit mode they
+still move the text cursor. `]` and `[` jump to the next or previous hunk
+header, placing it at the top of the pane when possible, and report
+`Already at last hunk` / `Already at first hunk` at the boundaries. The page
+size excludes the pane borders and any wrapped notices, such as a local patch
+cap.
+
+The Diff title shows `patch row R/T • hunk H/N`. It counts rows of the patch
+GitHub returned, not of the full file; ReviewBox never fetches or shows file
+content beyond the patch. Only the first wrapped row of a patch line shows the
+draft/comment marker and old/new line numbers. A comment on any wrapped row
+targets the same original patch line and GitHub position; hunk headers,
+no-newline markers and unsupported rows cannot take a line comment. Search
+(`/`, `n`, `N`) matches patch lines case-insensitively and moves to the wrapped
+row that contains the match. Resizing keeps the current line and position
+within it, and a cursor at the patch end keeps following the end.
+
+Planned, not yet available: a labeled side-by-side old/new view with a unified
+fallback, choosing the old or new side for line actions, and an expanded
+full-terminal diff view.
+
 ## Terminal restoration
 
 ReviewBox acquires raw mode, the alternate screen, and a hidden cursor in that
@@ -334,6 +367,14 @@ still moving the text cursor and Help/Comments/Search/Publish/Bulk modes
 either scrolling consistently or staying isolated; a dedicated test asserts
 every key dispatched in Normal mode, including the arrows, `o`/`O`/`x`,
 `Space`, and `A`, has a matching `?` help entry.
+Diff navigation tests cover display-row, half-page, full-page, start/end and
+hunk movement at exact viewport boundaries (with and without wrapped notices),
+every wrapped row of a line taller than the pane, exact-fit tails, resize
+anchor preservation, search into a wrapped continuation, comment targets on
+continuations resolving to the original GitHub position, refusal on hunk
+headers, no-newline markers and unsupported rows, isolation of the new keys
+in every modal mode, and that cursor movement reuses the cached display
+projection while width changes and same-file content replacement rebuild it.
 Backlog tests drive the real background loader with scripted `gh` responses and
 in-memory pagers. They cover full raw pages whose accepted projection is empty
 followed by older pages (an empty initial batch), entirely reviewed first

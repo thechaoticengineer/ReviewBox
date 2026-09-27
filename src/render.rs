@@ -808,67 +808,61 @@ fn diff_message(app: &App, area: Rect, message: &str, style: Style) -> Vec<Line<
 
 fn diff_lines(app: &App, available_rows: usize) -> Vec<Line<'static>> {
     let mut lines = diff_notice(app);
-    let gutter_width = app.diff_gutter_width();
+    let projection = app.diff_projection();
+    let patch = app.current_diff_lines();
+    let gutter_width = projection.gutter_width();
     let number_width = gutter_width.saturating_sub(5) / 2;
-    let content_width = app.diff_content_width();
-    for (index, content) in app
-        .current_diff_lines()
-        .iter()
-        .enumerate()
-        .skip(app.scroll(Pane::Diff))
-    {
-        let style = diff_style(content.kind);
-        let matched = app.diff_match() == Some(index);
-        let selected = app.diff_cursor() == index;
-        let drafted = app.diff_line_has_draft(index);
-        let commented = app.diff_line_has_comment(index);
-        for (row, text) in wrap_text(&content.text, content_width)
-            .into_iter()
-            .enumerate()
-            .skip(if index == app.scroll(Pane::Diff) {
-                app.diff_row_offset()
-            } else {
-                0
-            })
-        {
-            if lines.len() >= available_rows {
-                return lines;
-            }
-            let gutter = if row == 0 {
-                format_diff_gutter(
-                    drafted,
-                    commented,
-                    content.old_line,
-                    content.new_line,
-                    number_width,
-                )
-            } else {
-                " ".repeat(gutter_width)
-            };
-            let text_style = if selected {
-                style.add_modifier(Modifier::REVERSED)
-            } else if matched {
-                style.add_modifier(Modifier::BOLD)
-            } else {
-                style
-            };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    gutter,
-                    if selected {
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    },
-                ),
-                Span::styled(text, text_style),
-            ]));
-        }
+    let visible = available_rows.saturating_sub(lines.len());
+    let first = app.scroll(Pane::Diff);
+    for (offset, row) in projection.rows(first, visible).iter().enumerate() {
+        let Some(content) = patch.get(row.raw_row) else {
+            continue;
+        };
+        let style = diff_style(row.kind);
+        let selected = app.diff_cursor() == first + offset;
+        let matched = app.diff_match() == Some(row.raw_row);
+        // Only the first wrapped row carries the gutter; continuations belong
+        // to the same raw row and show a blank gutter.
+        let gutter = if row.is_continuation() {
+            " ".repeat(gutter_width)
+        } else {
+            format_diff_gutter(
+                app.diff_line_has_draft(row.raw_row),
+                app.diff_line_has_comment(row.raw_row),
+                content.old_line,
+                content.new_line,
+                number_width,
+            )
+        };
+        let text_style = if selected {
+            style.add_modifier(Modifier::REVERSED)
+        } else if matched {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            style
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                gutter,
+                if selected {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            Span::styled(projection.row_text(patch, row).to_owned(), text_style),
+        ]));
     }
     lines
+}
+
+/// The diff pane body (notices and visible patch rows) for `rows` inner rows.
+#[cfg(test)]
+pub(crate) fn diff_pane_lines_for_test(app: &App, rows: usize) -> Vec<Line<'static>> {
+    diff_lines(app, rows)
 }
 
 fn diff_notice(app: &App) -> Vec<Line<'static>> {
@@ -938,9 +932,11 @@ fn pane_block<'a>(pane: Pane, focused: bool, app: &App) -> Block<'a> {
     let (reviewed, total) = app.review_progress();
     let filter = app.view_label();
     let title = if pane == Pane::Diff {
+        // Position first: it is the part most often clipped in narrow panes.
         format!(
-            " {} • {} • {filter} {reviewed}/{total} reviewed • {position}/{length} ",
+            " {} • {} • {} • {filter} {reviewed}/{total} reviewed ",
             pane.title(),
+            app.diff_position_label(),
             app.diff_comment_feedback()
         )
     } else if pane == Pane::Commit && app.selection_count() > 0 {
@@ -1836,7 +1832,9 @@ mod tests {
         let mut app = App::new(DemoFixture::load());
         app.handle_input(Input::Character('?'));
 
-        let output = rendered_text(&mut app, 120, 32);
+        // Tall enough to show every binding without scrolling; scrolling at
+        // smaller sizes is covered by the boundary-size help test.
+        let output = rendered_text(&mut app, 120, 40);
 
         assert!(output.contains("Keyboard help"));
         for binding in HELP_BINDINGS {
@@ -2258,6 +2256,71 @@ mod tests {
         app.apply(Command::Last);
         let tail = rendered_text(&mut app, 60, 16);
         assert!(tail.contains("TAIL"));
+    }
+
+    fn diff_title(app: &mut App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        app.resize(width, height);
+        terminal.draw(|frame| draw(frame, app)).expect("draw");
+        let diff = ReviewPaneLayout::from_area(Rect::new(0, 0, width, height)).diff;
+        let buffer = terminal.backend().buffer();
+        (diff.x..diff.right())
+            .map(|x| buffer[(x, diff.y)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn diff_title_and_wrapped_rows_show_patch_row_position_and_blank_continuation_gutters() {
+        let mut app = demo_patch_app(PatchContent::Text {
+            lines: vec![
+                DiffLine {
+                    kind: DiffLineKind::Hunk,
+                    old_line: None,
+                    new_line: None,
+                    text: "@@ -1 +1 @@".to_owned(),
+                },
+                DiffLine {
+                    kind: DiffLineKind::Addition,
+                    old_line: None,
+                    new_line: Some(7),
+                    text: format!("+{}", "w".repeat(120)),
+                },
+            ],
+        });
+        app.resize(120, 32);
+        for _ in 0..3 {
+            app.apply(Command::Open);
+        }
+        app.handle_input(Input::Character('j'));
+        app.handle_input(Input::Character('j'));
+
+        let title = diff_title(&mut app, 120, 32);
+        assert!(title.contains("patch row 3/4"), "title: {title}");
+        assert!(title.contains("hunk 1/1"), "title: {title}");
+
+        let body = rendered_diff_prefix(&mut app, 120, 32, 4);
+        let inner = ReviewPaneLayout::from_area(Rect::new(0, 0, 120, 32))
+            .diff
+            .width
+            .saturating_sub(2) as usize;
+        let rows: Vec<String> = body
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(inner)
+            .map(|row| row.iter().collect())
+            .collect();
+        assert!(rows[1].starts_with("    7 +w"), "first row: {:?}", rows[1]);
+        assert!(
+            rows[2].starts_with("       w"),
+            "continuation: {:?}",
+            rows[2]
+        );
+        assert!(
+            rows[3].starts_with("       w"),
+            "continuation: {:?}",
+            rows[3]
+        );
     }
 
     #[test]

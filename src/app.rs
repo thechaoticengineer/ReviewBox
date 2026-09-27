@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
 use std::io::Read;
@@ -9,6 +10,7 @@ use crate::comment_draft::{
     CommentAnchor, CommentDraft, CommentDrafts, CommentTarget, DraftStateError, DraftStore,
     MAX_DRAFT_CHARACTERS, MemoryDraftStore, SubmissionAttempt, line_target,
 };
+use crate::diff_view::{DiffAnchor, DiffProjection, DiffViewMode};
 use crate::external_editor::EditorOutcome;
 use crate::github::{
     CommentFailure, DetailFailure, DetailState, ExistingCommentAnchor, ExistingComments,
@@ -174,9 +176,14 @@ pub enum Command {
     MoveDown,
     MoveUp,
     GPrefix,
+    First,
     Last,
     HalfPageDown,
     HalfPageUp,
+    PageDown,
+    PageUp,
+    NextHunk,
+    PreviousHunk,
     Open,
     Back,
     ToggleReviewed,
@@ -205,6 +212,8 @@ pub enum Input {
     ExternalEditor,
     HalfPageDown,
     HalfPageUp,
+    PageDown,
+    PageUp,
     Quit,
     Unrelated,
 }
@@ -222,15 +231,27 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
     },
     HelpBinding {
         keys: "j / k or Down / Up",
-        action: "move or scroll down / up",
+        action: "move down / up; diff: one display row",
     },
     HelpBinding {
         keys: "gg / G",
         action: "first / last position",
     },
     HelpBinding {
+        keys: "Home / End",
+        action: "first / last position",
+    },
+    HelpBinding {
         keys: "Ctrl-d / Ctrl-u",
         action: "move down / up half a pane",
+    },
+    HelpBinding {
+        keys: "PageDown / PageUp",
+        action: "move down / up a full pane",
+    },
+    HelpBinding {
+        keys: "[ / ]",
+        action: "diff: previous / next hunk",
     },
     HelpBinding {
         keys: "Enter / Escape",
@@ -353,6 +374,42 @@ struct ListPosition {
 struct SearchQuery {
     original: String,
     needle: String,
+}
+
+/// Everything a diff projection depends on. Cursor movement changes none of
+/// these fields, so it always reuses the cached projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffProjectionKey {
+    detail: Option<DetailKey>,
+    file_index: usize,
+    content_generation: u64,
+    /// Address and length of the current patch rows; a cheap extra guard
+    /// against replaced content.
+    lines: (usize, usize),
+    viewport_width: usize,
+    mode: DiffViewMode,
+}
+
+impl DiffProjectionKey {
+    fn same_file(&self, other: &Self) -> bool {
+        self.detail == other.detail && self.file_index == other.file_index
+    }
+}
+
+/// The logical position and viewport-relative row the user last read at.
+/// It is reused across consecutive rebuilds while the cursor stays on the
+/// row containing it, so repeated resizes do not drift to row starts.
+#[derive(Debug, Clone, Copy)]
+struct DiffReadingAnchor {
+    anchor: DiffAnchor,
+    relative: usize,
+    cursor: usize,
+}
+
+#[derive(Debug)]
+struct CachedDiffProjection {
+    key: DiffProjectionKey,
+    projection: DiffProjection,
 }
 
 const MAX_VISIBLE_FAILURES: usize = 3;
@@ -737,11 +794,22 @@ pub struct App {
     repositories: ListPosition,
     commits: ListPosition,
     files: ListPosition,
+    /// Display-row index of the diff cursor in the cached projection.
     diff_cursor: usize,
+    /// Display-row index of the first visible patch row.
     diff_scroll: usize,
-    diff_row_offset: usize,
+    /// Raw patch row of the current search match.
     diff_match: Option<usize>,
     diff_viewport_width: usize,
+    diff_view: Option<CachedDiffProjection>,
+    /// Reading position restored across projection rebuilds.
+    diff_anchor: Option<DiffReadingAnchor>,
+    /// Changes whenever patch data may have been replaced under an unchanged
+    /// commit and file identity, so a cached projection is never reused for
+    /// replaced content.
+    diff_content_generation: u64,
+    #[cfg(test)]
+    diff_projection_builds: usize,
     viewport_heights: [usize; 4],
     pending_g: bool,
     search_query: String,
@@ -872,9 +940,13 @@ impl App {
             files: ListPosition::default(),
             diff_cursor: 0,
             diff_scroll: 0,
-            diff_row_offset: 0,
             diff_match: None,
             diff_viewport_width: 0,
+            diff_view: None,
+            diff_anchor: None,
+            diff_content_generation: 0,
+            #[cfg(test)]
+            diff_projection_builds: 0,
             viewport_heights: [0; 4],
             pending_g: false,
             search_query: String::new(),
@@ -1027,6 +1099,7 @@ impl App {
                     .values()
                     .map(|loaded| loaded.repository.clone())
                     .collect();
+                self.invalidate_diff_content();
             }
             LoadEvent::RepositoryLoaded {
                 repository_index,
@@ -1049,6 +1122,7 @@ impl App {
                     .values()
                     .map(|loaded| loaded.repository.clone())
                     .collect();
+                self.invalidate_diff_content();
             }
             LoadEvent::Failure(failure) => {
                 if live.failures.len() < MAX_VISIBLE_FAILURES {
@@ -1206,10 +1280,14 @@ impl App {
             Input::Escape => Command::Back,
             Input::HalfPageDown => Command::HalfPageDown,
             Input::HalfPageUp => Command::HalfPageUp,
+            Input::PageDown => Command::PageDown,
+            Input::PageUp => Command::PageUp,
+            Input::Home => Command::First,
+            Input::End => Command::Last,
+            Input::Character(']') => Command::NextHunk,
+            Input::Character('[') => Command::PreviousHunk,
             Input::Character(_)
             | Input::Backspace
-            | Input::Home
-            | Input::End
             | Input::Cancel
             | Input::ExternalEditor
             | Input::Unrelated
@@ -1241,6 +1319,8 @@ impl App {
             | Input::ExternalEditor
             | Input::HalfPageDown
             | Input::HalfPageUp
+            | Input::PageDown
+            | Input::PageUp
             | Input::Unrelated
             | Input::Quit => {}
         }
@@ -1335,7 +1415,12 @@ impl App {
             }
             Input::Cancel => self.cancel_edit(previous_focus),
             Input::ExternalEditor => self.request_external_editor_from_edit(),
-            Input::HalfPageDown | Input::HalfPageUp | Input::Unrelated | Input::Quit => {}
+            Input::HalfPageDown
+            | Input::HalfPageUp
+            | Input::PageDown
+            | Input::PageUp
+            | Input::Unrelated
+            | Input::Quit => {}
         }
     }
 
@@ -1350,10 +1435,14 @@ impl App {
             Command::FocusNext => self.focus_next("Focus moved right"),
             Command::MoveDown => self.move_active(false, 1),
             Command::MoveUp => self.move_active(true, 1),
-            Command::GPrefix => self.move_to_first(),
+            Command::GPrefix | Command::First => self.move_to_first(),
             Command::Last => self.move_to_last(),
-            Command::HalfPageDown => self.move_active(false, self.half_page_step()),
-            Command::HalfPageUp => self.move_active(true, self.half_page_step()),
+            Command::HalfPageDown => self.move_page(false, self.half_page_step()),
+            Command::HalfPageUp => self.move_page(true, self.half_page_step()),
+            Command::PageDown => self.move_page(false, self.page_step()),
+            Command::PageUp => self.move_page(true, self.page_step()),
+            Command::NextHunk => self.move_to_hunk(true),
+            Command::PreviousHunk => self.move_to_hunk(false),
             Command::Open => self.open_selected(),
             Command::Back => self.focus_previous("Returned to parent pane"),
             Command::ToggleReviewed => self.toggle_reviewed(),
@@ -1959,7 +2048,10 @@ impl App {
         let Some(file) = self.current_file() else {
             return Err("No diff file is selected");
         };
-        let Some(line) = line_target(file, self.diff_cursor) else {
+        let Some(line) = self
+            .diff_cursor_comment_row()
+            .and_then(|row| line_target(file, row))
+        else {
             return Err("Selected diff row cannot accept a line comment");
         };
         CommentTarget::line(repository.identity.id, &commit.sha, line)
@@ -2149,6 +2241,7 @@ impl App {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.saturating_add(1);
         self.detail_cache.insert(key.clone(), DetailState::Loading);
+        self.invalidate_diff_content();
         self.touch_detail(&key);
         self.active_request = Some(ActiveDetailRequest {
             request_id,
@@ -2699,6 +2792,7 @@ impl App {
         }
 
         if projection_changed {
+            self.invalidate_diff_content();
             self.rebuild_projection(Some(selection));
             if previous_detail != self.current_detail_key() {
                 self.reset_diff_position();
@@ -2792,6 +2886,7 @@ impl App {
             return;
         }
         self.active_request = None;
+        self.invalidate_diff_content();
 
         match result.outcome {
             Ok(detail) => {
@@ -2856,7 +2951,7 @@ impl App {
             Pane::Repository => self.repositories.selected,
             Pane::Commit => self.commits.selected,
             Pane::File => self.files.selected,
-            Pane::Diff => self.diff_cursor,
+            Pane::Diff => self.diff_cursor_raw_row().unwrap_or(0),
         };
         let found = self.find_match(target, current, backward);
         let direction = if backward { "previous" } else { "next" };
@@ -2867,8 +2962,7 @@ impl App {
                 Pane::File => self.select_file(index),
                 Pane::Diff => {
                     self.diff_match = Some(index);
-                    self.diff_cursor = index;
-                    self.ensure_diff_line_visible(index);
+                    self.move_diff_cursor_to_match(index);
                 }
             }
             let length = self.dataset_len(target);
@@ -2978,16 +3072,71 @@ impl App {
                 self.select_file(selected);
             }
             Pane::Diff => {
-                self.diff_cursor = moved_index(
-                    self.diff_cursor,
-                    self.current_diff_lines().len(),
-                    upward,
-                    amount,
-                );
-                self.ensure_diff_line_visible(self.diff_cursor);
+                self.sync_diff_projection();
+                self.diff_cursor =
+                    moved_index(self.diff_cursor, self.diff_row_count(), upward, amount);
+                self.ensure_diff_cursor_visible();
             }
         }
         self.status = if upward { "Moved up" } else { "Moved down" }.to_owned();
+    }
+
+    /// Ctrl-d/Ctrl-u and PageDown/PageUp. In the diff, the viewport and the
+    /// cursor move together, so consecutive pages show adjacent display rows
+    /// without skipping any; the last page stops at an exact-fit tail.
+    fn move_page(&mut self, upward: bool, amount: usize) {
+        if self.focus != Pane::Diff {
+            self.move_active(upward, amount);
+            return;
+        }
+        self.sync_diff_projection();
+        let total = self.diff_row_count();
+        if upward {
+            self.diff_scroll = self.diff_scroll.saturating_sub(amount);
+            self.diff_cursor = self.diff_cursor.saturating_sub(amount);
+        } else {
+            self.diff_scroll = self
+                .diff_scroll
+                .saturating_add(amount)
+                .min(self.max_diff_scroll());
+            self.diff_cursor = self
+                .diff_cursor
+                .saturating_add(amount)
+                .min(total.saturating_sub(1));
+        }
+        self.ensure_diff_cursor_visible();
+        self.status = if upward { "Moved up" } else { "Moved down" }.to_owned();
+    }
+
+    fn move_to_hunk(&mut self, forward: bool) {
+        if self.focus != Pane::Diff {
+            self.status = "Hunk movement works in the Diff pane".to_owned();
+            return;
+        }
+        self.sync_diff_projection();
+        let projection = self.cached_diff_projection();
+        if projection.hunk_count() == 0 {
+            self.status = "No hunk headers in this patch".to_owned();
+            return;
+        }
+        let target = if forward {
+            projection.next_hunk(self.diff_cursor)
+        } else {
+            projection.previous_hunk(self.diff_cursor)
+        };
+        let Some(row) = target else {
+            self.status = if forward {
+                "Already at last hunk"
+            } else {
+                "Already at first hunk"
+            }
+            .to_owned();
+            return;
+        };
+        let (number, count) = (projection.hunk_number(row), projection.hunk_count());
+        self.diff_cursor = row;
+        self.diff_scroll = row.min(self.max_diff_scroll());
+        self.status = format!("Moved to hunk {number}/{count}");
     }
 
     fn move_to_first(&mut self) {
@@ -2997,7 +3146,7 @@ impl App {
             Pane::File => self.select_file(0),
             Pane::Diff => {
                 self.diff_cursor = 0;
-                self.ensure_diff_line_visible(0);
+                self.diff_scroll = 0;
             }
         }
         self.status = "Moved to first position".to_owned();
@@ -3015,16 +3164,28 @@ impl App {
                 self.select_file(self.current_files().len().saturating_sub(1));
             }
             Pane::Diff => {
-                self.diff_cursor = self.current_diff_lines().len().saturating_sub(1);
+                self.sync_diff_projection();
+                self.diff_cursor = self.diff_row_count().saturating_sub(1);
                 self.diff_scroll = self.max_diff_scroll();
-                self.diff_row_offset = self.tail_diff_row_offset();
             }
         }
         self.status = "Moved to last position".to_owned();
     }
 
     fn half_page_step(&self) -> usize {
-        (self.viewport_heights[self.focus.index()] / 2).max(1)
+        (self.page_capacity() / 2).max(1)
+    }
+
+    fn page_step(&self) -> usize {
+        self.page_capacity().max(1)
+    }
+
+    fn page_capacity(&self) -> usize {
+        if self.focus == Pane::Diff {
+            self.diff_patch_capacity()
+        } else {
+            self.viewport_heights[self.focus.index()]
+        }
     }
 
     fn select_repository(&mut self, selected: usize) {
@@ -3074,21 +3235,11 @@ impl App {
             self.viewport_heights[Pane::File.index()],
         );
 
-        let diff_len = self.current_diff_lines().len();
-        self.diff_cursor = self.diff_cursor.min(diff_len.saturating_sub(1));
-        self.diff_scroll = self.diff_scroll.min(self.max_diff_scroll());
-        self.diff_row_offset = self
-            .diff_row_offset
-            .min(self.diff_line_rows(self.diff_scroll).saturating_sub(1));
-        let tail_requested = diff_len > 0
-            && self.diff_cursor == diff_len.saturating_sub(1)
-            && self.diff_row_offset > 0;
-        if tail_requested {
-            self.diff_scroll = self.max_diff_scroll();
-            self.diff_row_offset = self.tail_diff_row_offset();
-        } else if diff_len > 0 {
-            self.ensure_diff_line_visible(self.diff_cursor);
-        }
+        self.sync_diff_projection();
+        self.diff_cursor = self
+            .diff_cursor
+            .min(self.diff_row_count().saturating_sub(1));
+        self.ensure_diff_cursor_visible();
         self.focus = self.focus.min(self.deepest_meaningful_pane());
         self.reconcile_selection();
     }
@@ -3111,62 +3262,202 @@ impl App {
     }
 
     fn max_diff_scroll(&self) -> usize {
-        let capacity = self.diff_patch_capacity();
-        let lines = self.current_diff_lines();
-        let mut rows: usize = 0;
-        for index in (0..lines.len()).rev() {
-            rows = rows.saturating_add(self.diff_line_rows(index));
-            if rows > capacity {
-                return index.saturating_add(1).min(lines.len().saturating_sub(1));
-            }
-        }
-        0
+        self.diff_row_count()
+            .saturating_sub(self.diff_patch_capacity())
     }
 
-    fn ensure_diff_line_visible(&mut self, index: usize) {
+    /// Keeps the cursor inside `[scroll, scroll + capacity)` and the viewport
+    /// inside the projection, so an exact-fit tail shows no blank overrun.
+    fn ensure_diff_cursor_visible(&mut self) {
         let capacity = self.diff_patch_capacity();
-        if index < self.diff_scroll {
-            self.diff_scroll = index;
-            self.diff_row_offset = 0;
-            return;
+        if self.diff_cursor < self.diff_scroll {
+            self.diff_scroll = self.diff_cursor;
+        } else if self.diff_cursor >= self.diff_scroll.saturating_add(capacity) {
+            self.diff_scroll = self.diff_cursor + 1 - capacity;
         }
-        let mut rows: usize = 0;
-        for line in self.diff_scroll..=index {
-            rows = rows.saturating_add(self.diff_line_rows(line));
-        }
-        if rows > capacity {
-            self.diff_scroll = index;
-            let mut rows = self.diff_line_rows(index);
-            while self.diff_scroll > 0 {
-                let previous = self.diff_line_rows(self.diff_scroll - 1);
-                if rows.saturating_add(previous) > capacity {
-                    break;
-                }
-                rows += previous;
-                self.diff_scroll -= 1;
-            }
-        }
-        self.diff_row_offset = 0;
+        self.diff_scroll = self.diff_scroll.min(self.max_diff_scroll());
     }
 
-    fn tail_diff_row_offset(&self) -> usize {
-        let capacity = self.diff_patch_capacity();
-        let total_rows = (self.diff_scroll..self.current_diff_lines().len())
-            .map(|index| self.diff_line_rows(index))
-            .sum::<usize>();
-        total_rows.saturating_sub(capacity)
+    fn move_diff_cursor_to_match(&mut self, raw_row: usize) {
+        let char_offset = self
+            .current_diff_lines()
+            .get(raw_row)
+            .zip(self.last_search.as_ref())
+            .map_or(0, |(line, query)| {
+                match_char_offset(&line.text, &query.needle)
+            });
+        self.sync_diff_projection();
+        if let Some(row) = self.cached_diff_projection().row_for_anchor(DiffAnchor {
+            raw_row,
+            char_offset,
+        }) {
+            self.diff_cursor = row;
+        }
+        self.ensure_diff_cursor_visible();
     }
 
     fn clear_diff_match(&mut self) {
         self.diff_match = None;
-        self.diff_row_offset = 0;
     }
 
     fn reset_diff_position(&mut self) {
         self.diff_cursor = 0;
         self.diff_scroll = 0;
-        self.diff_row_offset = 0;
         self.diff_match = None;
+    }
+
+    fn invalidate_diff_content(&mut self) {
+        self.diff_content_generation = self.diff_content_generation.wrapping_add(1);
+    }
+
+    fn diff_projection_key(&self) -> DiffProjectionKey {
+        let lines = self.current_diff_lines();
+        DiffProjectionKey {
+            detail: self.current_detail_key(),
+            file_index: self.files.selected,
+            content_generation: self.diff_content_generation,
+            lines: (lines.as_ptr() as usize, lines.len()),
+            viewport_width: self.diff_viewport_width,
+            mode: DiffViewMode::Unified,
+        }
+    }
+
+    fn build_diff_projection(&self) -> DiffProjection {
+        let lines = self.current_diff_lines();
+        let gutter_width = DiffProjection::gutter_width_for(lines);
+        // Without known geometry (compact fallback) rows are left unwrapped;
+        // the next real resize rebuilds them at the actual width.
+        let content_width = if self.diff_viewport_width == 0 {
+            usize::MAX
+        } else {
+            self.diff_viewport_width.saturating_sub(gutter_width).max(1)
+        };
+        DiffProjection::build(lines, content_width, gutter_width)
+    }
+
+    /// Rebuilds the cached projection when its file, content, width or mode
+    /// changed. For the same file, the cursor keeps its logical anchor (raw
+    /// row and wrapped character offset) and its viewport-relative position;
+    /// a cursor on the last row keeps following the tail.
+    fn sync_diff_projection(&mut self) {
+        let key = self.diff_projection_key();
+        if self
+            .diff_view
+            .as_ref()
+            .is_some_and(|cached| cached.key == key)
+        {
+            return;
+        }
+        let stored = self.diff_anchor.take();
+        let restore = self.diff_view.take().and_then(|previous| {
+            if !previous.key.same_file(&key) {
+                return None;
+            }
+            // A cursor on the last row follows the tail, unless that row is
+            // also the first one, where the start of the patch wins.
+            let at_tail = self.diff_cursor > 0 && self.diff_cursor + 1 == previous.projection.len();
+            let reading = match stored {
+                Some(stored)
+                    if previous.projection.row_for_anchor(stored.anchor)
+                        == Some(self.diff_cursor) =>
+                {
+                    let relative = if stored.cursor == self.diff_cursor {
+                        stored.relative
+                    } else {
+                        self.diff_cursor.saturating_sub(self.diff_scroll)
+                    };
+                    (stored.anchor, relative)
+                }
+                _ => (
+                    previous.projection.anchor(self.diff_cursor)?,
+                    self.diff_cursor.saturating_sub(self.diff_scroll),
+                ),
+            };
+            Some((reading, at_tail))
+        });
+        let projection = self.build_diff_projection();
+        #[cfg(test)]
+        {
+            self.diff_projection_builds += 1;
+        }
+        self.diff_view = Some(CachedDiffProjection { key, projection });
+        let Some(((anchor, relative), at_tail)) = restore else {
+            return;
+        };
+        let total = self.cached_diff_projection().len();
+        if at_tail {
+            self.diff_cursor = total.saturating_sub(1);
+            self.diff_scroll = self.max_diff_scroll();
+        } else if let Some(row) = self.cached_diff_projection().row_for_anchor(anchor) {
+            self.diff_cursor = row;
+            self.diff_scroll = row.saturating_sub(relative).min(self.max_diff_scroll());
+            self.ensure_diff_cursor_visible();
+            self.diff_anchor = Some(DiffReadingAnchor {
+                anchor,
+                relative,
+                cursor: row,
+            });
+        }
+    }
+
+    /// The cached projection; callers sync it first.
+    fn cached_diff_projection(&self) -> &DiffProjection {
+        static EMPTY: std::sync::OnceLock<DiffProjection> = std::sync::OnceLock::new();
+        self.diff_view.as_ref().map_or_else(
+            || EMPTY.get_or_init(|| DiffProjection::build(&[], 1, 0)),
+            |cached| &cached.projection,
+        )
+    }
+
+    /// The projection for the current diff: the cached one when it is
+    /// current, otherwise a fresh build that is not cached.
+    pub(crate) fn diff_projection(&self) -> Cow<'_, DiffProjection> {
+        match &self.diff_view {
+            Some(cached) if cached.key == self.diff_projection_key() => {
+                Cow::Borrowed(&cached.projection)
+            }
+            _ => Cow::Owned(self.build_diff_projection()),
+        }
+    }
+
+    fn diff_row_count(&self) -> usize {
+        match &self.diff_view {
+            Some(cached) if cached.key == self.diff_projection_key() => cached.projection.len(),
+            _ => self.build_diff_projection().len(),
+        }
+    }
+
+    /// Raw patch row and comment row under the diff cursor.
+    fn diff_cursor_rows(&self) -> Option<(usize, Option<usize>)> {
+        self.diff_projection()
+            .row(self.diff_cursor)
+            .map(|row| (row.raw_row, row.comment_row))
+    }
+
+    pub fn diff_cursor_raw_row(&self) -> Option<usize> {
+        self.diff_cursor_rows().map(|(raw_row, _)| raw_row)
+    }
+
+    pub fn diff_cursor_comment_row(&self) -> Option<usize> {
+        self.diff_cursor_rows()
+            .and_then(|(_, comment_row)| comment_row)
+    }
+
+    /// Diff title position: display rows of the patch (not of the file) and
+    /// the hunk containing the cursor.
+    pub fn diff_position_label(&self) -> String {
+        let projection = self.diff_projection();
+        let total = projection.len();
+        let row = if projection.is_empty() {
+            0
+        } else {
+            self.diff_cursor.min(total - 1) + 1
+        };
+        format!(
+            "patch row {row}/{total} • hunk {}/{}",
+            projection.hunk_number(self.diff_cursor),
+            projection.hunk_count()
+        )
     }
 
     pub fn diff_match(&self) -> Option<usize> {
@@ -3177,37 +3468,8 @@ impl App {
         self.diff_cursor
     }
 
-    pub fn diff_row_offset(&self) -> usize {
-        self.diff_row_offset
-    }
-
-    pub fn diff_gutter_width(&self) -> usize {
-        let max_number = self
-            .current_diff_lines()
-            .iter()
-            .flat_map(|line| [line.old_line, line.new_line])
-            .flatten()
-            .max()
-            .unwrap_or(0);
-        decimal_width(max_number)
-            .saturating_mul(2)
-            .saturating_add(5)
-    }
-
-    pub fn diff_content_width(&self) -> usize {
-        self.diff_viewport_width
-            .saturating_sub(self.diff_gutter_width())
-            .max(1)
-    }
-
     pub(crate) fn diff_viewport_width(&self) -> usize {
         self.diff_viewport_width.max(1)
-    }
-
-    pub fn diff_line_rows(&self, index: usize) -> usize {
-        self.current_diff_lines().get(index).map_or(0, |line| {
-            wrap_text(&line.text, self.diff_content_width()).len()
-        })
     }
 
     pub(crate) fn diff_notice_texts(&self) -> Vec<String> {
@@ -3233,7 +3495,10 @@ impl App {
         notices
     }
 
-    fn diff_patch_capacity(&self) -> usize {
+    /// Patch rows that fit in the diff pane: the inner height (borders are
+    /// already excluded) minus the wrapped notice rows drawn above the patch.
+    /// The unified view draws no additional header rows.
+    pub(crate) fn diff_patch_capacity(&self) -> usize {
         let notice_rows = self
             .diff_notice_texts()
             .iter()
@@ -3330,7 +3595,11 @@ impl App {
     }
 
     pub fn position(&self, pane: Pane) -> (usize, usize) {
-        let length = self.dataset_len(pane);
+        let length = if pane == Pane::Diff {
+            self.diff_row_count()
+        } else {
+            self.dataset_len(pane)
+        };
         if length == 0 {
             (0, 0)
         } else {
@@ -3547,7 +3816,10 @@ impl App {
         let Some(file) = self.current_file() else {
             return "line comments unavailable: no diff".to_owned();
         };
-        if let Some(target) = line_target(file, self.diff_cursor) {
+        if let Some(target) = self
+            .diff_cursor_comment_row()
+            .and_then(|row| line_target(file, row))
+        {
             return format!("commentable {}:{}", target.path, target.position);
         }
         if !file.api_path_is_commentable {
@@ -3572,7 +3844,11 @@ impl App {
         if lines.first().map(|line| line.kind) != Some(DiffLineKind::Hunk) {
             return "line comments unavailable: invalid hunk".to_owned();
         }
-        match lines.get(self.diff_cursor).map(|line| line.kind) {
+        match self
+            .diff_cursor_raw_row()
+            .and_then(|row| lines.get(row))
+            .map(|line| line.kind)
+        {
             Some(DiffLineKind::Hunk) => "line comments unavailable: hunk header".to_owned(),
             Some(DiffLineKind::NoNewline) => {
                 "line comments unavailable: no-newline marker".to_owned()
@@ -3785,6 +4061,7 @@ impl App {
         ) {
             self.detail_cache.remove(&active.key);
             self.remove_detail_lru(&active.key);
+            self.invalidate_diff_content();
         }
         self.effects.push_back(DetailEffect::Cancel {
             request_id: active.request_id,
@@ -3900,8 +4177,20 @@ fn find_wrapped_direction(
     }
 }
 
-fn decimal_width(number: u32) -> usize {
-    number.to_string().len().max(1)
+/// Character offset of the first case-insensitive occurrence of an already
+/// lowercased `needle` in `text`, or 0 when it cannot be located per character.
+fn match_char_offset(text: &str, needle: &str) -> usize {
+    let mut lowered = String::with_capacity(text.len());
+    let mut starts = Vec::with_capacity(text.len());
+    for character in text.chars() {
+        starts.push(lowered.len());
+        lowered.extend(character.to_lowercase());
+    }
+    lowered.find(needle).map_or(0, |byte| {
+        starts
+            .partition_point(|start| *start <= byte)
+            .saturating_sub(1)
+    })
 }
 
 fn moved_index(current: usize, length: usize, upward: bool, amount: usize) -> usize {
@@ -4496,17 +4785,18 @@ mod tests {
         let mut app = app();
         app.focus = Pane::Diff;
 
+        // Six one-row patch lines in a two-row viewport.
         app.apply(Command::Last);
-        assert_eq!(app.scroll(Pane::Diff), 5);
+        assert_eq!((app.diff_cursor(), app.scroll(Pane::Diff)), (5, 4));
         app.apply(Command::MoveDown);
-        assert_eq!(app.scroll(Pane::Diff), 5);
+        assert_eq!((app.diff_cursor(), app.scroll(Pane::Diff)), (5, 4));
         app.apply(Command::HalfPageUp);
-        assert_eq!(app.scroll(Pane::Diff), 4);
+        assert_eq!((app.diff_cursor(), app.scroll(Pane::Diff)), (4, 3));
         app.apply(Command::GPrefix);
         app.apply(Command::GPrefix);
-        assert_eq!(app.scroll(Pane::Diff), 0);
+        assert_eq!((app.diff_cursor(), app.scroll(Pane::Diff)), (0, 0));
         app.apply(Command::MoveUp);
-        assert_eq!(app.scroll(Pane::Diff), 0);
+        assert_eq!((app.diff_cursor(), app.scroll(Pane::Diff)), (0, 0));
     }
 
     #[test]
@@ -4706,7 +4996,8 @@ mod tests {
         app.focus = Pane::Diff;
 
         enter_search(&mut app, "five");
-        assert_eq!(app.scroll(Pane::Diff), 4);
+        assert_eq!(app.diff_cursor(), 4);
+        assert_eq!(app.scroll(Pane::Diff), 3);
         enter_search(&mut app, "one");
         assert_eq!(app.scroll(Pane::Diff), 0);
 
@@ -6135,7 +6426,7 @@ mod tests {
             [Pane::Repository, Pane::Commit, Pane::File, Pane::Diff]
                 .map(|pane| (app.selected(pane), app.scroll(pane))),
             app.diff_cursor(),
-            app.diff_row_offset(),
+            app.scroll(Pane::Diff),
             app.pending_g(),
             app.status().to_owned(),
         )
@@ -6247,7 +6538,7 @@ mod backlog_tests {
 
     use super::*;
     use crate::comment_draft::FileDraftStore;
-    use crate::inbox::{ChildPane, GitHubAuthor};
+    use crate::inbox::{ChildPane, FileStatus, GitHubAuthor};
     use crate::review_state::FileReviewStore;
 
     static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
@@ -7330,6 +7621,95 @@ mod backlog_tests {
     }
 
     #[test]
+    fn new_diff_keys_only_cancel_a_bulk_confirmation() {
+        for input in [
+            Input::PageDown,
+            Input::PageUp,
+            Input::Home,
+            Input::End,
+            Input::Character(']'),
+            Input::Character('['),
+        ] {
+            let mut app = selection_app(HistoryCoverage::Complete);
+            app.handle_input(Input::Character('A'));
+            app.handle_input(Input::Character('m'));
+            assert!(matches!(app.mode(), Mode::ConfirmBulk { .. }));
+            let before = (app.focus(), app.selected(Pane::Commit));
+            app.handle_input(input);
+            assert_eq!(app.mode(), Mode::Normal);
+            assert_eq!((app.focus(), app.selected(Pane::Commit)), before);
+            assert_eq!(app.selection_count(), 3, "cancel keeps the selection");
+            assert!((1..=3).all(|value| !app.is_reviewed(7, &sha(value))));
+        }
+    }
+
+    fn patched_commit(value: u32, patch: &str) -> Commit {
+        Commit {
+            files: ChildPane::Available(vec![FileChange {
+                path: "src/replaced.rs".to_owned(),
+                api_path_is_commentable: true,
+                previous_path: None,
+                status: FileStatus::Modified,
+                additions: 1,
+                deletions: 0,
+                changes: 1,
+                patch: crate::github::parse_patch_text(patch),
+            }]),
+            ..commit(value, 2024)
+        }
+    }
+
+    #[test]
+    fn same_file_content_replacement_invalidates_the_cached_projection() {
+        let mut app = App::new(Inbox::backlog(BacklogOrigin::Demo));
+        app.resize(100, 30);
+        discovered(&mut app, &[7]);
+        let first = "@@ -1,3 +1,3 @@\n a\n+first\n b";
+        snapshot(
+            &mut app,
+            INITIAL_GENERATION,
+            repository(7, vec![patched_commit(1, first)]),
+            HistoryCoverage::Complete,
+            Vec::new(),
+        );
+        for _ in 0..3 {
+            app.handle_input(Input::Enter);
+        }
+        assert_eq!(app.focus(), Pane::Diff);
+
+        let builds = app.diff_projection_builds;
+        for input in [Input::Character('j'), Input::Down, Input::Up, Input::End] {
+            app.handle_input(input);
+        }
+        assert_eq!(app.diff_projection_builds, builds, "cursor steps reuse it");
+        assert_eq!(app.diff_row_count(), 4);
+
+        // Same repository, commit, file index and row count; different text.
+        let second = "@@ -1,3 +1,3 @@\n a\n+second\n b";
+        snapshot(
+            &mut app,
+            INITIAL_GENERATION,
+            repository(7, vec![patched_commit(1, second)]),
+            HistoryCoverage::Complete,
+            Vec::new(),
+        );
+        assert_eq!(app.focus(), Pane::Diff);
+        assert_eq!(app.diff_projection_builds, builds + 1);
+        assert_eq!(app.diff_row_count(), 4);
+        let projection = app.diff_projection();
+        let texts: Vec<_> = projection
+            .rows(0, 4)
+            .iter()
+            .map(|row| projection.row_text(app.current_diff_lines(), row))
+            .collect();
+        assert_eq!(texts[2], "+second");
+        drop(projection);
+
+        app.handle_input(Input::Character('k'));
+        assert_eq!(app.diff_projection_builds, builds + 1);
+    }
+
+    #[test]
     fn bulk_selection_and_confirmation_are_mode_isolated() {
         let mut app = selection_app(HistoryCoverage::Complete);
 
@@ -7417,5 +7797,632 @@ mod backlog_tests {
         app.reject_backlog_effect(effects[0].clone());
         assert!(app.backlog_state().unwrap().active().is_none());
         assert!(app.status().contains("unavailable"));
+    }
+}
+
+#[cfg(test)]
+mod diff_navigation_tests {
+    use chrono::{TimeZone, Utc};
+
+    use super::*;
+    use crate::github::parse_patch_text;
+    use crate::inbox::{ChildPane, FileStatus, GitHubAuthor};
+
+    const PATH: &str = "src/view.rs";
+
+    fn file(patch: PatchContent) -> FileChange {
+        FileChange {
+            path: PATH.to_owned(),
+            api_path_is_commentable: true,
+            previous_path: None,
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 1,
+            changes: 2,
+            patch,
+        }
+    }
+
+    fn inbox(patch: PatchContent) -> Inbox {
+        Inbox::demo(vec![Repository {
+            identity: RepositoryIdentity {
+                id: 40,
+                owner: "fictional".to_owned(),
+                name: "view".to_owned(),
+            },
+            commits: vec![Commit {
+                sha: "4444444000000000000000000000000000000000".to_owned(),
+                subject: "view".to_owned(),
+                author: GitHubAuthor {
+                    login: "fictional".to_owned(),
+                },
+                authored_at: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+                files: ChildPane::Available(vec![file(patch)]),
+            }],
+        }])
+    }
+
+    /// A focused diff with `height` inner rows and `width` inner columns. All
+    /// fixtures use single-digit line numbers, so the gutter is 7 columns.
+    fn diff_app_with(patch: PatchContent, width: usize, height: usize) -> App {
+        let mut app = App::new(inbox(patch));
+        app.viewport_heights = [2, 2, 2, height];
+        app.diff_viewport_width = width;
+        for _ in 0..3 {
+            app.handle_input(Input::Enter);
+        }
+        assert_eq!(app.focus(), Pane::Diff);
+        app
+    }
+
+    fn diff_app(patch: &str, width: usize, height: usize) -> App {
+        diff_app_with(parse_patch_text(patch), width, height)
+    }
+
+    /// A hunk header followed by `count` one-row context lines.
+    fn short_lines(count: usize) -> String {
+        let mut patch = format!("@@ -1,{count} +1,{count} @@");
+        for index in 0..count {
+            patch.push_str(&format!("\n line{index}"));
+        }
+        patch
+    }
+
+    fn state(app: &App) -> (usize, usize) {
+        (app.diff_cursor(), app.scroll(Pane::Diff))
+    }
+
+    fn assert_cursor_visible(app: &App) {
+        let capacity = app.diff_patch_capacity();
+        let (cursor, scroll) = state(app);
+        assert!(
+            scroll <= cursor && cursor < scroll + capacity,
+            "cursor {cursor} outside viewport {scroll}..{}",
+            scroll + capacity
+        );
+        assert!(scroll <= app.max_diff_scroll());
+    }
+
+    fn press(app: &mut App, input: Input) {
+        app.handle_input(input);
+        assert_cursor_visible(app);
+    }
+
+    fn cursor_row(app: &App) -> crate::diff_view::DisplayRow {
+        app.diff_projection()
+            .row(app.diff_cursor())
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn row_movements_respect_exact_viewport_boundaries() {
+        // 11 display rows in a 4-row viewport: the last top row is 7.
+        let mut app = diff_app(&short_lines(10), 40, 4);
+        assert_eq!(app.diff_row_count(), 11);
+        assert_eq!(app.diff_patch_capacity(), 4);
+
+        for expected in [(1, 0), (2, 0), (3, 0), (4, 1)] {
+            press(&mut app, Input::Character('j'));
+            assert_eq!(state(&app), expected);
+        }
+        for expected in [(3, 1), (2, 1), (1, 1), (0, 0)] {
+            press(&mut app, Input::Up);
+            assert_eq!(state(&app), expected);
+        }
+        press(&mut app, Input::Down);
+        assert_eq!(state(&app), (1, 0));
+        press(&mut app, Input::Character('k'));
+        assert_eq!(state(&app), (0, 0));
+
+        press(&mut app, Input::PageDown);
+        assert_eq!(state(&app), (4, 4));
+        press(&mut app, Input::PageDown);
+        assert_eq!(state(&app), (8, 7), "the last page clamps to the tail");
+        press(&mut app, Input::PageDown);
+        assert_eq!(state(&app), (10, 7));
+        press(&mut app, Input::PageUp);
+        assert_eq!(state(&app), (6, 3));
+        press(&mut app, Input::PageUp);
+        assert_eq!(state(&app), (2, 0));
+        press(&mut app, Input::PageUp);
+        assert_eq!(state(&app), (0, 0));
+
+        press(&mut app, Input::HalfPageDown);
+        assert_eq!(state(&app), (2, 2));
+        press(&mut app, Input::HalfPageDown);
+        assert_eq!(state(&app), (4, 4));
+        press(&mut app, Input::HalfPageUp);
+        assert_eq!(state(&app), (2, 2));
+
+        press(&mut app, Input::End);
+        assert_eq!(state(&app), (10, 7));
+        press(&mut app, Input::Home);
+        assert_eq!(state(&app), (0, 0));
+        press(&mut app, Input::Character('G'));
+        assert_eq!(state(&app), (10, 7));
+        press(&mut app, Input::Character('j'));
+        assert_eq!(state(&app), (10, 7));
+        press(&mut app, Input::Character('g'));
+        press(&mut app, Input::Character('g'));
+        assert_eq!(state(&app), (0, 0));
+        press(&mut app, Input::Character('k'));
+        assert_eq!(state(&app), (0, 0));
+    }
+
+    #[test]
+    fn capacity_excludes_wrapped_notices() {
+        let lines = parse_patch_text(&short_lines(10)).lines().to_vec();
+        let patch = PatchContent::Capped {
+            lines,
+            omitted_lines: 12,
+            omitted_bytes: 4096,
+            reason: PatchCapReason::FileLimit,
+        };
+        // The notice wraps to two rows at 30 columns: 6 - 2 = 4 patch rows.
+        let mut app = diff_app_with(patch, 30, 6);
+        let notice = &app.diff_notice_texts()[0];
+        assert_eq!(wrap_text(notice, 30).len(), 2);
+        assert_eq!(app.diff_patch_capacity(), 4);
+
+        for expected in [(1, 0), (2, 0), (3, 0), (4, 1)] {
+            press(&mut app, Input::Down);
+            assert_eq!(state(&app), expected);
+        }
+        press(&mut app, Input::Home);
+        press(&mut app, Input::PageDown);
+        assert_eq!(state(&app), (4, 4));
+        press(&mut app, Input::End);
+        assert_eq!(state(&app), (10, 7));
+
+        let output = rendered(&mut app, 30, 6);
+        assert!(output.contains("line9"), "tail row is drawn:\n{output}");
+        assert!(output.contains("line6"), "first tail-page row:\n{output}");
+    }
+
+    /// Renders the diff pane alone at `width`×`height` inner cells.
+    fn rendered(app: &mut App, width: usize, height: usize) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let lines_width = width as u16 + 2;
+        let lines_height = height as u16 + 2;
+        let mut terminal = Terminal::new(TestBackend::new(lines_width, lines_height)).unwrap();
+        terminal
+            .draw(|frame| {
+                let lines = crate::render::diff_pane_lines_for_test(app, height);
+                frame.render_widget(ratatui::widgets::Paragraph::new(lines), frame.area());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    fn over_tall_patch() -> String {
+        // At width 17 the text has 10 columns: the header takes two rows, the
+        // 100-character addition ten and the context line one.
+        let long: String = (0..99)
+            .map(|index| char::from(b'a' + (index % 26) as u8))
+            .collect();
+        format!("@@ -1,2 +1,2 @@\n+{long}\n end")
+    }
+
+    #[test]
+    fn every_row_of_an_over_tall_line_is_reached_by_j_and_page_down() {
+        let mut app = diff_app(&over_tall_patch(), 17, 3);
+        let total = app.diff_row_count();
+        assert_eq!(total, 13);
+
+        let mut visited = vec![false; total];
+        visited[0] = true;
+        for _ in 0..total + 2 {
+            press(&mut app, Input::Character('j'));
+            visited[app.diff_cursor()] = true;
+        }
+        assert!(visited.iter().all(|seen| *seen), "j skipped rows");
+        let segments: Vec<_> = (2..12)
+            .map(|row| app.diff_projection().row(row).unwrap().segment)
+            .collect();
+        assert_eq!(segments, (0..10).collect::<Vec<_>>());
+
+        press(&mut app, Input::Home);
+        let capacity = app.diff_patch_capacity();
+        let mut shown = vec![false; total];
+        let mut previous_scroll = None;
+        loop {
+            let scroll = app.scroll(Pane::Diff);
+            shown[scroll..(scroll + capacity).min(total)]
+                .iter_mut()
+                .for_each(|seen| *seen = true);
+            if previous_scroll == Some(scroll) {
+                break;
+            }
+            if let Some(previous) = previous_scroll {
+                assert!(
+                    scroll <= previous + capacity,
+                    "PageDown skipped rows {}..{scroll}",
+                    previous + capacity
+                );
+            }
+            previous_scroll = Some(scroll);
+            press(&mut app, Input::PageDown);
+        }
+        assert!(shown.iter().all(|seen| *seen), "PageDown skipped rows");
+        assert_eq!(state(&app), (total - 1, total - capacity));
+
+        // The middle of the long line is drawn when its row is reached.
+        press(&mut app, Input::Home);
+        for _ in 0..7 {
+            press(&mut app, Input::Character('j'));
+        }
+        let row = cursor_row(&app);
+        assert_eq!((row.raw_row, row.segment), (1, 5));
+        let middle = app
+            .diff_projection()
+            .row_text(app.current_diff_lines(), &row)
+            .to_owned();
+        assert!(rendered(&mut app, 17, 3).contains(&middle));
+    }
+
+    #[test]
+    fn exact_fit_tail_shows_no_blank_overrun() {
+        let mut app = diff_app(&short_lines(3), 40, 4);
+        assert_eq!(app.diff_row_count(), 4);
+        press(&mut app, Input::End);
+        assert_eq!(state(&app), (3, 0));
+        press(&mut app, Input::PageDown);
+        assert_eq!(state(&app), (3, 0));
+
+        let mut app = diff_app(&short_lines(4), 40, 4);
+        press(&mut app, Input::Character('G'));
+        assert_eq!(state(&app), (4, 1));
+        let output = rendered(&mut app, 40, 4);
+        assert!(output.contains("line3"));
+        assert!(!output.contains("@@"));
+    }
+
+    fn three_hunks() -> String {
+        [
+            "@@ -1,2 +1,2 @@",
+            " a",
+            "+b",
+            "@@ -10,2 +10,2 @@",
+            " c",
+            "-d",
+            "@@ -20,3 +20,3 @@",
+            " e",
+            " f",
+            " g",
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn hunk_movement_visits_each_header_and_stops_at_boundaries() {
+        let mut app = diff_app(&three_hunks(), 40, 3);
+        assert!(app.diff_position_label().contains("hunk 1/3"));
+
+        press(&mut app, Input::Character(']'));
+        assert_eq!(state(&app), (3, 3), "header at the viewport top");
+        assert_eq!(app.status(), "Moved to hunk 2/3");
+        assert!(app.diff_position_label().contains("hunk 2/3"));
+        press(&mut app, Input::Character(']'));
+        // The last header cannot reach the top without a blank overrun.
+        assert_eq!(state(&app), (6, 6));
+        assert!(app.diff_position_label().contains("hunk 3/3"));
+        press(&mut app, Input::Character(']'));
+        assert_eq!(state(&app), (6, 6));
+        assert_eq!(app.status(), "Already at last hunk");
+
+        press(&mut app, Input::Character('G'));
+        press(&mut app, Input::Character('['));
+        assert_eq!(app.diff_cursor(), 6, "back to the current hunk header");
+        press(&mut app, Input::Character('['));
+        assert_eq!(state(&app), (3, 3));
+        press(&mut app, Input::Character('['));
+        assert_eq!(state(&app), (0, 0));
+        press(&mut app, Input::Character('['));
+        assert_eq!(state(&app), (0, 0));
+        assert_eq!(app.status(), "Already at first hunk");
+
+        let mut unhunked = diff_app("plain\ntext", 40, 3);
+        press(&mut unhunked, Input::Character(']'));
+        assert_eq!(unhunked.status(), "No hunk headers in this patch");
+
+        app.handle_input(Input::Escape);
+        assert_eq!(app.focus(), Pane::File);
+        app.handle_input(Input::Character(']'));
+        assert_eq!(app.status(), "Hunk movement works in the Diff pane");
+        assert_eq!(app.focus(), Pane::File);
+    }
+
+    #[test]
+    fn title_reports_patch_rows_and_hunks() {
+        let mut app = diff_app(&three_hunks(), 40, 3);
+        press(&mut app, Input::Character('j'));
+        assert_eq!(app.diff_position_label(), "patch row 2/10 • hunk 1/3");
+        let mut malformed = diff_app("plain", 40, 3);
+        assert_eq!(malformed.diff_position_label(), "patch row 1/1 • hunk 0/0");
+        malformed.handle_input(Input::Escape);
+    }
+
+    #[test]
+    fn resize_preserves_the_logical_anchor_and_relative_position() {
+        let mut app = diff_app(&over_tall_patch(), 17, 4);
+        for _ in 0..7 {
+            press(&mut app, Input::Character('j'));
+        }
+        let before = cursor_row(&app);
+        assert_eq!((before.raw_row, before.segment), (1, 5));
+        let anchor = before.char_offset;
+        let relative = app.diff_cursor() - app.scroll(Pane::Diff);
+
+        for width in [27, 12, 57, 17] {
+            app.diff_viewport_width = width;
+            app.normalize();
+            assert_cursor_visible(&app);
+            let row = cursor_row(&app);
+            let text = app
+                .diff_projection()
+                .row_text(app.current_diff_lines(), &row)
+                .chars()
+                .count();
+            assert_eq!(row.raw_row, 1, "width {width}");
+            assert!(
+                row.char_offset <= anchor && anchor < row.char_offset + text,
+                "width {width}: row starting at {} does not contain {anchor}",
+                row.char_offset
+            );
+            let now = app.diff_cursor() - app.scroll(Pane::Diff);
+            assert!(now <= relative, "width {width}");
+        }
+        assert_eq!(cursor_row(&app), before);
+        assert_eq!(app.diff_cursor() - app.scroll(Pane::Diff), relative);
+
+        // Real resizes rebuild at the new pane width and keep following the
+        // tail from the end.
+        let mut app = diff_app(&over_tall_patch(), 17, 4);
+        app.resize(100, 30);
+        press(&mut app, Input::End);
+        for (width, height) in [(70, 20), (160, 40), (60, 16)] {
+            app.resize(width, height);
+            assert_eq!(app.diff_cursor(), app.diff_row_count() - 1);
+            assert_eq!(app.scroll(Pane::Diff), app.max_diff_scroll());
+        }
+    }
+
+    #[test]
+    fn cursor_steps_reuse_the_cached_projection() {
+        let mut app = diff_app(&over_tall_patch(), 17, 3);
+        let builds = app.diff_projection_builds;
+        for input in [
+            Input::Character('j'),
+            Input::Down,
+            Input::PageDown,
+            Input::HalfPageDown,
+            Input::Character(']'),
+            Input::Character('['),
+            Input::End,
+            Input::Home,
+            Input::Up,
+            Input::PageUp,
+        ] {
+            app.handle_input(input);
+        }
+        enter_search(&mut app, "end");
+        app.handle_input(Input::Character('n'));
+        let _ = app.diff_position_label();
+        assert_eq!(app.diff_projection_builds, builds);
+
+        app.diff_viewport_width = 30;
+        app.normalize();
+        assert_eq!(app.diff_projection_builds, builds + 1, "width change");
+        app.handle_input(Input::Character('j'));
+        assert_eq!(app.diff_projection_builds, builds + 1);
+    }
+
+    fn enter_search(app: &mut App, query: &str) {
+        app.handle_input(Input::Character('/'));
+        for character in query.chars() {
+            app.handle_input(Input::Character(character));
+        }
+        app.handle_input(Input::Enter);
+    }
+
+    #[test]
+    fn search_lands_on_the_wrapped_row_containing_the_match() {
+        let text = format!("+{}NEEDLE{}", "x".repeat(49), "y".repeat(20));
+        let patch = format!("@@ -1,3 +1,3 @@\n a\n{text}\n b");
+        let mut app = diff_app(&patch, 17, 3);
+
+        enter_search(&mut app, "needle");
+        let row = cursor_row(&app);
+        assert_eq!(row.raw_row, 2);
+        assert_eq!(row.segment, 5, "the match starts at character 50");
+        assert_eq!(row.char_offset, 50);
+        assert_eq!(app.diff_match(), Some(2));
+        assert_cursor_visible(&app);
+        assert!(rendered(&mut app, 17, 3).contains("NEEDLE"));
+
+        app.handle_input(Input::Character('n'));
+        assert_eq!(
+            cursor_row(&app).raw_row,
+            2,
+            "the only match wraps to itself"
+        );
+        enter_search(&mut app, " b");
+        assert_eq!(cursor_row(&app).raw_row, 3);
+    }
+
+    fn comment_position(app: &App) -> Option<u32> {
+        match app.mode() {
+            Mode::Edit { target, .. } => match target.anchor() {
+                CommentAnchor::Line(line) => Some(line.position),
+                CommentAnchor::Commit => None,
+            },
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn comment_targets_map_display_rows_to_canonical_raw_positions() {
+        let long = "z".repeat(45);
+        let patch =
+            format!("@@ -1,2 +1,2 @@\n-{long}\n+{long}\n\\ No newline at end of file\nunsupported");
+        // Deletion and addition each wrap to two 30-column rows at width 37.
+        let mut app = diff_app(&patch, 37, 20);
+        let expected = [
+            (0, None),
+            (1, Some(1)),
+            (1, Some(1)),
+            (2, Some(2)),
+            (2, Some(2)),
+            (3, None),
+            (4, None),
+        ];
+        assert_eq!(app.diff_row_count(), expected.len());
+        for (row, (raw_row, position)) in expected.into_iter().enumerate() {
+            app.diff_cursor = row;
+            assert_eq!(app.diff_cursor_raw_row(), Some(raw_row));
+            app.handle_input(Input::Character('c'));
+            assert_eq!(comment_position(&app), position, "display row {row}");
+            if position.is_some() {
+                assert!(
+                    app.diff_comment_feedback()
+                        .contains(&format!("{PATH}:{raw_row}"))
+                );
+                app.handle_input(Input::Cancel);
+            } else {
+                assert_eq!(app.mode(), Mode::Normal);
+                assert_eq!(
+                    app.status(),
+                    "Selected diff row cannot accept a line comment"
+                );
+            }
+        }
+
+        app.diff_cursor = 0;
+        assert_eq!(
+            app.diff_comment_feedback(),
+            "line comments unavailable: hunk header"
+        );
+        app.diff_cursor = 5;
+        assert_eq!(
+            app.diff_comment_feedback(),
+            "line comments unavailable: no-newline marker"
+        );
+        app.diff_cursor = 6;
+        assert_eq!(
+            app.diff_comment_feedback(),
+            "line comments unavailable: unsupported patch row"
+        );
+    }
+
+    #[test]
+    fn drafts_on_continuations_reopen_the_original_target_and_mark_the_gutter() {
+        let patch = format!("@@ -1 +1 @@\n+{}", "q".repeat(25));
+        let mut app = diff_app(&patch, 17, 6);
+        press(&mut app, Input::End);
+        assert!(cursor_row(&app).is_continuation());
+        app.handle_input(Input::Character('c'));
+        app.handle_input(Input::Character('x'));
+        app.handle_input(Input::Escape);
+        assert!(app.diff_line_has_draft(1));
+
+        press(&mut app, Input::Up);
+        app.handle_input(Input::Character('c'));
+        assert_eq!(comment_position(&app), Some(1));
+        assert_eq!(app.edit_buffer().unwrap().text(), "x");
+        app.handle_input(Input::Cancel);
+
+        let output = rendered(&mut app, 17, 6);
+        assert_eq!(output.matches('◆').count(), 1, "one marker:\n{output}");
+    }
+
+    #[test]
+    fn new_diff_keys_stay_isolated_in_modal_modes() {
+        let navigation = [
+            Input::PageDown,
+            Input::PageUp,
+            Input::Home,
+            Input::End,
+            Input::Character(']'),
+            Input::Character('['),
+        ];
+        let start = |app: &mut App| {
+            for _ in 0..4 {
+                press(app, Input::Character('j'));
+            }
+            state(app)
+        };
+
+        let mut app = diff_app(&short_lines(20), 40, 4);
+        let before = start(&mut app);
+        app.handle_input(Input::Character('/'));
+        for input in navigation {
+            app.handle_input(input);
+        }
+        assert_eq!(app.search_query(), "][");
+        assert!(matches!(app.mode(), Mode::SearchEntry { .. }));
+        app.handle_input(Input::Escape);
+        assert_eq!(state(&app), before);
+
+        app.handle_input(Input::Character('?'));
+        for input in navigation {
+            app.handle_input(input);
+        }
+        assert!(matches!(app.mode(), Mode::Help { .. }));
+        app.handle_input(Input::Escape);
+        assert_eq!(state(&app), before);
+
+        app.handle_input(Input::Character('C'));
+        assert!(matches!(app.mode(), Mode::Comments { .. }));
+        for input in navigation {
+            app.handle_input(input);
+        }
+        assert!(matches!(app.mode(), Mode::Comments { .. }));
+        app.handle_input(Input::Escape);
+        assert_eq!(state(&app), before);
+
+        app.handle_input(Input::Character('c'));
+        assert!(matches!(app.mode(), Mode::Edit { .. }));
+        for character in ['a', 'b', 'c'] {
+            app.handle_input(Input::Character(character));
+        }
+        app.handle_input(Input::Home);
+        assert_eq!(app.edit_buffer().unwrap().cursor(), 0);
+        app.handle_input(Input::End);
+        assert_eq!(app.edit_buffer().unwrap().cursor(), 3);
+        app.handle_input(Input::Left);
+        assert_eq!(app.edit_buffer().unwrap().cursor(), 2);
+        for input in navigation {
+            app.handle_input(input);
+        }
+        assert!(matches!(app.mode(), Mode::Edit { .. }));
+        // Home and End moved the text cursor last, so brackets land at the end.
+        assert_eq!(app.edit_buffer().unwrap().text(), "abc][");
+        app.handle_input(Input::Escape);
+        assert_eq!(state(&app), before);
+
+        for input in navigation {
+            app.handle_input(Input::Character('P'));
+            assert!(matches!(app.mode(), Mode::ConfirmPublish { .. }));
+            app.handle_input(input);
+            assert_eq!(app.mode(), Mode::Normal);
+            assert_eq!(app.status(), "Publish cancelled");
+            assert_eq!(state(&app), before);
+        }
+        assert!(
+            !app.take_comment_effects()
+                .iter()
+                .any(|effect| matches!(effect, CommentEffect::Publish { .. })),
+            "a cancelled confirmation never publishes"
+        );
     }
 }

@@ -4,6 +4,7 @@ mod comment;
 pub mod comment_draft;
 mod day;
 mod detail;
+mod diff_view;
 mod event;
 mod external_editor;
 mod fixture;

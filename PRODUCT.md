@@ -83,6 +83,22 @@ either requires a new agreed direction, not an implicit extension of the above.
   and do not gain new UI; they do not limit or otherwise control the default
   backlog.
 
+## Accepted diff presentation direction
+
+Improve diff reading without changing review, backlog, comment or storage
+behavior: navigation by wrapped display row with page, start/end and hunk
+movement; a labeled side-by-side old/new view with synchronized scrolling and
+an automatic unified fallback in narrow panes; a distinct control for
+choosing the old or new side for line actions; and an in-app expanded diff
+view that restores the browsing context. Line comments always resolve to the
+canonical GitHub patch position, and no content beyond the patch is fetched.
+
+Delivered so far: display-row navigation (`j`/`k`, `Ctrl-d`/`Ctrl-u`,
+`PageDown`/`PageUp`, `Home`/`End`, `gg`/`G`, `[`/`]` hunks), patch-row and hunk
+position feedback, wrapped-row comment targeting and search, and resize anchor
+preservation. The side-by-side view, side selection and expanded view are
+still in progress.
+
 ## Delivery order
 
 1. Runnable terminal foundation and demo data with Neovim-style navigation.

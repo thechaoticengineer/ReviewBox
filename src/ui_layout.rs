@@ -11,25 +11,48 @@ pub(crate) struct ReviewPaneLayout {
 }
 
 pub(crate) fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
     let mut rows = Vec::new();
-    let mut row = String::new();
+    for_each_wrap_segment(text, width, |segment| {
+        rows.push(text[segment.bytes].to_owned())
+    });
+    rows
+}
+
+/// One wrapped display row of a text: its byte range and the character offset
+/// at which it starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WrapSegment {
+    pub(crate) bytes: std::ops::Range<usize>,
+    pub(crate) char_start: usize,
+}
+
+/// Visits the wrapped rows of `text` at `width` terminal columns. This is the
+/// single wrapping rule shared by rendering and diff navigation, so Unicode
+/// widths always agree. Empty text still yields one empty row.
+pub(crate) fn for_each_wrap_segment(text: &str, width: usize, mut visit: impl FnMut(WrapSegment)) {
+    let width = width.max(1);
+    let mut row_start = 0;
+    let mut row_char_start = 0;
     let mut row_width: usize = 0;
-    for character in text.chars() {
+    for (char_index, (byte_index, character)) in text.char_indices().enumerate() {
         let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
         if row_width > 0 && row_width.saturating_add(character_width) > width {
-            rows.push(std::mem::take(&mut row));
+            visit(WrapSegment {
+                bytes: row_start..byte_index,
+                char_start: row_char_start,
+            });
+            row_start = byte_index;
+            row_char_start = char_index;
             row_width = 0;
         }
-        row.push(character);
         row_width = row_width.saturating_add(character_width);
     }
-    if row.is_empty() && rows.is_empty() {
-        rows.push(String::new());
-    } else if !row.is_empty() {
-        rows.push(row);
+    if row_start < text.len() || text.is_empty() {
+        visit(WrapSegment {
+            bytes: row_start..text.len(),
+            char_start: row_char_start,
+        });
     }
-    rows
 }
 
 impl ReviewPaneLayout {

@@ -53,6 +53,8 @@ pub fn translate_key(key: KeyEvent) -> Option<Input> {
         (KeyCode::Down, false, false) => Input::Down,
         (KeyCode::Home, false, false) => Input::Home,
         (KeyCode::End, false, false) => Input::End,
+        (KeyCode::PageDown, false, false) => Input::PageDown,
+        (KeyCode::PageUp, false, false) => Input::PageUp,
         _ => Input::Unrelated,
     };
     Some(command)
@@ -1171,6 +1173,8 @@ mod tests {
             (key(KeyCode::Down), Input::Down),
             (key(KeyCode::Home), Input::Home),
             (key(KeyCode::End), Input::End),
+            (key(KeyCode::PageDown), Input::PageDown),
+            (key(KeyCode::PageUp), Input::PageUp),
         ] {
             assert_eq!(translate_key(key), Some(expected));
         }
