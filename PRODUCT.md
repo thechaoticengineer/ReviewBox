@@ -93,7 +93,7 @@ choosing the old or new side for line actions; and an in-app expanded diff
 view that restores the browsing context. Line comments always resolve to the
 canonical GitHub patch position, and no content beyond the patch is fetched.
 
-Delivered so far: display-row navigation (`j`/`k`, `Ctrl-d`/`Ctrl-u`,
+Delivered: display-row navigation (`j`/`k`, `Ctrl-d`/`Ctrl-u`,
 `PageDown`/`PageUp`, `Home`/`End`, `gg`/`G`, `[`/`]` hunks), patch-row and hunk
 position feedback, wrapped-row comment targeting and search, and resize anchor
 preservation; the default labeled side-by-side view (`v` toggles unified) with
@@ -104,7 +104,18 @@ selection for line comments (`<` old, `>` new) with refusal on alignment
 padding; and an in-app expanded diff view (`z`) that hides the
 repository/commit/file panes behind a one-row file identity header, keeps the
 status row, and restores the previous focus, selections and reading position
-exactly as left on collapse.
+exactly as left on collapse. A fictional demo comparison file and
+noninteractive smoke exercise this end to end, and the README documents the
+delivered reading model, including a unified-versus-split snapshot.
+
+Boundaries: positional pairing of a deletion/addition run is a reading aid,
+never a claim of semantic equivalence, and alignment padding never carries a
+comment position. Diff presentation does not fetch full file content, only
+the GitHub patch; it does not add an external diff-program integration, a
+syntax-highlighting subsystem, a date-range picker or other new date-filter
+UI, a cross-repository bulk action, or a pull-request workflow. These remain
+out of scope, consistent with the backlog direction's boundaries above;
+revisiting any of them requires a new agreed direction.
 
 ## Delivery order
 

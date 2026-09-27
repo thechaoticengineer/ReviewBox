@@ -11,10 +11,11 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 
-use crate::app::{App, AttemptSource, Input, Mode, Pane};
+use crate::app::{App, AttemptSource, Input, Mode, Pane, SPLIT_FALLBACK_NOTICE};
 use crate::cli::{self, Command};
 use crate::comment_draft::{MemoryDraftStore, SubmissionAttempt};
 use crate::day::LocalTimezoneDetector;
+use crate::diff_view::{DiffSide, DiffViewMode};
 use crate::event::{
     self, AppEvent, CommentRequester, EventSource, FakeComments, LoaderEventSource,
 };
@@ -721,10 +722,294 @@ pub fn run() -> io::Result<SmokeReport> {
         "compact resize frame",
     )?;
 
+    exercise_diff_presentation(&mut terminal, &mut frames)?;
     exercise_backlog_demo(&mut terminal, &mut frames)?;
     exercise_event_loop_exits()?;
 
     Ok(SmokeReport { frames })
+}
+
+/// Drives the fictional comparison patch through split labeling and paired
+/// rows, the unified round-trip, page/hunk/end navigation, per-side line
+/// drafts with padding refusal, expansion and the narrow-width fallback.
+fn exercise_diff_presentation(
+    terminal: &mut Terminal<TestBackend>,
+    frames: &mut usize,
+) -> io::Result<()> {
+    resize(terminal, FULL_WIDTH, FULL_HEIGHT)?;
+    let mut app = App::with_stores(
+        DemoFixture::load(),
+        Box::new(MemoryReviewStore::default()),
+        Box::new(MemoryDraftStore::default()),
+    );
+    app.handle_input(Input::Enter);
+    app.handle_input(Input::Enter);
+    search(&mut app, "src/comparison.rs")?;
+    app.handle_input(Input::Enter);
+    ensure(
+        app.focus() == Pane::Diff,
+        "the comparison file must open in the diff pane",
+    )?;
+
+    let opened = render_rows(terminal, &mut app, frames)?;
+    ensure_row_contains(
+        &opened,
+        &["Old", "New • comment side"],
+        "comparison split header",
+    )?;
+    ensure_row_contains(
+        &opened,
+        &["for value in old", "let drift = sample"],
+        "paired replacement row",
+    )?;
+
+    input(&mut app, 'j');
+    let anchored_row = app.diff_cursor_raw_row();
+    input(&mut app, 'v');
+    ensure(
+        app.effective_diff_mode() == DiffViewMode::Unified,
+        "v must switch the comparison file to the unified view",
+    )?;
+    ensure(
+        app.diff_cursor_raw_row() == anchored_row,
+        "toggling to unified must keep the same selected line",
+    )?;
+    input(&mut app, 'v');
+    ensure(
+        app.effective_diff_mode() == DiffViewMode::Split,
+        "v must switch the comparison file back to the split view",
+    )?;
+    ensure(
+        app.diff_cursor_raw_row() == anchored_row,
+        "toggling back to split must keep the same selected line",
+    )?;
+
+    let before_page = app.diff_position_label();
+    app.handle_input(Input::PageDown);
+    ensure(
+        app.diff_position_label() != before_page,
+        "PageDown must move the comparison diff position",
+    )?;
+    let mut reached_last_hunk = false;
+    for _ in 0..8 {
+        if app.diff_position_label().contains("hunk 4/4") {
+            reached_last_hunk = true;
+            break;
+        }
+        input(&mut app, ']');
+    }
+    ensure(reached_last_hunk, "] must reach the fourth comparison hunk")?;
+    input(&mut app, 'G');
+    ensure(
+        diff_row_matches_total(&app.diff_position_label()),
+        "G must reach the comparison file's last wrapped display row",
+    )?;
+
+    input(&mut app, 'g');
+    input(&mut app, 'g');
+    let mut at_last_hunk = false;
+    for _ in 0..8 {
+        if app.diff_position_label().contains("hunk 4/4") {
+            at_last_hunk = true;
+            break;
+        }
+        input(&mut app, ']');
+    }
+    ensure(at_last_hunk, "] must reach the equal-replacement hunk")?;
+
+    // Find the paired deletion/addition row: the row where the old and new
+    // sides resolve to distinct, both-eligible canonical positions. Wrapped
+    // continuations of the preceding context line come first, so this does
+    // not assume a fixed number of rows from the hunk header.
+    let mut found_pair = false;
+    for _ in 0..20 {
+        input(&mut app, '<');
+        let old_row = app.diff_cursor_comment_row();
+        input(&mut app, '>');
+        let new_row = app.diff_cursor_comment_row();
+        if old_row.is_some() && new_row.is_some() && old_row != new_row {
+            found_pair = true;
+            break;
+        }
+        input(&mut app, 'j');
+    }
+    ensure(
+        found_pair,
+        "the equal-replacement hunk must expose a paired old/new row",
+    )?;
+
+    input(&mut app, '<');
+    ensure(
+        app.diff_side() == DiffSide::Old,
+        "< must select the old side",
+    )?;
+    input(&mut app, 'c');
+    ensure(
+        matches!(app.mode(), Mode::Edit { .. }),
+        "c must open an old-side line draft",
+    )?;
+    let old_position = app.diff_cursor_comment_row();
+    for character in "old side note".chars() {
+        input(&mut app, character);
+    }
+    app.handle_input(Input::Escape);
+    ensure(app.draft_count() == 1, "the old-side draft must be saved")?;
+
+    input(&mut app, '>');
+    ensure(
+        app.diff_side() == DiffSide::New,
+        "> must select the new side",
+    )?;
+    input(&mut app, 'c');
+    ensure(
+        matches!(app.mode(), Mode::Edit { .. }),
+        "c must open a new-side line draft",
+    )?;
+    let new_position = app.diff_cursor_comment_row();
+    for character in "new side note".chars() {
+        input(&mut app, character);
+    }
+    app.handle_input(Input::Escape);
+    ensure(app.draft_count() == 2, "the new-side draft must be saved")?;
+    ensure(
+        old_position.is_some() && old_position != new_position,
+        "old- and new-side drafts must target distinct canonical positions",
+    )?;
+    ensure(
+        old_position.is_some_and(|row| app.diff_line_has_draft(row)),
+        "the old-side canonical position must carry its draft",
+    )?;
+    ensure(
+        new_position.is_some_and(|row| app.diff_line_has_draft(row)),
+        "the new-side canonical position must carry its draft",
+    )?;
+
+    input(&mut app, 'g');
+    input(&mut app, 'g');
+    input(&mut app, '>');
+    let mut on_padding = false;
+    for _ in 0..40 {
+        if app
+            .diff_comment_feedback()
+            .contains("no new line on this row")
+        {
+            on_padding = true;
+            break;
+        }
+        input(&mut app, 'j');
+    }
+    ensure(
+        on_padding,
+        "the unequal comparison replacement must expose new-side padding",
+    )?;
+    input(&mut app, 'c');
+    ensure(
+        app.mode() == Mode::Normal && app.draft_count() == 2,
+        "a padding row must refuse a line draft",
+    )?;
+    ensure(
+        app.status()
+            .contains("No new line on this row; press < for the old side"),
+        "padding refusal must name the old side",
+    )?;
+    ensure_contains(
+        &render_frame(terminal, &mut app, frames)?,
+        "No new line on this row",
+        "padding refusal frame",
+    )?;
+
+    let selected_before_expand = app.current_file().map(|file| file.path.clone());
+    input(&mut app, 'z');
+    ensure(app.diff_expanded(), "z must expand the comparison diff")?;
+    let expanded_frame = render_frame(terminal, &mut app, frames)?;
+    ensure_contains(
+        &expanded_frame,
+        "src/comparison.rs",
+        "expanded comparison identity header",
+    )?;
+    ensure_not_contains(&expanded_frame, "Repository", "expanded comparison frame")?;
+    ensure_not_contains(&expanded_frame, "Commit", "expanded comparison frame")?;
+    ensure_not_contains(&expanded_frame, "File", "expanded comparison frame")?;
+    input(&mut app, 'z');
+    ensure(!app.diff_expanded(), "z must collapse the comparison diff")?;
+    let collapsed_frame = render_frame(terminal, &mut app, frames)?;
+    ensure_contains(&collapsed_frame, "Repository", "collapsed comparison frame")?;
+    ensure_contains(&collapsed_frame, "Commit", "collapsed comparison frame")?;
+    ensure(
+        app.current_file().map(|file| file.path.clone()) == selected_before_expand,
+        "collapsing must keep the same selected file",
+    )?;
+
+    // 80 columns keeps the fallback notice on one unwrapped row while still
+    // leaving each split side under the minimum text width.
+    resize(terminal, 80, 24)?;
+    ensure_contains(
+        &render_frame(terminal, &mut app, frames)?,
+        SPLIT_FALLBACK_NOTICE,
+        "narrow comparison frame",
+    )?;
+    resize(terminal, FULL_WIDTH, FULL_HEIGHT)?;
+    let restored = render_frame(terminal, &mut app, frames)?;
+    ensure_not_contains(
+        &restored,
+        SPLIT_FALLBACK_NOTICE,
+        "restored comparison frame",
+    )?;
+    ensure_contains(&restored, "Old", "restored comparison frame")?;
+    // Re-entering split from the narrow unified fallback adopts whichever
+    // side holds the anchored line, so either side may now be active.
+    ensure(
+        restored.contains("Old • comment side") || restored.contains("New • comment side"),
+        "restored comparison frame must show an active split side",
+    )?;
+
+    Ok(())
+}
+
+/// The row/total from a `"patch row R/T • hunk H/N"` position label.
+fn diff_row_matches_total(label: &str) -> bool {
+    let Some(after_prefix) = label.strip_prefix("patch row ") else {
+        return false;
+    };
+    let Some((counts, _)) = after_prefix.split_once(" • hunk ") else {
+        return false;
+    };
+    let Some((row, total)) = counts.split_once('/') else {
+        return false;
+    };
+    row == total
+}
+
+/// Renders one frame and splits its content into one string per terminal
+/// row, so an assertion can confirm two fragments share a single screen row.
+fn render_rows(
+    terminal: &mut Terminal<TestBackend>,
+    app: &mut App,
+    frames: &mut usize,
+) -> io::Result<Vec<String>> {
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            app.resize(area.width, area.height);
+            render::draw(frame, app);
+        })
+        .map_err(io::Error::other)?;
+    *frames += 1;
+    let buffer = terminal.backend().buffer();
+    let width = usize::from(buffer.area.width).max(1);
+    Ok(buffer
+        .content
+        .chunks(width)
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect())
+}
+
+fn ensure_row_contains(rows: &[String], fragments: &[&str], context: &str) -> io::Result<()> {
+    ensure(
+        rows.iter()
+            .any(|row| fragments.iter().all(|fragment| row.contains(fragment))),
+        &format!("{context} must show {fragments:?} together on one screen row"),
+    )
 }
 
 /// Drive the production `--demo` backlog: the fictional pager runs on the

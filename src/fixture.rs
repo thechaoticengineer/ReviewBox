@@ -392,6 +392,7 @@ fn primary_files() -> Vec<FileChange> {
         no_patch_file("assets/fictional-orbit-map.bin"),
         capped_file("generated/fictional-catalog.rs"),
         file("notes/empty-placeholder.txt", &[]),
+        file("src/comparison.rs", COMPARISON_DIFF),
     ]
 }
 
@@ -562,6 +563,58 @@ const DOC_DIFF: &[&str] = &[
     "+It never performs a network request.",
     "+",
     " Run the example with `cargo run`.",
+];
+
+/// A comparison patch covering, in one file, a large unequal-block
+/// replacement, a pure addition run with a wrapping Unicode line, a pure
+/// deletion run, and a final equal replacement whose lines both lack a
+/// trailing newline. Hunks stay numbered continuously across the fictional
+/// file for readability, though line-number continuity is not required for
+/// parsing.
+const COMPARISON_DIFF: &[&str] = &[
+    "@@ -1,10 +1,8 @@",
+    " pub fn compare_signals(old: &[f64], new: &[f64]) -> Comparison {",
+    "-    let mut total = 0.0;",
+    "-    let mut count = 0;",
+    "-    for value in old {",
+    "-        total += value;",
+    "-        count += 1;",
+    "-    }",
+    "+    let baseline = old.iter().sum::<f64>() / old.len().max(1) as f64;",
+    "+    let sample = new.iter().sum::<f64>() / new.len().max(1) as f64;",
+    "+    let drift = sample - baseline;",
+    "+    let confidence = if drift.abs() < 0.01 { \"stable\" } else { \"drifting\" };",
+    " ",
+    "     Comparison { drift }",
+    " }",
+    "@@ -11,4 +9,8 @@",
+    " ",
+    " pub fn describe(comparison: &Comparison) -> String {",
+    "+    let mut lines = Vec::new();",
+    "+    lines.push(format!(\"drift: {:.3}\", comparison.drift));",
+    "+    lines.push(\"日本語のとても長い一行のテキストです。幅の広い文字を含む長い文字列が折り返しの確認に使われます wide characters wrap check\".to_owned());",
+    "+    lines.push(\"observed on a fictional imaginary sensor array\".to_owned());",
+    " lines.join(\"\\n\")",
+    " }",
+    "@@ -15,11 +17,4 @@",
+    " ",
+    " pub fn legacy_helper() -> bool {",
+    "-    // TODO: remove once the fictional legacy path retires",
+    "-    let attempts = 3;",
+    "-    let mut ok = false;",
+    "-    while attempts > 0 && !ok {",
+    "-        ok = probe_once();",
+    "-    }",
+    "-    ok",
+    " }",
+    " ",
+    "@@ -26,3 +21,3 @@",
+    " ",
+    " pub fn version_tag() -> &'static str {",
+    "-    \"comparison-fixture-1\"",
+    "\\ No newline at end of file",
+    "+    \"comparison-fixture-2\"",
+    "\\ No newline at end of file",
 ];
 
 #[cfg(test)]

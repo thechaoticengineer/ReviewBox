@@ -3,15 +3,20 @@
 A keyboard-first terminal inbox for reviewing your own GitHub commits across
 projects.
 
-**Current status: backlog release, following the completed first release.**
-The first usable release described in [PRODUCT.md](PRODUCT.md) is implemented:
-live and fictional inboxes share the repository → commit → file → diff
-workflow, reviewed progress and comment drafts are durable in live mode,
-comments require an explicit publish confirmation, loading and failure states
-are actionable, and the terminal UI has compact layouts and deterministic
-end-to-end smoke coverage. On top of that first release, this backlog release
-adds a durable, undated review backlog with progressive history loading and
-reversible bulk review marking.
+**Current status: backlog release with improved diff reading, following the
+completed first release.** The first usable release described in
+[PRODUCT.md](PRODUCT.md) is implemented: live and fictional inboxes share the
+repository → commit → file → diff workflow, reviewed progress and comment
+drafts are durable in live mode, comments require an explicit publish
+confirmation, loading and failure states are actionable, and the terminal UI
+has compact layouts and deterministic end-to-end smoke coverage. On top of
+that first release, this backlog release adds a durable, undated review
+backlog with progressive history loading and reversible bulk review marking.
+Most recently, diff presentation and navigation were improved: display-row
+navigation with page and hunk movement, a labeled side-by-side old/new view
+with an automatic unified fallback, active-side selection for line comments,
+and an in-app expanded diff view (see
+[Reading diffs](#reading-diffs)).
 
 The default inbox is now an undated **backlog** of your unreviewed commits: a
 commit stays pending until you mark it reviewed, however old it is. History
@@ -175,8 +180,17 @@ recorded terminal operations. For the backlog it loads older history, marks the
 old pending commit reviewed, confirms that it leaves the backlog and appears in
 the Reviewed view, unmarks it, opens and cancels a partial-scope bulk
 confirmation, loads all history, selects all loaded commits, bulk marks them,
-and bulk unmarks them from the Reviewed view. It never invokes `gh`,
-opens a real editor, reaches the network, or writes to HOME/XDG storage.
+and bulk unmarks them from the Reviewed view. For diff reading it opens a
+fictional comparison file and confirms the labeled split header and a paired
+deletion/addition on one screen row, toggles `v` to unified and back to the
+same selected line, moves with `PageDown` and `]` and confirms `G` reaches the
+last wrapped row, drafts a line comment on each side of an equal replacement
+and confirms their canonical positions differ, confirms a padding row refuses
+a draft and names the other side, expands (`z`) and confirms the identity
+header replaces the list panes and collapse restores them, and confirms a
+narrow pane shows the unified-fallback notice and a normal-width pane restores
+split. It never invokes `gh`, opens a real editor, reaches the network, or
+writes to HOME/XDG storage.
 
 ## GitHub authentication and access
 
@@ -402,6 +416,40 @@ expanded flag, which resumes as soon as the terminal grows back. Overlays
 over the expanded view with their own key isolation, and `q`, `Ctrl-c`, and
 `x` keep working.
 
+#### The same hunk, unified versus split
+
+This fictional snapshot is the same one-line replacement from the demo
+fixture's comparison file, shown first as `v` renders it in the unified view
+and then in the default side-by-side view. Positional pairing (the deletion
+lined up with the addition) is a reading aid only; it is not a claim that the
+two lines correspond.
+
+Unified:
+
+```
+@@ -26,3 +21,3 @@
+     pub fn version_tag() -> &'static str {
+-    "comparison-fixture-1"
+\ No newline at end of file
++    "comparison-fixture-2"
+\ No newline at end of file
+```
+
+Split (`Old │ New`, active side underlined on the inactive column):
+
+```
+ Old                                │ New
+ 26   pub fn version_tag() -> ... { │  21   pub fn version_tag() -> ... {
+ 27  -    "comparison-fixture-1"    │  22  +    "comparison-fixture-2"
+     \ No newline at end of file    │      \ No newline at end of file
+```
+
+The deletion and the addition are separate GitHub positions even though they
+share one screen row; `<` targets old line 27 and `>` targets new line 22.
+The no-newline marker stays attached to its own line and side and is never a
+comment target. Only the patch GitHub returned is shown; no full file content
+is fetched or invented.
+
 ## Terminal restoration
 
 ReviewBox acquires raw mode, the alternate screen, and a hidden cursor in that
@@ -448,6 +496,16 @@ canonical positions on both sides of a paired row, on wrapped continuations
 and on context, refusal on padding, headers and markers, search selecting the
 matching side and wrapped row, view toggles and resizes that keep the line
 and its target, and isolation of `v`, `<` and `>` in modal modes.
+The demo fixture's comparison file adds a rendered end-to-end path through the
+same behavior: a large unequal-block replacement, a pure addition run with a
+wrapping Unicode line, a pure deletion run, and a final equal replacement
+with a no-newline marker on each side. The smoke opens it and confirms the
+split header and a paired row, a stable selection across a `v` round trip,
+`PageDown`/`]`/`G` reachability with row and hunk feedback, distinct
+canonical positions for line drafts on the old and new sides of the equal
+replacement, refusal with the other side named on an alignment-padding row,
+the expanded identity header replacing the list panes and their restoration
+on collapse, and the narrow-pane unified-fallback notice.
 Backlog tests drive the real background loader with scripted `gh` responses and
 in-memory pagers. They cover full raw pages whose accepted projection is empty
 followed by older pages (an empty initial batch), entirely reviewed first
@@ -543,7 +601,14 @@ GitHub. Live line-position publishing was deliberately not tested.
   by a local cap are unsupported. GitHub positions are derived from raw patch rows
   starting at the first hunk, including intervening headers and notices. This
   mapping is fixture-tested only; a GitHub rejection preserves the draft. These
-  are commit comments, not pull-request review threads.
+  are commit comments, not pull-request review threads. In the side-by-side
+  view, a display row maps to the canonical position of whichever side is
+  displayed there: a paired deletion and addition are two distinct positions
+  even though they share one screen row, and a wrapped continuation always
+  targets its original line's position. Alignment padding (an unequal block's
+  shorter side, or a pure addition/deletion's missing side) carries no
+  position at all; `c` refuses it and names the other side when that side does
+  hold a line.
 
 ## Release checks
 

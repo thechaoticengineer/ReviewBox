@@ -2101,7 +2101,7 @@ mod tests {
         assert!(output.contains("unreviewed"));
         assert!(output.contains("src/welcome.rs"));
         assert!(output.contains("modified"));
-        assert!(output.contains("1/8"));
+        assert!(output.contains("1/9"));
         assert!(output.contains("split") || output.contains("unified"));
         // The diff pane itself is still shown, but the list panes are gone.
         assert!(output.contains("Diff"));
