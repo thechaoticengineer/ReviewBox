@@ -164,11 +164,11 @@ pub struct HelpBinding {
 
 pub const HELP_BINDINGS: &[HelpBinding] = &[
     HelpBinding {
-        keys: "h / l",
+        keys: "h / l or Left / Right",
         action: "focus previous / next pane",
     },
     HelpBinding {
-        keys: "j / k",
+        keys: "j / k or Down / Up",
         action: "move or scroll down / up",
     },
     HelpBinding {
@@ -930,6 +930,10 @@ impl App {
             Input::Character('j') => Command::MoveDown,
             Input::Character('k') => Command::MoveUp,
             Input::Character('l') => Command::FocusNext,
+            Input::Left => Command::FocusPrevious,
+            Input::Down => Command::MoveDown,
+            Input::Up => Command::MoveUp,
+            Input::Right => Command::FocusNext,
             Input::Character('g') => Command::GPrefix,
             Input::Character('G') => Command::Last,
             Input::Character('m') => Command::ToggleReviewed,
@@ -958,10 +962,6 @@ impl App {
             Input::HalfPageUp => Command::HalfPageUp,
             Input::Character(_)
             | Input::Backspace
-            | Input::Left
-            | Input::Right
-            | Input::Up
-            | Input::Down
             | Input::Home
             | Input::End
             | Input::Cancel
@@ -3957,10 +3957,14 @@ mod tests {
     #[test]
     fn every_documented_normal_binding_has_an_observable_dispatch() {
         let cases: &[(&str, &str, &[Input])] = &[
-            ("h", "h / l", &[Input::Character('h')]),
-            ("l", "h / l", &[Input::Character('l')]),
-            ("j", "j / k", &[Input::Character('j')]),
-            ("k", "j / k", &[Input::Character('k')]),
+            ("h", "h / l or Left / Right", &[Input::Character('h')]),
+            ("l", "h / l or Left / Right", &[Input::Character('l')]),
+            ("Left", "h / l or Left / Right", &[Input::Left]),
+            ("Right", "h / l or Left / Right", &[Input::Right]),
+            ("j", "j / k or Down / Up", &[Input::Character('j')]),
+            ("k", "j / k or Down / Up", &[Input::Character('k')]),
+            ("Down", "j / k or Down / Up", &[Input::Down]),
+            ("Up", "j / k or Down / Up", &[Input::Up]),
             ("g", "gg / G", &[Input::Character('g')]),
             (
                 "gg",
@@ -4943,5 +4947,254 @@ mod tests {
         });
         assert!(app.current_comments().is_none());
         assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn arrow_keys_mirror_hjkl_in_normal_mode_repository_pane() {
+        let mut app_hjkl = App::new(DemoFixture::load());
+        let mut app_arrows = App::new(DemoFixture::load());
+
+        app_hjkl.handle_input(Input::Character('j'));
+        app_arrows.handle_input(Input::Down);
+        assert_eq!(
+            app_hjkl.selected(Pane::Repository),
+            app_arrows.selected(Pane::Repository),
+            "Down must move down like j"
+        );
+
+        app_hjkl.handle_input(Input::Character('k'));
+        app_arrows.handle_input(Input::Up);
+        assert_eq!(
+            app_hjkl.selected(Pane::Repository),
+            app_arrows.selected(Pane::Repository),
+            "Up must move up like k"
+        );
+
+        app_hjkl.handle_input(Input::Character('l'));
+        app_arrows.handle_input(Input::Right);
+        assert_eq!(app_hjkl.focus(), Pane::Commit, "l must move to commit pane");
+        assert_eq!(
+            app_arrows.focus(),
+            Pane::Commit,
+            "Right must move to commit pane like l"
+        );
+
+        app_hjkl.handle_input(Input::Character('h'));
+        app_arrows.handle_input(Input::Left);
+        assert_eq!(
+            app_hjkl.focus(),
+            Pane::Repository,
+            "h must return to repository"
+        );
+        assert_eq!(
+            app_arrows.focus(),
+            Pane::Repository,
+            "Left must return to repository like h"
+        );
+    }
+
+    #[test]
+    fn arrow_keys_mirror_hjkl_in_all_panes() {
+        let mut app_arrow = app();
+        let mut app_hjkl = app();
+
+        app_arrow.apply(Command::FocusNext);
+        app_hjkl.apply(Command::FocusNext);
+        assert_eq!(app_arrow.focus(), Pane::Commit);
+        assert_eq!(app_hjkl.focus(), Pane::Commit);
+
+        app_arrow.handle_input(Input::Down);
+        app_hjkl.apply(Command::MoveDown);
+        assert_eq!(
+            app_arrow.selected(Pane::Commit),
+            app_hjkl.selected(Pane::Commit),
+            "Down arrow must move like j in Commit pane"
+        );
+
+        app_arrow.apply(Command::Open);
+        app_hjkl.apply(Command::Open);
+        assert_eq!(app_arrow.focus(), Pane::File);
+        assert_eq!(app_hjkl.focus(), Pane::File);
+
+        app_arrow.handle_input(Input::Down);
+        app_hjkl.apply(Command::MoveDown);
+        assert_eq!(
+            app_arrow.selected(Pane::File),
+            app_hjkl.selected(Pane::File),
+            "Down arrow must move like j in File pane"
+        );
+
+        app_arrow.apply(Command::Open);
+        app_hjkl.apply(Command::Open);
+        assert_eq!(app_arrow.focus(), Pane::Diff);
+        assert_eq!(app_hjkl.focus(), Pane::Diff);
+
+        app_arrow.handle_input(Input::Down);
+        app_hjkl.apply(Command::MoveDown);
+        assert_eq!(
+            app_arrow.scroll(Pane::Diff),
+            app_hjkl.scroll(Pane::Diff),
+            "Down arrow must scroll like j in Diff pane"
+        );
+    }
+
+    #[test]
+    fn arrow_keys_in_edit_mode_move_text_cursor_without_navigation() {
+        let mut app = App::new(DemoFixture::load());
+        open_first_commit_editor(&mut app);
+        type_edit_text(&mut app, "abcde");
+
+        app.handle_input(Input::Left);
+        app.handle_input(Input::Left);
+        app.handle_input(Input::Character('X'));
+        assert_eq!(app.edit_buffer().unwrap().text(), "abcXde");
+        assert!(matches!(app.mode(), Mode::Edit { .. }));
+        assert_eq!(
+            app.focus(),
+            Pane::Commit,
+            "focus must not change with arrows"
+        );
+
+        app.handle_input(Input::Right);
+        app.handle_input(Input::Character('Y'));
+        assert_eq!(app.edit_buffer().unwrap().text(), "abcXdYe");
+        assert!(matches!(app.mode(), Mode::Edit { .. }));
+
+        type_edit_text(&mut app, "\nline2");
+        app.handle_input(Input::Up);
+        app.handle_input(Input::Character('U'));
+        assert!(
+            app.edit_buffer().unwrap().text().contains("U"),
+            "Up arrow must insert at a position"
+        );
+        assert!(matches!(app.mode(), Mode::Edit { .. }));
+
+        app.handle_input(Input::Down);
+        app.handle_input(Input::Character('D'));
+        assert!(
+            app.edit_buffer().unwrap().text().contains("D"),
+            "Down arrow must insert at a position"
+        );
+        assert!(matches!(app.mode(), Mode::Edit { .. }));
+    }
+
+    #[test]
+    fn arrow_keys_in_help_mode_scroll_like_jk() {
+        let mut app = App::new(DemoFixture::load());
+        app.handle_input(Input::Character('?'));
+        assert!(matches!(app.mode(), Mode::Help { .. }));
+
+        let initial_scroll = app.help_scroll;
+        app.handle_input(Input::Down);
+        let scroll_after_down = app.help_scroll;
+        assert!(
+            scroll_after_down > initial_scroll,
+            "Down must scroll in help mode"
+        );
+
+        app.handle_input(Input::Up);
+        assert_eq!(
+            app.help_scroll, initial_scroll,
+            "Up must scroll back in help mode"
+        );
+    }
+
+    #[test]
+    fn arrow_keys_in_comments_mode_scroll_like_jk() {
+        let mut app = App::new(DemoFixture::load());
+        app.handle_input(Input::Character('l'));
+        app.handle_input(Input::Character('C'));
+
+        assert!(matches!(app.mode(), Mode::Comments { .. }));
+        let initial_scroll = app.comments_scroll;
+        app.handle_input(Input::Down);
+        let scroll_after_down = app.comments_scroll;
+        assert!(
+            scroll_after_down > initial_scroll,
+            "Down must scroll in comments mode"
+        );
+
+        app.handle_input(Input::Up);
+        assert_eq!(
+            app.comments_scroll, initial_scroll,
+            "Up must scroll back in comments mode"
+        );
+    }
+
+    #[test]
+    fn arrow_keys_in_confirm_publish_mode_cancel_like_any_non_y() {
+        let mut app = App::new(DemoFixture::load());
+        open_first_commit_editor(&mut app);
+        type_edit_text(&mut app, "fictional");
+        app.handle_input(Input::Escape);
+
+        app.handle_input(Input::Character('P'));
+        assert!(matches!(app.mode(), Mode::ConfirmPublish { .. }));
+
+        app.handle_input(Input::Down);
+        assert_eq!(
+            app.mode(),
+            Mode::Normal,
+            "Down arrow must cancel confirmation"
+        );
+
+        app.handle_input(Input::Character('P'));
+        app.handle_input(Input::Up);
+        assert_eq!(
+            app.mode(),
+            Mode::Normal,
+            "Up arrow must cancel confirmation"
+        );
+
+        app.handle_input(Input::Character('P'));
+        app.handle_input(Input::Left);
+        assert_eq!(
+            app.mode(),
+            Mode::Normal,
+            "Left arrow must cancel confirmation"
+        );
+
+        app.handle_input(Input::Character('P'));
+        app.handle_input(Input::Right);
+        assert_eq!(
+            app.mode(),
+            Mode::Normal,
+            "Right arrow must cancel confirmation"
+        );
+    }
+
+    #[test]
+    fn arrow_keys_in_search_mode_are_ignored_and_stay_isolated() {
+        let mut app = App::new(DemoFixture::load());
+        app.handle_input(Input::Character('/'));
+        assert!(matches!(app.mode(), Mode::SearchEntry { .. }));
+
+        app.handle_input(Input::Down);
+        assert!(matches!(app.mode(), Mode::SearchEntry { .. }));
+
+        app.handle_input(Input::Up);
+        assert!(matches!(app.mode(), Mode::SearchEntry { .. }));
+
+        app.handle_input(Input::Escape);
+        assert_eq!(app.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn arrow_pending_g_reset_matches_hjkl() {
+        let mut app_hjkl = App::new(DemoFixture::load());
+        let mut app_arrows = App::new(DemoFixture::load());
+
+        app_hjkl.handle_input(Input::Character('g'));
+        assert!(app_hjkl.pending_g());
+        app_hjkl.handle_input(Input::Character('j'));
+        assert!(!app_hjkl.pending_g(), "j must clear pending_g");
+
+        app_arrows.handle_input(Input::Character('g'));
+        assert!(app_arrows.pending_g());
+        app_arrows.handle_input(Input::Down);
+        assert!(
+            !app_arrows.pending_g(),
+            "Down arrow must clear pending_g like j"
+        );
     }
 }

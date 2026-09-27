@@ -135,8 +135,8 @@ Normal mode:
 
 | Keys | Action |
 | --- | --- |
-| `h / l` | focus previous / next pane |
-| `j / k` | move or scroll down / up |
+| `h / l or Left / Right` | focus previous / next pane |
+| `j / k or Down / Up` | move or scroll down / up |
 | `gg / G` | first / last position |
 | `Ctrl-d / Ctrl-u` | move down / up half a pane |
 | `Enter / Escape` | open child / return to parent |
@@ -189,7 +189,7 @@ Publish confirmation:
 | --- | --- |
 | `Publish: y / any other key` | confirm / cancel |
 
-The in-app `?` overlay is generated from the same binding descriptions. Search,
+In Normal mode, arrow keys (`Left`, `Right`, `Up`, `Down`) perform the same actions as `h`, `l`, `k`, `j` respectively across the repository, commit, file, and diff panes. The in-app `?` overlay is generated from the same binding descriptions. Search,
 Help, Edit, Comments, and Publish modes isolate their keys from Normal mode.
 Normal navigation letters are inserted literally in Edit mode.
 

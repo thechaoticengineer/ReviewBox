@@ -206,6 +206,16 @@ pub fn run() -> io::Result<SmokeReport> {
         "fictional-studio/pixel-garden-demo",
         "j navigation frame",
     )?;
+    app.handle_input(Input::Up);
+    ensure(
+        app.selected(Pane::Repository) == 0,
+        "Up arrow must move up like k",
+    )?;
+    ensure_contains(
+        &render_frame(&mut terminal, &mut app, &mut frames)?,
+        "fictional-labs/orbit-notes-demo",
+        "arrow navigation frame",
+    )?;
     input(&mut app, 'g');
     input(&mut app, 'g');
     ensure(
