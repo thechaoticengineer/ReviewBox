@@ -688,7 +688,8 @@ pub fn run() -> io::Result<SmokeReport> {
     let help = render_frame(&mut terminal, &mut app, &mut frames)?;
     for binding in [
         "n / N",
-        "mark commit reviewed / unreviewed",
+        "mark reviewed / unreviewed; bulk if selected",
+        "select commit / all loaded (backlog)",
         "backlog / reviewed (day: remaining / all)",
         "load older / all history; cancel loading",
     ] {
@@ -833,6 +834,34 @@ fn exercise_backlog_demo(
         "unmarked commit returns to the backlog",
     )?;
 
+    if app.focus() == Pane::Repository {
+        app.handle_input(Input::Enter);
+    }
+    input(&mut app, ' ');
+    ensure(
+        app.selection_count() == 1 && app.is_selected(VACATION_REPOSITORY_ID, &pending),
+        "Space must select the current loaded commit",
+    )?;
+    input(&mut app, 'm');
+    ensure(
+        matches!(app.mode(), Mode::ConfirmBulk { .. }),
+        "m with a selection must open the bulk confirmation",
+    )?;
+    let partial = render_frame(terminal, &mut app, frames)?;
+    ensure_contains(&partial, "Mark 1 commit reviewed?", "partial bulk action")?;
+    ensure_contains(
+        &partial,
+        "older history is not loaded and is not included",
+        "partial bulk scope",
+    )?;
+    app.handle_input(Input::Escape);
+    ensure(
+        app.mode() == Mode::Normal
+            && app.selection_count() == 1
+            && !app.is_reviewed(VACATION_REPOSITORY_ID, &pending),
+        "cancelling a bulk change keeps marks and the selection",
+    )?;
+
     input(&mut app, 'O');
     pump_backlog(&mut app, &mut session)?;
     let all = render_frame(terminal, &mut app, frames)?;
@@ -854,7 +883,119 @@ fn exercise_backlog_demo(
         app.status() == "No history load is active",
         "x without an active load must report that nothing is cancelled",
     )?;
+    ensure(
+        app.selection_count() == 1,
+        "Load all must not extend the selection automatically",
+    )?;
+
+    exercise_bulk_review(terminal, &mut app, frames)?;
     session.shutdown();
+    Ok(())
+}
+
+/// Select all loaded pending commits of the complete vacation repository, mark
+/// them reviewed in one confirmed action, then unmark them from the Reviewed
+/// view so they return to the backlog.
+fn exercise_bulk_review(
+    terminal: &mut Terminal<TestBackend>,
+    app: &mut App,
+    frames: &mut usize,
+) -> io::Result<()> {
+    let pending = app.current_commits().len();
+    ensure(pending >= 2, "Load all must expose several pending commits")?;
+    input(app, 'A');
+    ensure(
+        app.selection_count() == pending,
+        "A must select every loaded commit in the current view",
+    )?;
+    ensure_contains(
+        &render_frame(terminal, app, frames)?,
+        &format!("{pending} selected (loaded)"),
+        "select-all frame",
+    )?;
+    input(app, 'm');
+    let confirm = render_frame(terminal, app, frames)?;
+    ensure_contains(
+        &confirm,
+        &format!("Mark {pending} commits reviewed?"),
+        "bulk mark action",
+    )?;
+    ensure_contains(
+        &confirm,
+        &format!("all {pending} unreviewed commits in"),
+        "complete bulk scope",
+    )?;
+    ensure_contains(&confirm, "complete history loaded", "bulk coverage")?;
+    input(app, 'y');
+    ensure(
+        app.selection_count() == 0
+            && app
+                .inbox()
+                .repositories
+                .iter()
+                .filter(|repository| repository.identity.id == VACATION_REPOSITORY_ID)
+                .flat_map(|repository| repository.commits.iter())
+                .all(|commit| app.is_reviewed(VACATION_REPOSITORY_ID, &commit.sha)),
+        "a confirmed bulk mark reviews every selected commit and clears the selection",
+    )?;
+    ensure_contains(
+        &render_frame(terminal, app, frames)?,
+        &format!("Marked {pending} commits reviewed"),
+        "bulk mark status",
+    )?;
+
+    input(app, 'f');
+    ensure(
+        app.backlog_view() == Some(crate::app::BacklogView::Reviewed),
+        "f must open the Reviewed view",
+    )?;
+    ensure(
+        app.current_repository()
+            .is_some_and(|repository| repository.identity.id == VACATION_REPOSITORY_ID),
+        "the Reviewed view keeps the bulk-marked repository selected",
+    )?;
+    if app.focus() == Pane::Repository {
+        app.handle_input(Input::Enter);
+    }
+    let total = app.current_commits().len();
+    ensure_contains(
+        &render_frame(terminal, app, frames)?,
+        OLDEST_LABEL,
+        "Reviewed view lists bulk-marked commits",
+    )?;
+    input(app, 'A');
+    input(app, 'm');
+    ensure_contains(
+        &render_frame(terminal, app, frames)?,
+        &format!("all {total} reviewed commits in"),
+        "bulk unmark scope",
+    )?;
+    input(app, 'y');
+    ensure(
+        app.inbox()
+            .repositories
+            .iter()
+            .filter(|repository| repository.identity.id == VACATION_REPOSITORY_ID)
+            .flat_map(|repository| repository.commits.iter())
+            .all(|commit| !app.is_reviewed(VACATION_REPOSITORY_ID, &commit.sha)),
+        "a confirmed bulk unmark returns every commit to the backlog",
+    )?;
+    input(app, 'f');
+    while app.focus() != Pane::Repository {
+        app.handle_input(Input::Escape);
+    }
+    input(app, 'G');
+    ensure(
+        app.current_repository()
+            .is_some_and(|repository| repository.identity.id == VACATION_REPOSITORY_ID)
+            && app.current_commits().len() == total,
+        "every bulk-unmarked commit is pending in the backlog again",
+    )?;
+    ensure_contains(
+        &render_frame(terminal, app, frames)?,
+        OLDEST_LABEL,
+        "bulk-unmarked commits return to the backlog",
+    )?;
     Ok(())
 }
 

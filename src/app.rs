@@ -50,6 +50,51 @@ pub enum Mode {
         target: CommentTarget,
         previous_focus: Pane,
     },
+    ConfirmBulk {
+        request: BulkRequest,
+        previous_focus: Pane,
+    },
+}
+
+/// A bulk review change frozen when its confirmation opened. Confirming
+/// writes exactly `keys`; commits discovered later are never included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BulkRequest {
+    keys: Vec<ReviewKey>,
+    reviewed: bool,
+    repository_id: u64,
+    repository_name: String,
+    view: BacklogView,
+    scope: String,
+}
+
+impl BulkRequest {
+    /// Action line, for example `Mark 3 commits reviewed?`.
+    pub fn action(&self) -> String {
+        let count = self.keys.len();
+        let noun = if count == 1 { "commit" } else { "commits" };
+        let state = if self.reviewed {
+            "reviewed"
+        } else {
+            "unreviewed"
+        };
+        format!("Mark {count} {noun} {state}?")
+    }
+
+    /// Scope line naming the exact count, the repository and the history
+    /// coverage frozen at request time.
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+}
+
+/// Commits selected for a bulk review change. Selection is distinct from the
+/// durable reviewed flag and belongs to one repository and one backlog view.
+#[derive(Debug, Clone)]
+struct CommitSelection {
+    repository_id: u64,
+    view: BacklogView,
+    keys: Vec<ReviewKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +167,8 @@ impl Pane {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Quit,
+    ToggleSelected,
+    SelectAll,
     FocusPrevious,
     FocusNext,
     MoveDown,
@@ -199,7 +246,11 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
     },
     HelpBinding {
         keys: "m",
-        action: "mark commit reviewed / unreviewed",
+        action: "mark reviewed / unreviewed; bulk if selected",
+    },
+    HelpBinding {
+        keys: "Space / A",
+        action: "select commit / all loaded (backlog)",
     },
     HelpBinding {
         keys: "f",
@@ -262,12 +313,8 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
         action: "save and return / cancel",
     },
     HelpBinding {
-        keys: "Edit: Ctrl-e",
-        action: "edit current buffer externally",
-    },
-    HelpBinding {
-        keys: "Edit: Ctrl-c",
-        action: "save and quit",
+        keys: "Edit: Ctrl-e / Ctrl-c",
+        action: "edit buffer externally / save and quit",
     },
     HelpBinding {
         keys: "Comments: j/k or arrows",
@@ -278,8 +325,8 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
         action: "refresh / close",
     },
     HelpBinding {
-        keys: "Publish: y / any other key",
-        action: "confirm / cancel",
+        keys: "Publish, Bulk: y / other",
+        action: "confirm / cancel (cancel keeps selection)",
     },
 ];
 
@@ -705,6 +752,7 @@ pub struct App {
     backlog: Option<BacklogState>,
     backlog_view: BacklogView,
     backlog_effects: VecDeque<BacklogEffect>,
+    selection: Option<CommitSelection>,
     review_store: Option<Box<dyn ReviewStore>>,
     review_marks: ReviewMarks,
     review_warning: Option<String>,
@@ -837,6 +885,7 @@ impl App {
             backlog,
             backlog_view: BacklogView::Pending,
             backlog_effects: VecDeque::new(),
+            selection: None,
             review_store,
             review_marks,
             review_warning,
@@ -1059,7 +1108,8 @@ impl App {
             | Mode::Help { .. }
             | Mode::Edit { .. }
             | Mode::Comments { .. }
-            | Mode::ConfirmPublish { .. } => {}
+            | Mode::ConfirmPublish { .. }
+            | Mode::ConfirmBulk { .. } => {}
         }
         self.normalize();
     }
@@ -1090,6 +1140,10 @@ impl App {
                 target,
                 previous_focus,
             } => self.handle_publish_confirmation(target, previous_focus, input),
+            Mode::ConfirmBulk {
+                request,
+                previous_focus,
+            } => self.handle_bulk_confirmation(request, previous_focus, input),
         }
         self.normalize();
     }
@@ -1124,6 +1178,8 @@ impl App {
             Input::Character('g') => Command::GPrefix,
             Input::Character('G') => Command::Last,
             Input::Character('m') => Command::ToggleReviewed,
+            Input::Character(' ') => Command::ToggleSelected,
+            Input::Character('A') => Command::SelectAll,
             Input::Character('f') => Command::ToggleRemaining,
             Input::Character('o') => Command::LoadOlder,
             Input::Character('O') => Command::LoadAll,
@@ -1246,6 +1302,22 @@ impl App {
         self.confirm_publish(target);
     }
 
+    fn handle_bulk_confirmation(
+        &mut self,
+        request: BulkRequest,
+        previous_focus: Pane,
+        input: Input,
+    ) {
+        self.pending_g = false;
+        self.mode = Mode::Normal;
+        self.focus = previous_focus;
+        if input != Input::Character('y') {
+            self.status = "Bulk review change cancelled; selection kept".to_owned();
+            return;
+        }
+        self.confirm_bulk(request);
+    }
+
     fn handle_edit_input(&mut self, previous_focus: Pane, input: Input) {
         self.pending_g = false;
         match input {
@@ -1272,6 +1344,8 @@ impl App {
             Command::Quit => {
                 self.quit();
             }
+            Command::ToggleSelected => self.toggle_selected(),
+            Command::SelectAll => self.select_all(),
             Command::FocusPrevious => self.focus_previous("Focus moved left"),
             Command::FocusNext => self.focus_next("Focus moved right"),
             Command::MoveDown => self.move_active(false, 1),
@@ -2094,6 +2168,10 @@ impl App {
             self.status = "Open a commit before changing review progress".to_owned();
             return;
         }
+        if self.selection_count() > 0 {
+            self.request_bulk();
+            return;
+        }
         let Some((repository_id, sha)) = self
             .current_repository()
             .zip(self.current_commit())
@@ -2136,6 +2214,10 @@ impl App {
     }
 
     fn toggle_remaining(&mut self) {
+        let cleared = self
+            .selection
+            .take()
+            .is_some_and(|selection| !selection.keys.is_empty());
         let before = self.current_detail_key();
         let selection = self.selection_identity();
         if self.backlog.is_some() {
@@ -2170,6 +2252,231 @@ impl App {
             (false, _, true) => "Showing remaining commits only".to_owned(),
             (false, _, false) => "Showing all commits".to_owned(),
         };
+        if cleared {
+            self.status.push_str("; selection cleared");
+        }
+    }
+
+    /// The current repository and loaded, visible commit keys of the current
+    /// backlog view, or a status explaining why selection is unavailable.
+    fn selectable_commits(&self) -> Result<(u64, Vec<ReviewKey>), &'static str> {
+        if self.backlog.is_none() {
+            return Err("Selecting commits is available only in the backlog");
+        }
+        if self.focus == Pane::Repository {
+            return Err("Open the commit list before selecting commits");
+        }
+        let Some(repository) = self.current_repository() else {
+            return Err("No repository selected; nothing to select");
+        };
+        let keys = self
+            .current_commits()
+            .iter()
+            .filter_map(|commit| ReviewKey::new(repository.identity.id, &commit.sha).ok())
+            .collect();
+        Ok((repository.identity.id, keys))
+    }
+
+    fn toggle_selected(&mut self) {
+        let (repository_id, _) = match self.selectable_commits() {
+            Ok(selectable) => selectable,
+            Err(status) => {
+                self.status = status.to_owned();
+                return;
+            }
+        };
+        let Some(key) = self
+            .current_commit()
+            .and_then(|commit| ReviewKey::new(repository_id, &commit.sha).ok())
+        else {
+            self.status = "No commit selected; nothing to select".to_owned();
+            return;
+        };
+        let view = self.backlog_view;
+        let selection = self.selection.get_or_insert_with(|| CommitSelection {
+            repository_id,
+            view,
+            keys: Vec::new(),
+        });
+        if let Some(index) = selection.keys.iter().position(|selected| *selected == key) {
+            selection.keys.remove(index);
+        } else {
+            selection.keys.push(key);
+        }
+        self.status = self.selection_status();
+    }
+
+    fn select_all(&mut self) {
+        let (repository_id, keys) = match self.selectable_commits() {
+            Ok(selectable) => selectable,
+            Err(status) => {
+                self.status = status.to_owned();
+                return;
+            }
+        };
+        if keys.is_empty() {
+            self.status = "No loaded commits in this view to select".to_owned();
+            return;
+        }
+        let all_selected = self
+            .selection
+            .as_ref()
+            .is_some_and(|selection| keys.iter().all(|key| selection.keys.contains(key)));
+        if all_selected {
+            self.selection = None;
+            self.status = "Selection cleared".to_owned();
+            return;
+        }
+        self.selection = Some(CommitSelection {
+            repository_id,
+            view: self.backlog_view,
+            keys,
+        });
+        self.status = self.selection_status();
+    }
+
+    fn selection_status(&self) -> String {
+        let count = self.selection_count();
+        if count == 0 {
+            return "Selection cleared".to_owned();
+        }
+        let coverage = self
+            .selection
+            .as_ref()
+            .zip(self.backlog.as_ref())
+            .map(|(selection, state)| state.coverage(selection.repository_id));
+        let suffix = match coverage {
+            Some(HistoryCoverage::Complete) => "; m marks them after confirmation",
+            Some(HistoryCoverage::MoreAvailable) => {
+                "; older history is not loaded and cannot be selected (o/O)"
+            }
+            _ => "; some history is unavailable and cannot be selected",
+        };
+        format!("{count} selected (loaded){suffix}")
+    }
+
+    /// Keep the selection attached to commit identity: clear it when the
+    /// repository or view changes and drop keys that are no longer visible.
+    /// Newly loaded commits are never added.
+    fn reconcile_selection(&mut self) {
+        let Some(selection) = self.selection.as_ref() else {
+            return;
+        };
+        let current = self
+            .current_repository()
+            .map(|repository| repository.identity.id);
+        if current != Some(selection.repository_id) || self.backlog_view() != Some(selection.view) {
+            self.selection = None;
+            return;
+        }
+        let visible: Vec<ReviewKey> = self
+            .current_commits()
+            .iter()
+            .filter_map(|commit| ReviewKey::new(selection.repository_id, &commit.sha).ok())
+            .collect();
+        let selection = self.selection.as_mut().expect("checked above");
+        selection.keys.retain(|key| visible.contains(key));
+        if selection.keys.is_empty() {
+            self.selection = None;
+        }
+    }
+
+    fn request_bulk(&mut self) {
+        let Some(selection) = self.selection.clone() else {
+            return;
+        };
+        let Some(repository) = self
+            .current_repository()
+            .filter(|repository| repository.identity.id == selection.repository_id)
+        else {
+            self.selection = None;
+            self.status = "Selection cleared; the repository changed".to_owned();
+            return;
+        };
+        if self.review_store.is_none() {
+            self.status = "Review progress is unavailable; marks unchanged".to_owned();
+            return;
+        }
+        let repository_name = repository.display_name();
+        let visible = self.current_commits().len();
+        let count = selection.keys.len();
+        let coverage = self
+            .backlog
+            .as_ref()
+            .map_or(HistoryCoverage::Incomplete, |state| {
+                state.coverage(selection.repository_id)
+            });
+        let noun = if count == 1 { "commit" } else { "commits" };
+        let filter = match selection.view {
+            BacklogView::Pending => "unreviewed",
+            BacklogView::Reviewed => "reviewed",
+        };
+        let scope = match coverage {
+            HistoryCoverage::Complete if count == visible => format!(
+                "Scope: all {count} {filter} {noun} in {repository_name}; complete history loaded"
+            ),
+            HistoryCoverage::Complete => format!(
+                "Scope: {count} selected {noun} in {repository_name}; complete history loaded"
+            ),
+            HistoryCoverage::MoreAvailable => format!(
+                "Scope: {count} selected loaded {noun} in {repository_name}; older history is not loaded and is not included"
+            ),
+            HistoryCoverage::Incomplete => format!(
+                "Scope: {count} selected loaded {noun} in {repository_name}; history is incomplete (some history is unavailable) and is not included"
+            ),
+        };
+        let request = BulkRequest {
+            keys: selection.keys,
+            reviewed: selection.view == BacklogView::Pending,
+            repository_id: selection.repository_id,
+            repository_name,
+            view: selection.view,
+            scope,
+        };
+        self.status = "Confirm the bulk review change: y applies; any other key cancels".to_owned();
+        self.mode = Mode::ConfirmBulk {
+            request,
+            previous_focus: self.focus,
+        };
+    }
+
+    fn confirm_bulk(&mut self, request: BulkRequest) {
+        let Some(store) = self.review_store.as_ref() else {
+            self.status = "Review progress is unavailable; marks unchanged".to_owned();
+            return;
+        };
+        match store.set_reviewed_many(&request.keys, request.reviewed) {
+            Ok(marks) => {
+                let before = self.current_detail_key();
+                let identity = self.selection_identity();
+                self.review_marks = marks;
+                self.selection = None;
+                self.rebuild_projection(Some(identity));
+                if before != self.current_detail_key() {
+                    self.reset_diff_position();
+                    if self.focus > Pane::Commit {
+                        self.focus = Pane::Commit;
+                    }
+                }
+                self.cancel_detail_if_selection_changed();
+                let count = request.keys.len();
+                let (noun, pronoun) = if count == 1 {
+                    ("commit", "it")
+                } else {
+                    ("commits", "they")
+                };
+                self.status = if request.reviewed {
+                    format!(
+                        "Marked {count} {noun} reviewed; {pronoun} left the backlog (f shows reviewed)"
+                    )
+                } else {
+                    format!("Marked {count} {noun} unreviewed; {pronoun} returned to the backlog")
+                };
+            }
+            Err(error) => {
+                self.status = format!("Bulk review change failed; marks unchanged: {error}");
+            }
+        }
     }
 
     fn request_history(&mut self, request: HistoryRequest) {
@@ -2783,6 +3090,7 @@ impl App {
             self.ensure_diff_line_visible(self.diff_cursor);
         }
         self.focus = self.focus.min(self.deepest_meaningful_pane());
+        self.reconcile_selection();
     }
 
     fn deepest_meaningful_pane(&self) -> Pane {
@@ -3166,6 +3474,22 @@ impl App {
 
     pub fn review_warning(&self) -> Option<&str> {
         self.review_warning.as_deref()
+    }
+
+    /// Number of selected loaded commits in the current repository and view.
+    pub fn selection_count(&self) -> usize {
+        self.selection
+            .as_ref()
+            .map_or(0, |selection| selection.keys.len())
+    }
+
+    pub fn is_selected(&self, repository_id: u64, sha: &str) -> bool {
+        let Ok(key) = ReviewKey::new(repository_id, sha) else {
+            return false;
+        };
+        self.selection
+            .as_ref()
+            .is_some_and(|selection| selection.keys.contains(&key))
     }
 
     pub fn draft_warning(&self) -> Option<&str> {
@@ -4579,6 +4903,8 @@ mod tests {
             ("n", "n / N", &[Input::Character('n')]),
             ("N", "n / N", &[Input::Character('N')]),
             ("m", "m", &[Input::Character('m')]),
+            ("Space", "Space / A", &[Input::Character(' ')]),
+            ("A", "Space / A", &[Input::Character('A')]),
             ("f", "f", &[Input::Character('f')]),
             ("c", "c", &[Input::Character('c')]),
             ("E", "E", &[Input::Character('E')]),
@@ -6416,6 +6742,554 @@ mod backlog_tests {
         assert_eq!(
             app.status(),
             "All history of this repository is already loaded"
+        );
+    }
+
+    #[derive(Debug)]
+    struct FailingBatchStore(ReviewMarks);
+
+    impl ReviewStore for FailingBatchStore {
+        fn load(&self) -> Result<ReviewMarks, ReviewStateError> {
+            Ok(self.0.clone())
+        }
+
+        fn set_reviewed_many(
+            &self,
+            _keys: &[ReviewKey],
+            _reviewed: bool,
+        ) -> Result<ReviewMarks, ReviewStateError> {
+            Err(ReviewStateError::Write(std::io::ErrorKind::StorageFull))
+        }
+    }
+
+    /// A backlog with repository 7 (three pending commits) and repository 8
+    /// (one pending commit), opened on repository 7's commit pane.
+    fn selection_app_with(store: Box<dyn ReviewStore>, coverage: HistoryCoverage) -> App {
+        let mut app = backlog_app_with(store);
+        discovered(&mut app, &[7, 8]);
+        snapshot(
+            &mut app,
+            INITIAL_GENERATION,
+            repository(7, vec![commit(1, 2024), commit(2, 2023), commit(3, 2022)]),
+            coverage,
+            Vec::new(),
+        );
+        snapshot(
+            &mut app,
+            INITIAL_GENERATION,
+            repository(8, vec![commit(11, 2024)]),
+            HistoryCoverage::Complete,
+            Vec::new(),
+        );
+        finished(&mut app, INITIAL_GENERATION, None);
+        app.handle_input(Input::Enter);
+        app
+    }
+
+    fn selection_app(coverage: HistoryCoverage) -> App {
+        let app = selection_app_with(Box::new(MemoryReviewStore::default()), coverage);
+        assert_eq!(app.current_repository().unwrap().identity.id, 7);
+        assert_eq!(app.focus(), Pane::Commit);
+        app
+    }
+
+    fn bulk_request(app: &App) -> BulkRequest {
+        match app.mode() {
+            Mode::ConfirmBulk { request, .. } => request,
+            other => panic!("expected a bulk confirmation, got {other:?}"),
+        }
+    }
+
+    fn selected_shas(app: &App) -> Vec<String> {
+        app.selection.as_ref().map_or_else(Vec::new, |selection| {
+            selection
+                .keys
+                .iter()
+                .map(|key| key.sha().to_owned())
+                .collect()
+        })
+    }
+
+    #[test]
+    fn space_selects_single_commits_and_bulk_marks_exactly_the_selection() {
+        let mut app = selection_app(HistoryCoverage::Complete);
+        app.handle_input(Input::Character(' '));
+        assert_eq!(app.selection_count(), 1);
+        assert!(app.is_selected(7, &sha(1)));
+        assert!(
+            !app.is_reviewed(7, &sha(1)),
+            "selection is not a review mark"
+        );
+        assert!(app.status().contains("1 selected (loaded)"));
+
+        app.handle_input(Input::Character('m'));
+        let request = bulk_request(&app);
+        assert!(request.reviewed);
+        assert_eq!(request.action(), "Mark 1 commit reviewed?");
+        assert_eq!(
+            request.scope(),
+            "Scope: 1 selected commit in octo/repository-7; complete history loaded"
+        );
+        assert!(
+            !app.is_reviewed(7, &sha(1)),
+            "confirmation alone never marks"
+        );
+
+        app.handle_input(Input::Character('y'));
+        assert_eq!(app.mode(), Mode::Normal);
+        assert!(app.is_reviewed(7, &sha(1)));
+        assert!(!app.is_reviewed(7, &sha(2)));
+        assert_eq!(app.selection_count(), 0);
+        assert_eq!(shas(&app), [sha(2), sha(3)]);
+        assert!(app.status().contains("Marked 1 commit reviewed"));
+
+        // Several commits: toggle on, off and on again by identity.
+        app.handle_input(Input::Character(' '));
+        app.handle_input(Input::Character('j'));
+        app.handle_input(Input::Character(' '));
+        app.handle_input(Input::Character(' '));
+        assert_eq!(selected_shas(&app), [sha(2)]);
+        app.handle_input(Input::Character(' '));
+        assert_eq!(selected_shas(&app), [sha(2), sha(3)]);
+        app.handle_input(Input::Character('m'));
+        assert_eq!(bulk_request(&app).action(), "Mark 2 commits reviewed?");
+        assert!(
+            bulk_request(&app)
+                .scope()
+                .starts_with("Scope: all 2 unreviewed commits in octo/repository-7")
+        );
+        app.handle_input(Input::Character('y'));
+        assert!(app.is_reviewed(7, &sha(2)) && app.is_reviewed(7, &sha(3)));
+        assert!(
+            !app.is_reviewed(8, &sha(11)),
+            "other repositories are untouched"
+        );
+    }
+
+    #[test]
+    fn select_all_covers_loaded_visible_commits_and_toggles_off() {
+        let mut app = selection_app(HistoryCoverage::Complete);
+        app.handle_input(Input::Character('A'));
+        assert_eq!(selected_shas(&app), [sha(1), sha(2), sha(3)]);
+        app.handle_input(Input::Character('A'));
+        assert_eq!(app.selection_count(), 0);
+        assert_eq!(app.status(), "Selection cleared");
+
+        app.handle_input(Input::Character(' '));
+        app.handle_input(Input::Character('A'));
+        assert_eq!(app.selection_count(), 3, "A extends a partial selection");
+        app.handle_input(Input::Character('m'));
+        let request = bulk_request(&app);
+        assert_eq!(
+            request.scope(),
+            "Scope: all 3 unreviewed commits in octo/repository-7; complete history loaded"
+        );
+        assert!(!request.scope().contains("all repository commits"));
+        app.handle_input(Input::Character('y'));
+        assert!((1..=3).all(|value| app.is_reviewed(7, &sha(value))));
+        assert!(app.status().contains("Marked 3 commits reviewed"));
+    }
+
+    #[test]
+    fn reviewed_view_bulk_unmark_returns_commits_to_the_backlog() {
+        let mut app = selection_app_with(
+            Box::new(marked(&[(7, 1), (7, 2), (7, 3)])),
+            HistoryCoverage::Complete,
+        );
+        app.handle_input(Input::Character('f'));
+        assert_eq!(app.backlog_view(), Some(BacklogView::Reviewed));
+        while app.focus() != Pane::Repository {
+            app.handle_input(Input::Escape);
+        }
+        assert_eq!(app.visible_repositories().len(), 1);
+        assert_eq!(app.current_repository().unwrap().identity.id, 7);
+        app.handle_input(Input::Enter);
+        app.handle_input(Input::Character(' '));
+        app.handle_input(Input::Character('j'));
+        app.handle_input(Input::Character(' '));
+        app.handle_input(Input::Character('m'));
+        let request = bulk_request(&app);
+        assert!(!request.reviewed);
+        assert_eq!(request.view, BacklogView::Reviewed);
+        assert_eq!(request.action(), "Mark 2 commits unreviewed?");
+        app.handle_input(Input::Character('y'));
+        assert!(!app.is_reviewed(7, &sha(1)) && !app.is_reviewed(7, &sha(2)));
+        assert!(app.is_reviewed(7, &sha(3)));
+        assert!(app.status().contains("returned to the backlog"));
+
+        app.handle_input(Input::Character('A'));
+        app.handle_input(Input::Character('m'));
+        assert_eq!(
+            bulk_request(&app).scope(),
+            "Scope: all 1 reviewed commit in octo/repository-7; complete history loaded"
+        );
+        app.handle_input(Input::Character('y'));
+        app.handle_input(Input::Character('f'));
+        let pending = app
+            .inbox()
+            .repositories
+            .iter()
+            .find(|repository| repository.identity.id == 7)
+            .map(|repository| app.repository_pending(repository));
+        assert_eq!(pending, Some(3));
+    }
+
+    #[test]
+    fn scope_discloses_partial_history_until_load_all_completes() {
+        let mut app = selection_app(HistoryCoverage::MoreAvailable);
+        app.handle_input(Input::Character('A'));
+        app.handle_input(Input::Character('m'));
+        assert_eq!(
+            bulk_request(&app).scope(),
+            "Scope: 3 selected loaded commits in octo/repository-7; older history is not loaded and is not included"
+        );
+        app.handle_input(Input::Escape);
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.selection_count(), 3, "cancel keeps the selection");
+        assert!(app.status().contains("cancelled"));
+        assert!(!app.is_reviewed(7, &sha(1)));
+
+        app.handle_input(Input::Character('O'));
+        let (generation, repository_id, request) = load_effect(&mut app);
+        assert_eq!((repository_id, request), (7, HistoryRequest::All));
+        snapshot(
+            &mut app,
+            generation,
+            repository(
+                7,
+                vec![
+                    commit(1, 2024),
+                    commit(2, 2023),
+                    commit(3, 2022),
+                    commit(4, 2015),
+                ],
+            ),
+            HistoryCoverage::Complete,
+            Vec::new(),
+        );
+        finished(&mut app, generation, Some(7));
+        assert_eq!(
+            app.selection_count(),
+            3,
+            "loading never extends the selection"
+        );
+        assert!(!app.is_selected(7, &sha(4)));
+        app.handle_input(Input::Character('G'));
+        app.handle_input(Input::Character(' '));
+        assert!(
+            app.is_selected(7, &sha(4)),
+            "Load all makes old commits selectable"
+        );
+        app.handle_input(Input::Character('m'));
+        assert_eq!(
+            bulk_request(&app).scope(),
+            "Scope: all 4 unreviewed commits in octo/repository-7; complete history loaded"
+        );
+        app.handle_input(Input::Character('y'));
+        assert!(app.is_reviewed(7, &sha(4)));
+    }
+
+    #[test]
+    fn incomplete_history_scope_discloses_unavailable_history() {
+        let mut app = selection_app(HistoryCoverage::Incomplete);
+        app.handle_input(Input::Character('A'));
+        assert!(app.status().contains("unavailable"));
+        app.handle_input(Input::Character('m'));
+        let scope = bulk_request(&app).scope().to_owned();
+        assert!(scope.contains("3 selected loaded commits"));
+        assert!(scope.contains("history is incomplete (some history is unavailable)"));
+        assert!(!scope.contains("all 3"));
+    }
+
+    #[test]
+    fn history_arriving_before_confirmation_is_excluded_and_stays_pending() {
+        let mut app = selection_app(HistoryCoverage::MoreAvailable);
+        app.handle_input(Input::Character('A'));
+        app.handle_input(Input::Character('m'));
+        let frozen = bulk_request(&app);
+
+        // A Load older snapshot cannot start while confirming, but a
+        // concurrently arriving page for an active load must not widen the
+        // frozen request either.
+        let generation = app.backlog.as_ref().unwrap().next_generation;
+        app.backlog.as_mut().unwrap().active = Some(HistoryLoad {
+            generation,
+            kind: HistoryLoadKind::Older,
+            repository_id: Some(7),
+            pages_fetched: 0,
+            commits_loaded: 3,
+            commits_before: 3,
+            cancelling: false,
+        });
+        snapshot(
+            &mut app,
+            generation,
+            repository(
+                7,
+                vec![
+                    commit(5, 2025),
+                    commit(1, 2024),
+                    commit(2, 2023),
+                    commit(3, 2022),
+                ],
+            ),
+            HistoryCoverage::MoreAvailable,
+            Vec::new(),
+        );
+        finished(&mut app, generation, Some(7));
+        assert_eq!(bulk_request(&app), frozen);
+
+        app.handle_input(Input::Character('y'));
+        assert!((1..=3).all(|value| app.is_reviewed(7, &sha(value))));
+        assert!(!app.is_reviewed(7, &sha(5)), "a later commit stays pending");
+        assert_eq!(shas(&app), [sha(5)]);
+    }
+
+    #[test]
+    fn selection_follows_identity_across_snapshots_and_prunes_hidden_commits() {
+        let mut app = selection_app(HistoryCoverage::MoreAvailable);
+        app.handle_input(Input::Character('j'));
+        app.handle_input(Input::Character(' '));
+        assert_eq!(selected_shas(&app), [sha(2)]);
+
+        app.handle_input(Input::Character('o'));
+        let (generation, _, _) = load_effect(&mut app);
+        // Reordered snapshot with a new commit at the top.
+        snapshot(
+            &mut app,
+            generation,
+            repository(
+                7,
+                vec![
+                    commit(6, 2026),
+                    commit(3, 2022),
+                    commit(2, 2023),
+                    commit(1, 2024),
+                ],
+            ),
+            HistoryCoverage::MoreAvailable,
+            Vec::new(),
+        );
+        assert_eq!(selected_shas(&app), [sha(2)]);
+        assert!(!app.is_selected(7, &sha(6)));
+        assert_eq!(app.current_commit().unwrap().sha, sha(2));
+
+        // A snapshot that no longer lists the selected commit prunes it.
+        snapshot(
+            &mut app,
+            generation,
+            repository(7, vec![commit(6, 2026), commit(3, 2022), commit(1, 2024)]),
+            HistoryCoverage::MoreAvailable,
+            Vec::new(),
+        );
+        finished(&mut app, generation, Some(7));
+        assert_eq!(app.selection_count(), 0);
+        app.handle_input(Input::Character('m'));
+        assert_eq!(
+            app.mode(),
+            Mode::Normal,
+            "m without a selection marks one commit"
+        );
+    }
+
+    #[test]
+    fn repository_switch_and_view_toggle_clear_the_selection() {
+        let mut app = selection_app(HistoryCoverage::Complete);
+        app.handle_input(Input::Character('A'));
+        app.handle_input(Input::Character('h'));
+        assert_eq!(
+            app.selection_count(),
+            3,
+            "moving focus alone keeps the selection"
+        );
+        app.handle_input(Input::Character('j'));
+        assert_eq!(app.current_repository().unwrap().identity.id, 8);
+        assert_eq!(app.selection_count(), 0);
+        app.handle_input(Input::Character('k'));
+        assert_eq!(
+            app.selection_count(),
+            0,
+            "returning never restores a selection"
+        );
+
+        app.handle_input(Input::Enter);
+        app.handle_input(Input::Character(' '));
+        assert_eq!(app.selection_count(), 1);
+        app.handle_input(Input::Character('f'));
+        assert_eq!(app.selection_count(), 0);
+        assert!(app.status().contains("selection cleared"));
+        app.handle_input(Input::Character('f'));
+        assert_eq!(app.selection_count(), 0);
+    }
+
+    #[test]
+    fn failed_bulk_save_reports_failure_and_keeps_marks_drafts_and_selection() {
+        let existing = marked(&[(8, 11)]).load().unwrap();
+        let draft = CommentDraft::new(
+            CommentTarget::commit(7, sha(1)).unwrap(),
+            "Fictional pending draft",
+        )
+        .unwrap();
+        let drafts = MemoryDraftStore::default();
+        drafts.save(&draft).unwrap();
+        let mut app = App::with_stores(
+            Inbox::backlog(BacklogOrigin::GitHub),
+            Box::new(FailingBatchStore(existing)),
+            Box::new(drafts),
+        );
+        discovered(&mut app, &[7, 8]);
+        snapshot(
+            &mut app,
+            INITIAL_GENERATION,
+            repository(7, vec![commit(1, 2024), commit(2, 2023)]),
+            HistoryCoverage::Complete,
+            Vec::new(),
+        );
+        finished(&mut app, INITIAL_GENERATION, None);
+        app.handle_input(Input::Enter);
+        app.handle_input(Input::Character('A'));
+        app.handle_input(Input::Character('m'));
+        app.handle_input(Input::Character('y'));
+
+        assert!(
+            app.status()
+                .starts_with("Bulk review change failed; marks unchanged")
+        );
+        assert!(!app.status().contains("Marked"));
+        assert!(!app.status().contains(&sha(1)));
+        assert!(!app.is_reviewed(7, &sha(1)) && !app.is_reviewed(7, &sha(2)));
+        assert!(app.is_reviewed(8, &sha(11)));
+        assert_eq!(app.selection_count(), 2);
+        assert_eq!(app.draft_count(), 1);
+        assert!(app.commit_has_draft(7, &sha(1)));
+    }
+
+    #[test]
+    fn bulk_marks_survive_restart_with_a_file_store() {
+        let directory = TestDirectory::new();
+        let state = directory.file("review-state.json");
+        let open = || {
+            let mut app = App::with_review_store(
+                Inbox::backlog(BacklogOrigin::GitHub),
+                Box::new(FileReviewStore::at(&state).unwrap()),
+            );
+            discovered(&mut app, &[7]);
+            snapshot(
+                &mut app,
+                INITIAL_GENERATION,
+                repository(7, vec![commit(1, 2024), commit(2, 2023), commit(3, 2010)]),
+                HistoryCoverage::Complete,
+                Vec::new(),
+            );
+            finished(&mut app, INITIAL_GENERATION, None);
+            app.handle_input(Input::Enter);
+            app
+        };
+
+        let mut app = open();
+        app.handle_input(Input::Character('A'));
+        app.handle_input(Input::Character('m'));
+        app.handle_input(Input::Character('y'));
+        drop(app);
+
+        let mut restarted = open();
+        assert!((1..=3).all(|value| restarted.is_reviewed(7, &sha(value))));
+        assert_eq!(
+            restarted.selection_count(),
+            0,
+            "selection is never persisted"
+        );
+        restarted.handle_input(Input::Character('f'));
+        if restarted.focus() == Pane::Repository {
+            restarted.handle_input(Input::Enter);
+        }
+        restarted.handle_input(Input::Character(' '));
+        restarted.handle_input(Input::Character('G'));
+        restarted.handle_input(Input::Character(' '));
+        restarted.handle_input(Input::Character('m'));
+        restarted.handle_input(Input::Character('y'));
+        drop(restarted);
+
+        let reopened = open();
+        assert_eq!(shas(&reopened), [sha(1), sha(3)]);
+        assert!(reopened.is_reviewed(7, &sha(2)));
+    }
+
+    #[test]
+    fn bulk_selection_and_confirmation_are_mode_isolated() {
+        let mut app = selection_app(HistoryCoverage::Complete);
+
+        app.handle_input(Input::Character('?'));
+        for input in [
+            Input::Character(' '),
+            Input::Character('A'),
+            Input::Character('m'),
+        ] {
+            app.handle_input(input);
+        }
+        assert!(matches!(app.mode(), Mode::Help { .. }));
+        assert_eq!(app.selection_count(), 0);
+        app.handle_input(Input::Escape);
+
+        app.handle_input(Input::Character('C'));
+        assert!(matches!(app.mode(), Mode::Comments { .. }));
+        for character in [' ', 'A', 'm', 'y'] {
+            app.handle_input(Input::Character(character));
+        }
+        assert_eq!(app.selection_count(), 0);
+        app.handle_input(Input::Escape);
+
+        app.handle_input(Input::Character('A'));
+        app.handle_input(Input::Character('c'));
+        assert!(matches!(app.mode(), Mode::Edit { .. }));
+        for character in [' ', 'A', 'm', 'y'] {
+            app.handle_input(Input::Character(character));
+        }
+        assert_eq!(app.edit_buffer().unwrap().text(), " Amy");
+        assert!(matches!(app.mode(), Mode::Edit { .. }));
+        assert!((1..=3).all(|value| !app.is_reviewed(7, &sha(value))));
+        app.handle_input(Input::Cancel);
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.selection_count(), 3);
+
+        // The confirmation isolates navigation: any non-y key only cancels.
+        app.handle_input(Input::Character('m'));
+        let focus = app.focus();
+        let selected = app.selected(Pane::Commit);
+        app.handle_input(Input::Character('j'));
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!((app.focus(), app.selected(Pane::Commit)), (focus, selected));
+        assert!((1..=3).all(|value| !app.is_reviewed(7, &sha(value))));
+        app.handle_input(Input::Character('m'));
+        app.handle_input(Input::Down);
+        assert_eq!(app.selected(Pane::Commit), selected);
+        assert!(app.status().contains("cancelled"));
+    }
+
+    #[test]
+    fn selection_is_limited_to_the_backlog_commit_pane() {
+        let mut app = selection_app(HistoryCoverage::Complete);
+        app.handle_input(Input::Character('h'));
+        app.handle_input(Input::Character(' '));
+        assert_eq!(
+            app.status(),
+            "Open the commit list before selecting commits"
+        );
+        app.handle_input(Input::Character('A'));
+        assert_eq!(app.selection_count(), 0);
+
+        let mut demo = App::new(Inbox::demo(Vec::new()));
+        for character in [' ', 'A'] {
+            demo.handle_input(Input::Character(character));
+            assert_eq!(
+                demo.status(),
+                "Selecting commits is available only in the backlog"
+            );
+        }
+        assert!(
+            HELP_BINDINGS
+                .iter()
+                .any(|binding| binding.keys == "Space / A")
         );
     }
 

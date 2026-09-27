@@ -6,8 +6,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 
 use crate::app::{
-    App, BacklogView, CommentListState, DiscoveryState, HELP_BINDINGS, HistoryLoadKind, LivePhase,
-    MIN_FULL_HEIGHT, MIN_FULL_WIDTH, Mode, Pane,
+    App, BacklogView, BulkRequest, CommentListState, DiscoveryState, HELP_BINDINGS,
+    HistoryLoadKind, LivePhase, MIN_FULL_HEIGHT, MIN_FULL_WIDTH, Mode, Pane,
 };
 use crate::comment_draft::CommentAnchor;
 use crate::day::TimezoneSource;
@@ -69,6 +69,17 @@ fn draw_review_panes(frame: &mut Frame<'_>, layout: ReviewPaneLayout, app: &App)
                                 app.commit_has_comments(repository.identity.id, &commit.sha),
                             )
                         });
+                let selected_marker = match app.backlog_view() {
+                    None => "",
+                    Some(_)
+                        if app.current_repository().is_some_and(|repository| {
+                            app.is_selected(repository.identity.id, &commit.sha)
+                        }) =>
+                    {
+                        "*"
+                    }
+                    Some(_) => " ",
+                };
                 let review_marker = if reviewed { "✓" } else { " " };
                 let draft_marker = if drafted {
                     "◆"
@@ -78,7 +89,7 @@ fn draw_review_panes(frame: &mut Frame<'_>, layout: ReviewPaneLayout, app: &App)
                     " "
                 };
                 format!(
-                    "{review_marker}{draft_marker} {}",
+                    "{selected_marker}{review_marker}{draft_marker} {}",
                     sanitize_display_text(&commit.label())
                 )
             })
@@ -932,6 +943,12 @@ fn pane_block<'a>(pane: Pane, focused: bool, app: &App) -> Block<'a> {
             pane.title(),
             app.diff_comment_feedback()
         )
+    } else if pane == Pane::Commit && app.selection_count() > 0 {
+        format!(
+            " {} {filter} {reviewed}/{total} reviewed • {position}/{length} • {} selected (loaded) ",
+            pane.title(),
+            app.selection_count()
+        )
     } else {
         format!(
             " {} {filter} {reviewed}/{total} reviewed • {position}/{length} ",
@@ -953,6 +970,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Mode::Edit { .. } => " EDIT ",
         Mode::Comments { .. } => " COMMENTS ",
         Mode::ConfirmPublish { .. } => " PUBLISH? ",
+        Mode::ConfirmBulk { .. } => " BULK? ",
     };
     let mut spans = vec![
         Span::styled(mode, Style::default().fg(Color::Black).bg(Color::Cyan)),
@@ -1005,6 +1023,7 @@ fn draw_compact(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Mode::Edit { .. } => "EDIT",
         Mode::Comments { .. } => "COMMENTS",
         Mode::ConfirmPublish { .. } => "PUBLISH?",
+        Mode::ConfirmBulk { .. } => "BULK?",
     };
     let review_warning = app
         .review_warning()
@@ -1015,9 +1034,12 @@ fn draw_compact(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .map(|warning| format!("\nCOMMENT DRAFT WARNING: {warning}"))
         .unwrap_or_default();
     let (reviewed, total) = app.review_progress();
-    let backlog = backlog_headline(app)
+    let mut backlog = backlog_headline(app)
         .map(|(headline, _)| format!("\n{headline}"))
         .unwrap_or_default();
+    if app.selection_count() > 0 {
+        backlog.push_str(&format!("\n{} selected (loaded)", app.selection_count()));
+    }
     let message = Paragraph::new(format!(
         "terminal too small\nneed 60×16 (now {}×{})\n{mode} • {} • {} {reviewed}/{total} reviewed\n{}{backlog}\n? help • Ctrl-c quit{review_warning}{draft_warning}",
         area.width,
@@ -1039,7 +1061,29 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Mode::Edit { target, .. } => draw_edit(frame, area, app, &target),
         Mode::Comments { .. } => draw_comments(frame, area, app),
         Mode::ConfirmPublish { target, .. } => draw_publish_confirmation(frame, area, app, &target),
+        Mode::ConfirmBulk { request, .. } => draw_bulk_confirmation(frame, area, &request),
     }
+}
+
+fn draw_bulk_confirmation(frame: &mut Frame<'_>, area: Rect, request: &BulkRequest) {
+    let popup = if area.width < MIN_FULL_WIDTH || area.height < MIN_FULL_HEIGHT {
+        area
+    } else {
+        centered_rect(area, 76, 9)
+    };
+    frame.render_widget(Clear, popup);
+    let block = modal_block(" BULK review change? ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Press y to confirm; any other key cancels\n{}\n{}",
+            request.action(),
+            sanitize_display_text(request.scope())
+        ))
+        .wrap(Wrap { trim: true }),
+        inner,
+    );
 }
 
 fn draw_publish_confirmation(
@@ -2752,5 +2796,57 @@ mod backlog_render_tests {
         let output = text(&mut app, 120, 32);
         assert!(output.contains(&compact("reviewed")));
         assert!(output.contains(&compact("Fictional change 1")));
+    }
+
+    #[test]
+    fn selection_marker_count_and_bulk_confirmation_render_at_boundary_sizes() {
+        let mut app = App::with_stores(
+            Inbox::backlog(BacklogOrigin::GitHub),
+            Box::new(MemoryReviewStore::default()),
+            Box::new(MemoryDraftStore::default()),
+        );
+        let repository = repository(7, &[1, 2]);
+        app.apply_backlog_event(BacklogEvent::Discovered {
+            generation: INITIAL_GENERATION,
+            repositories: vec![repository.identity.clone()],
+        });
+        app.apply_backlog_event(BacklogEvent::Snapshot {
+            generation: INITIAL_GENERATION,
+            repository,
+            coverage: HistoryCoverage::MoreAvailable,
+            failures: Vec::new(),
+            pages_loaded: 1,
+        });
+        app.apply_backlog_event(BacklogEvent::Finished {
+            generation: INITIAL_GENERATION,
+            repository_id: None,
+            outcome: HistoryOutcome::Finished,
+        });
+        app.handle_input(Input::Enter);
+        app.handle_input(Input::Character(' '));
+
+        let output = text(&mut app, 120, 32);
+        assert!(output.contains(&compact("1 selected (loaded)")));
+        assert!(output.contains(&compact("> *  0000000  Fictional change")));
+        assert_eq!(output.matches("*0000000Fictional").count(), 1);
+        assert_eq!(output.matches("0000000Fictional").count(), 2);
+        let small = text(&mut app, 40, 8);
+        assert!(small.contains(&compact("1 selected (loaded)")));
+
+        app.handle_input(Input::Character('m'));
+        for (width, height) in [(120, 32), (80, 24), (60, 16), (59, 15), (40, 8), (20, 5)] {
+            let output = text(&mut app, width, height);
+            assert!(
+                output.contains(&compact("Press y")),
+                "bulk confirmation at {width}x{height} lost its confirm hint"
+            );
+            if width >= 60 {
+                assert!(output.contains(&compact("BULK review change?")));
+                assert!(output.contains(&compact("Mark 1 commit reviewed?")));
+                assert!(output.contains(&compact(
+                    "1 selected loaded commit in octo/fictional-7; older history is not loaded and is not included"
+                )));
+            }
+        }
     }
 }

@@ -3,8 +3,8 @@
 A keyboard-first terminal inbox for reviewing your own GitHub commits across
 projects.
 
-**Current status: first release complete; the durable review backlog is
-delivered, bulk selection is planned.** The first usable release described in
+**Current status: first release complete; the durable review backlog and
+reversible bulk review marking are delivered.** The first usable release described in
 [PRODUCT.md](PRODUCT.md) is implemented: live and fictional inboxes share the
 repository → commit → file → diff workflow, reviewed progress and comment drafts
 are durable in live mode, comments require an explicit publish confirmation,
@@ -14,9 +14,10 @@ layouts and deterministic end-to-end smoke coverage.
 The default inbox is now an undated **backlog** of your unreviewed commits: a
 commit stays pending until you mark it reviewed, however old it is. History
 loads progressively with in-app Load older / Load all, progress, cancellation,
-and explicit completeness states. Selecting several commits and marking them
-reviewed or unreviewed in one action is **not implemented yet**; it is the next
-planned increment. Today, `m` marks or unmarks one commit at a time.
+and explicit completeness states. You can select single commits or all loaded
+commits of the current repository and mark them reviewed, or unreviewed from the
+Reviewed view, in one confirmed action (see
+[Selecting commits and bulk review](#selecting-commits-and-bulk-review)).
 
 ## Prerequisites
 
@@ -88,6 +89,47 @@ Completeness is stated explicitly and never overstated:
 that lists loaded reviewed commits so you can inspect them and press `m` to
 unmark one; it returns to the backlog. There is no date filter.
 
+### Selecting commits and bulk review
+
+Selection and the reviewed flag are separate. Selecting a commit only picks it
+for the next bulk action; it never marks anything, and it is never saved.
+Selection is available in the backlog and Reviewed views (not in the single-day
+view) with the commit pane or a deeper pane focused:
+
+- `Space` toggles the current commit. Selected rows show `*` before the review
+  marker, and the commit pane title shows `N selected (loaded)`.
+- `A` selects every **loaded** commit shown in the current repository and view,
+  or clears the selection when all of them are already selected.
+- `m` with a selection opens a confirmation instead of toggling one commit;
+  without a selection it keeps its single-commit behavior. In the backlog the
+  action marks the selection reviewed; in the Reviewed view it marks the
+  selection unreviewed, returning those commits to the backlog.
+
+The confirmation freezes the exact commits when it opens and states the action,
+the count, the repository, and the scope:
+
+| Coverage of the repository | Scope wording |
+| --- | --- |
+| Complete, every shown commit selected | `all N unreviewed commits in <repo>` (Reviewed view: `all N reviewed commits`) and `complete history loaded` |
+| Complete, some selected | `N selected commits in <repo>; complete history loaded` |
+| Older history not loaded | `N selected loaded commits …; older history is not loaded and is not included` |
+| History incomplete after a failure | `N selected loaded commits …; history is incomplete (some history is unavailable) and is not included` |
+
+"All" always refers to the commits of the current filtered view of one
+repository, never to every commit of the repository. Press `O` first to make
+the full supported history selectable. `y` saves exactly the frozen commits in
+one atomic write of `review-state.json`; any other key cancels and keeps the
+selection. Commits loaded after the confirmation opened are never included and
+stay unreviewed. If saving fails, the status reports the failure, and marks,
+drafts, and the selection stay unchanged. There is no cross-repository bulk
+action and no date watermark.
+
+Selection lifecycle: it belongs to one repository and one view. It is cleared
+when you move to another repository, when `f` switches the view, and after a
+successful bulk action. Background loading never adds commits to it; it follows
+commit identity (repository and full SHA) through reordering and drops any
+commit that is no longer shown. Moving focus between panes keeps it.
+
 ### Single-day view: `--date` / `--timezone`
 
 The previous day-scoped inbox remains available when you pass `--date`,
@@ -129,7 +171,9 @@ The smoke drives the static fixture workflow and the backlog demo through an
 in-memory terminal, fake comment service, mock editor, memory-only stores, and
 recorded terminal operations. For the backlog it loads older history, marks the
 old pending commit reviewed, confirms that it leaves the backlog and appears in
-the Reviewed view, unmarks it, and loads all history. It never invokes `gh`,
+the Reviewed view, unmarks it, opens and cancels a partial-scope bulk
+confirmation, loads all history, selects all loaded commits, bulk marks them,
+and bulk unmarks them from the Reviewed view. It never invokes `gh`,
 opens a real editor, reaches the network, or writes to HOME/XDG storage.
 
 ## GitHub authentication and access
@@ -210,7 +254,8 @@ Normal mode:
 | `Enter / Escape` | open child / return to parent |
 | `/` | search the focused pane |
 | `n / N` | next / previous search match |
-| `m` | mark commit reviewed / unreviewed |
+| `m` | mark reviewed / unreviewed; bulk if selected |
+| `Space / A` | select commit / all loaded (backlog) |
 | `f` | backlog / reviewed (day: remaining / all) |
 | `o / O / x` | load older / all history; cancel loading |
 | `c` | edit commit or selected-line draft |
@@ -241,8 +286,7 @@ Edit mode:
 | `Edit: printable / Enter` | insert text / newline |
 | `Edit: arrows / Home / End` | move the text cursor |
 | `Edit: Esc / Ctrl-g` | save and return / cancel |
-| `Edit: Ctrl-e` | edit current buffer externally |
-| `Edit: Ctrl-c` | save and quit |
+| `Edit: Ctrl-e / Ctrl-c` | edit buffer externally / save and quit |
 
 Comments mode:
 
@@ -251,14 +295,15 @@ Comments mode:
 | `Comments: j/k or arrows` | scroll comments |
 | `Comments: r / Esc` | refresh / close |
 
-Publish confirmation:
+Publish and bulk review confirmations:
 
 | Keys | Action |
 | --- | --- |
-| `Publish: y / any other key` | confirm / cancel |
+| `Publish, Bulk: y / other` | confirm / cancel (cancel keeps selection) |
 
 In Normal mode, arrow keys (`Left`, `Right`, `Up`, `Down`) perform the same actions as `h`, `l`, `k`, `j` respectively across the repository, commit, file, and diff panes. The in-app `?` overlay is generated from the same binding descriptions. Search,
-Help, Edit, Comments, and Publish modes isolate their keys from Normal mode.
+Help, Edit, Comments, Publish, and Bulk confirmation modes isolate their keys
+from Normal mode; `Space`, `A`, and `m` cannot start a bulk change from them.
 Normal navigation letters are inserted literally in Edit mode.
 
 ## Terminal restoration
@@ -288,7 +333,16 @@ overlapping branches, selection kept on the same SHA during loading,
 cancellation during Load all, rate-limited branches left incomplete and then
 retried, discovery failure, shutdown of blocked loads, stale-generation events,
 restart persistence with a temporary `review-state.json`, existing marks and
-drafts loading unchanged, and that viewing a commit never marks it. They also
+drafts loading unchanged, and that viewing a commit never marks it. Bulk review
+tests cover single, several, and all-loaded selection, bulk mark and Reviewed
+view bulk unmark, partial versus complete scope wording before and after Load
+all, incomplete-history disclosure, a page arriving between confirmation and
+`y` staying excluded and pending, selection following commit identity through
+reordering and pruning, clearing on repository and view changes, a failing
+store keeping marks, drafts, and selection, restart persistence of bulk marks,
+and modal isolation. The demo smoke confirms a partial-scope bulk request and
+cancels it, then selects all after Load all, bulk marks, opens the Reviewed
+view, and bulk unmarks. They also
 cover day/timezone presentation, all four panes, navigation and search,
 representative and truncated diffs, resize/compact rendering, reviewed/filter
 state, commit and eligible-line drafts, unsupported-line refusal, external
@@ -310,8 +364,8 @@ repository name, SHA, path, body, token, or capture is retained in the project.
 
 This is evidence for one available authenticated environment and suitable
 commit, not universal coverage. It predates the backlog: the default undated
-backlog, Load older, Load all, and cancellation are fixture-tested only and
-have not been verified against GitHub. Live permission-denied, authentication-expired,
+backlog, Load older, Load all, cancellation, and bulk selection/marking are
+fixture-tested only and have not been verified against GitHub. Live permission-denied, authentication-expired,
 offline, rate-limited, oversized-response, empty-account, empty-day, and
 incomplete-branch outcomes remain fixture-tested rather than induced against
 GitHub. Live line-position publishing was deliberately not tested.

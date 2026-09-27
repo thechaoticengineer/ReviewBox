@@ -43,7 +43,7 @@ directory, outside Git repositories.
 
 This direction supersedes the original default-today requirement.
 
-Delivered in the backlog increment:
+Delivered in the backlog and bulk-review increments:
 
 - The default inbox is the user's unreviewed commits across the supported
   repositories, with no date limit. A commit stays pending until it is
@@ -61,15 +61,14 @@ Delivered in the backlog increment:
 - A Reviewed view (`f`) exists only to inspect loaded reviewed commits and
   unmark them, returning them to the backlog.
 - In normal browsing mode, arrow keys mirror `h`/`j`/`k`/`l`.
-
-Not yet delivered (next increment):
-
-- Selecting individual commits or all loaded commits in the current repository,
-  and marking the selection reviewed or unreviewed in one confirmed action with
-  an explicit scope and count. Selection stays distinct from the durable
-  reviewed flag, never covers unloaded history silently, and never applies to
-  commits discovered after confirmation. There is no global cross-repository
-  bulk operation.
+- Selecting individual commits (`Space`) or all loaded commits (`A`) in the
+  current repository and view, and marking the selection reviewed (backlog) or
+  unreviewed (Reviewed view) in one confirmed action (`m`, then `y`) with an
+  explicit count, repository, and scope. Selection stays distinct from the
+  durable reviewed flag, is cleared on repository or view changes and after a
+  successful action, never covers unloaded history silently, and never applies
+  to commits discovered after the confirmation opened. There is no global
+  cross-repository bulk operation.
 
 ## Delivery order
 
