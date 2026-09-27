@@ -309,9 +309,16 @@ pub fn run() -> io::Result<SmokeReport> {
     )?;
     app.handle_input(Input::Enter);
     ensure(app.focus() == Pane::Diff, "Enter must open the diff pane")?;
+    // The default side-by-side view wraps this addition on the new side.
+    let opened = render_frame(&mut terminal, &mut app, &mut frames)?;
     ensure_contains(
-        &render_frame(&mut terminal, &mut app, &mut frames)?,
-        "Welcome aboard",
+        &opened,
+        "let heading = \"Welcome",
+        "opened substantial diff frame",
+    )?;
+    ensure_contains(
+        &opened,
+        "New • comment side",
         "opened substantial diff frame",
     )?;
 

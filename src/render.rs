@@ -11,11 +11,12 @@ use crate::app::{
 };
 use crate::comment_draft::CommentAnchor;
 use crate::day::TimezoneSource;
+use crate::diff_view::{DiffProjection, DiffSide, DisplayRow, Segment, SplitLayout};
 use crate::github::{
     CommentFailureKind, DetailFailure, DetailState, ExistingCommentAnchor, FailureCategory,
     HistoryCoverage, RESPONSE_TRUNCATED_LABEL, failure_category_label,
 };
-use crate::inbox::{DiffLineKind, InboxSource, PatchContent, Repository};
+use crate::inbox::{DiffLine, DiffLineKind, InboxSource, PatchContent, Repository};
 use crate::ui_layout::{ReviewPaneLayout, wrap_text};
 use unicode_width::UnicodeWidthChar;
 
@@ -810,11 +811,21 @@ fn diff_lines(app: &App, available_rows: usize) -> Vec<Line<'static>> {
     let mut lines = diff_notice(app);
     let projection = app.diff_projection();
     let patch = app.current_diff_lines();
+    let first = app.scroll(Pane::Diff);
+    if let Some(layout) = projection.split_layout() {
+        lines.push(split_header(layout, app.diff_side()));
+        let visible = available_rows.saturating_sub(lines.len());
+        for (offset, row) in projection.rows(first, visible).iter().enumerate() {
+            let selected = app.diff_cursor() == first + offset;
+            lines.push(split_row(app, &projection, patch, layout, row, selected));
+        }
+        return lines;
+    }
     let gutter_width = projection.gutter_width();
     let number_width = gutter_width.saturating_sub(5) / 2;
     let visible = available_rows.saturating_sub(lines.len());
-    let first = app.scroll(Pane::Diff);
     for (offset, row) in projection.rows(first, visible).iter().enumerate() {
+        let row = row.primary();
         let Some(content) = patch.get(row.raw_row) else {
             continue;
         };
@@ -845,10 +856,7 @@ fn diff_lines(app: &App, available_rows: usize) -> Vec<Line<'static>> {
             Span::styled(
                 gutter,
                 if selected {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
+                    selected_gutter_style()
                 } else {
                     Style::default().fg(Color::DarkGray)
                 },
@@ -857,6 +865,202 @@ fn diff_lines(app: &App, available_rows: usize) -> Vec<Line<'static>> {
         ]));
     }
     lines
+}
+
+fn selected_gutter_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// The labeled `Old | New` column header of the split view. The side that
+/// line actions target is highlighted and named.
+fn split_header(layout: SplitLayout, active: DiffSide) -> Line<'static> {
+    let label = |side: DiffSide| {
+        let name = match side {
+            DiffSide::Old => "Old",
+            DiffSide::New => "New",
+        };
+        let text = if side == active {
+            format!(" {name} • comment side")
+        } else {
+            format!(" {name}")
+        };
+        let style = if side == active {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        };
+        Span::styled(pad_to_width(&text, layout.side_width()), style)
+    };
+    Line::from(vec![
+        label(DiffSide::Old),
+        Span::styled("│", Style::default().fg(Color::DarkGray)),
+        label(DiffSide::New),
+    ])
+}
+
+fn split_row(
+    app: &App,
+    projection: &DiffProjection,
+    patch: &[DiffLine],
+    layout: SplitLayout,
+    row: &DisplayRow,
+    selected: bool,
+) -> Line<'static> {
+    match row {
+        // Hunk headers and unsupported rows span both sides.
+        DisplayRow::Single(segment) => {
+            let style = diff_style(segment.kind);
+            let text_style = if selected {
+                style.add_modifier(Modifier::REVERSED)
+            } else if app.diff_match() == Some(segment.raw_row) {
+                style.add_modifier(Modifier::BOLD)
+            } else {
+                style
+            };
+            Line::from(vec![
+                Span::styled(
+                    " ".repeat(layout.side_gutter),
+                    if selected {
+                        selected_gutter_style()
+                    } else {
+                        Style::default()
+                    },
+                ),
+                Span::styled(projection.row_text(patch, segment).to_owned(), text_style),
+            ])
+        }
+        DisplayRow::Split { old, new } => {
+            let mut spans = Vec::with_capacity(5);
+            for (side, cell) in [(DiffSide::Old, old), (DiffSide::New, new)] {
+                if side == DiffSide::New {
+                    spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+                }
+                let highlight = match (selected, side == app.diff_side()) {
+                    (false, _) => CellHighlight::None,
+                    (true, true) => CellHighlight::Active,
+                    (true, false) => CellHighlight::Inactive,
+                };
+                spans.extend(split_cell(
+                    app,
+                    projection,
+                    patch,
+                    layout,
+                    side,
+                    cell.segment(),
+                    highlight,
+                ));
+            }
+            Line::from(spans)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellHighlight {
+    None,
+    /// The selected row on the side line actions target.
+    Active,
+    /// The selected row on the other side.
+    Inactive,
+}
+
+/// One side of a split row: that side's gutter (marker and line number on
+/// the first segment of a commentable line) and its text padded to the side
+/// width. Filler renders blank, with no number.
+fn split_cell(
+    app: &App,
+    projection: &DiffProjection,
+    patch: &[DiffLine],
+    layout: SplitLayout,
+    side: DiffSide,
+    segment: Option<&Segment>,
+    highlight: CellHighlight,
+) -> [Span<'static>; 2] {
+    let number_width = layout.side_gutter.saturating_sub(3);
+    let (gutter, text, style) = match segment {
+        None => (
+            " ".repeat(layout.side_gutter),
+            String::new(),
+            Style::default(),
+        ),
+        Some(segment) => {
+            let gutter = match patch.get(segment.raw_row) {
+                Some(line) if !segment.is_continuation() && segment.comment_row().is_some() => {
+                    let number = match side {
+                        DiffSide::Old => line.old_line,
+                        DiffSide::New => line.new_line,
+                    };
+                    format_side_gutter(
+                        app.diff_line_has_draft(segment.raw_row),
+                        app.diff_line_has_comment(segment.raw_row),
+                        number,
+                        number_width,
+                    )
+                }
+                _ => " ".repeat(layout.side_gutter),
+            };
+            let style = if app.diff_match() == Some(segment.raw_row) {
+                diff_style(segment.kind).add_modifier(Modifier::BOLD)
+            } else {
+                diff_style(segment.kind)
+            };
+            (
+                gutter,
+                projection.row_text(patch, segment).to_owned(),
+                style,
+            )
+        }
+    };
+    match highlight {
+        CellHighlight::Active => [
+            Span::styled(gutter, selected_gutter_style()),
+            Span::styled(
+                pad_to_width(&text, layout.side_text),
+                style.add_modifier(Modifier::REVERSED),
+            ),
+        ],
+        CellHighlight::Inactive => [
+            Span::styled(gutter, Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                pad_to_width(&text, layout.side_text),
+                style.add_modifier(Modifier::UNDERLINED),
+            ),
+        ],
+        CellHighlight::None => [
+            Span::styled(gutter, Style::default().fg(Color::DarkGray)),
+            Span::styled(pad_to_width(&text, layout.side_text), style),
+        ],
+    }
+}
+
+/// Pads `text` with spaces to `width` terminal columns, using the same
+/// character widths as wrapping.
+fn pad_to_width(text: &str, width: usize) -> String {
+    let used: usize = text
+        .chars()
+        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
+        .sum();
+    let mut padded = String::with_capacity(text.len() + width.saturating_sub(used));
+    padded.push_str(text);
+    padded.extend(std::iter::repeat_n(' ', width.saturating_sub(used)));
+    padded
+}
+
+fn format_side_gutter(drafted: bool, commented: bool, number: Option<u32>, width: usize) -> String {
+    let number = number.map_or_else(String::new, |number| number.to_string());
+    let marker = if drafted {
+        '◆'
+    } else if commented {
+        '●'
+    } else {
+        ' '
+    };
+    format!("{marker} {number:>width$} ")
 }
 
 /// The diff pane body (notices and visible patch rows) for `rows` inner rows.
@@ -1537,6 +1741,7 @@ mod tests {
         Command, CommentEffect, CommentResult, CommentResultOutcome, DetailEffect, DetailResult,
         Input,
     };
+    use crate::diff_view::DiffViewMode;
     use crate::fixture::DemoFixture;
     use crate::github::{
         CommentFailure, ExistingComment, ExistingCommentAnchor, ExistingComments, FailureScope,
@@ -1789,7 +1994,10 @@ mod tests {
         assert!(output.contains("fictional-labs/orbit-notes-demo"));
         assert!(output.contains("a1b2c3d"));
         assert!(output.contains("src/welcome.rs"));
-        assert!(output.contains("Welcome aboard"));
+        // The default split view wraps this addition within the new side.
+        assert!(output.contains("let heading = \"Welcome"));
+        assert!(output.contains("aboard\";"));
+        assert!(output.contains("Old") && output.contains("New • comment side"));
     }
 
     #[test]
@@ -2235,6 +2443,276 @@ mod tests {
         assert!(output.contains("another commit"));
     }
 
+    const SPLIT_PATCH: &str = "@@ -1,4 +1,5 @@\n fn orbit() {\n-    let speed = 1;\n-    let label = \"slow\";\n+    let speed = 2;\n+    let label = \"fast and steady\";\n+    let extra = true;\n }\n\\ No newline at end of file";
+
+    /// The demo-style app focused on `patch` in its diff pane.
+    fn focused_patch_app(patch: &str, width: u16, height: u16) -> App {
+        let mut app = demo_patch_app(crate::github::parse_patch_text(patch));
+        app.resize(width, height);
+        for _ in 0..3 {
+            app.apply(Command::Open);
+        }
+        assert_eq!(app.focus(), Pane::Diff);
+        app
+    }
+
+    /// Inner rows of the diff pane and the buffer they came from.
+    fn diff_pane_rows(app: &mut App, width: u16, height: u16) -> (Vec<String>, Buffer, Rect) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        app.resize(width, height);
+        terminal.draw(|frame| draw(frame, app)).expect("draw");
+        let diff = ReviewPaneLayout::from_area(Rect::new(0, 0, width, height)).diff;
+        let inner = Rect::new(
+            diff.x + 1,
+            diff.y + 1,
+            diff.width.saturating_sub(2),
+            diff.height.saturating_sub(2),
+        );
+        let buffer = terminal.backend().buffer().clone();
+        let rows = (inner.y..inner.bottom())
+            .map(|y| {
+                (inner.x..inner.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        (rows, buffer, inner)
+    }
+
+    fn padded(text: &str, width: usize) -> String {
+        format!("{text:<width$}")
+    }
+
+    #[test]
+    fn split_view_snapshot_at_120x32_shows_labeled_aligned_sides() {
+        let mut app = focused_patch_app(SPLIT_PATCH, 120, 32);
+        let (rows, _, inner) = diff_pane_rows(&mut app, 120, 32);
+        // 65 inner columns: gutter 4 + 28 text columns per side, separator 1.
+        assert_eq!(inner.width, 65);
+        let side = |gutter: &str, text: &str| format!("{gutter}{}", padded(text, 28));
+        let row = |old: String, new: String| format!("{old}│{new}");
+        let expected = [
+            row(padded(" Old", 32), padded(" New • comment side", 32)),
+            format!("    {}", padded("@@ -1,4 +1,5 @@", 61)),
+            row(side("  1 ", " fn orbit() {"), side("  1 ", " fn orbit() {")),
+            row(
+                side("  2 ", "-    let speed = 1;"),
+                side("  2 ", "+    let speed = 2;"),
+            ),
+            row(
+                side("  3 ", "-    let label = \"slow\";"),
+                side("  3 ", "+    let label = \"fast and s"),
+            ),
+            row(side("    ", ""), side("    ", "teady\";")),
+            row(side("    ", ""), side("  4 ", "+    let extra = true;")),
+            row(side("  4 ", " }"), side("  5 ", " }")),
+            row(
+                side("    ", "\\ No newline at end of file"),
+                side("    ", "\\ No newline at end of file"),
+            ),
+        ];
+        for (index, expected) in expected.iter().enumerate() {
+            assert_eq!(&rows[index], expected, "row {index}:\n{}", rows.join("\n"));
+        }
+        assert!(
+            rows[expected.len()..]
+                .iter()
+                .all(|row| row.trim().is_empty())
+        );
+        assert!(app.diff_notice_texts().is_empty());
+        assert_eq!(app.diff_patch_capacity(), inner.height as usize - 1);
+    }
+
+    #[test]
+    fn narrow_panes_fall_back_to_unified_with_a_counted_notice() {
+        for (width, height, notice_rows) in [(80, 24, 1), (60, 16, 2)] {
+            let mut app = focused_patch_app(SPLIT_PATCH, width, height);
+            let (rows, _, inner) = diff_pane_rows(&mut app, width, height);
+            let notice = wrap_text(crate::app::SPLIT_FALLBACK_NOTICE, inner.width as usize);
+            assert_eq!(notice.len(), notice_rows, "{width}x{height}");
+            for (row, text) in rows.iter().zip(&notice) {
+                assert_eq!(row.trim_end(), text, "{width}x{height}");
+            }
+            assert!(rows[notice_rows].contains("@@ -1,4 +1,5 @@"));
+            assert!(rows[notice_rows + 1].starts_with("  1 1  fn orbit() {"));
+            assert!(rows[notice_rows + 2].starts_with("  2   -    let speed = 1;"));
+            assert!(rows.iter().all(|row| !row.contains('│')));
+            assert!(rows.iter().all(|row| !row.contains("comment side")));
+            assert_eq!(
+                app.diff_patch_capacity(),
+                inner.height as usize - notice_rows,
+                "{width}x{height}"
+            );
+
+            // An explicit unified preference shows no notice.
+            app.handle_input(Input::Character('v'));
+            let (rows, _, _) = diff_pane_rows(&mut app, width, height);
+            assert!(rows[0].contains("@@ -1,4 +1,5 @@"), "{width}x{height}");
+            assert!(app.diff_notice_texts().is_empty());
+        }
+    }
+
+    #[test]
+    fn split_threshold_boundary_switches_between_header_and_notice() {
+        let lines = crate::github::parse_patch_text(SPLIT_PATCH)
+            .lines()
+            .to_vec();
+        let inner = |width: u16| {
+            ReviewPaneLayout::from_area(Rect::new(0, 0, width, 24)).diff_content_width()
+        };
+        let first_split = (60..200)
+            .find(|width| crate::diff_view::SplitLayout::fit(&lines, inner(*width)).is_some())
+            .unwrap();
+        assert!(inner(first_split) >= 49 && inner(first_split - 1) < 49);
+
+        let mut app = focused_patch_app(SPLIT_PATCH, first_split - 1, 24);
+        let (rows, _, _) = diff_pane_rows(&mut app, first_split - 1, 24);
+        assert_eq!(rows[0].trim_end(), crate::app::SPLIT_FALLBACK_NOTICE);
+
+        let (rows, _, _) = diff_pane_rows(&mut app, first_split, 24);
+        assert!(rows[0].starts_with(" Old"), "{:?}", rows[0]);
+        assert!(rows[0].contains("│ New • comment side"));
+        assert!(rows[1].contains("@@ -1,4 +1,5 @@"));
+    }
+
+    #[test]
+    fn selected_split_row_highlights_the_active_side_and_underlines_the_other() {
+        let mut app = focused_patch_app(SPLIT_PATCH, 120, 32);
+        for _ in 0..2 {
+            app.handle_input(Input::Character('j'));
+        }
+        let (rows, buffer, inner) = diff_pane_rows(&mut app, 120, 32);
+        // Row 0 is the header, row 1 the hunk; the cursor is on row 3.
+        let y = inner.y + 3;
+        assert!(rows[3].contains("speed = 1") && rows[3].contains("speed = 2"));
+        let old_text = inner.x + 4;
+        let new_text = inner.x + 32 + 1 + 4;
+        let modifiers = |x: u16| buffer[(x, y)].modifier;
+        assert!(modifiers(new_text).contains(Modifier::REVERSED));
+        assert!(!modifiers(new_text).contains(Modifier::UNDERLINED));
+        assert!(modifiers(old_text).contains(Modifier::UNDERLINED));
+        assert!(!modifiers(old_text).contains(Modifier::REVERSED));
+        assert_eq!(buffer[(inner.x + 32, y)].symbol(), "│");
+
+        app.handle_input(Input::Character('<'));
+        let (rows, buffer, _) = diff_pane_rows(&mut app, 120, 32);
+        assert!(rows[0].starts_with(" Old • comment side"));
+        assert!(rows[0].contains("│ New "));
+        let modifiers = |x: u16| buffer[(x, y)].modifier;
+        assert!(modifiers(old_text).contains(Modifier::REVERSED));
+        assert!(modifiers(new_text).contains(Modifier::UNDERLINED));
+        // The header highlights the active label.
+        assert!(
+            buffer[(inner.x + 1, inner.y)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            !buffer[(inner.x + 34, inner.y)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert_eq!(
+            app.diff_comment_feedback(),
+            "commentable src/patch.rs:2 (old)"
+        );
+    }
+
+    #[test]
+    fn split_preference_leaves_non_text_patch_notices_unchanged() {
+        let states = [
+            (PatchContent::Empty, "No textual changes"),
+            (PatchContent::NoPatch, NO_PATCH_LABEL),
+            (
+                PatchContent::Unavailable,
+                "Patch not provided by GitHub (binary or too large)",
+            ),
+            (
+                PatchContent::Capped {
+                    lines: Vec::new(),
+                    omitted_lines: 3,
+                    omitted_bytes: 10,
+                    reason: PatchCapReason::CommitBudget,
+                },
+                "Omitted by per-commit budget",
+            ),
+        ];
+        for (patch, label) in states {
+            for (width, height) in [(120, 32), (60, 16)] {
+                let mut app = demo_patch_app(patch.clone());
+                app.resize(width, height);
+                for _ in 0..3 {
+                    app.apply(Command::Open);
+                }
+                let (rows, _, _) = diff_pane_rows(&mut app, width, height);
+                let text = rows.join("");
+                assert!(text.contains(label), "{label} at {width}x{height}");
+                assert!(!text.contains("comment side"), "{label}");
+                assert!(!text.contains("Unified view"), "{label}");
+                assert!(app.diff_notice_texts().is_empty(), "{label}");
+            }
+        }
+
+        // A locally capped patch keeps its notice above the split header.
+        let mut app = demo_patch_app(PatchContent::Capped {
+            lines: crate::github::parse_patch_text(SPLIT_PATCH)
+                .lines()
+                .to_vec(),
+            omitted_lines: 14,
+            omitted_bytes: 1_025,
+            reason: PatchCapReason::FileLimit,
+        });
+        app.resize(120, 32);
+        for _ in 0..3 {
+            app.apply(Command::Open);
+        }
+        let (rows, _, inner) = diff_pane_rows(&mut app, 120, 32);
+        assert_eq!(
+            rows[0].trim_end(),
+            "Patch capped locally: 14 lines / 2 KiB omitted"
+        );
+        assert!(rows[1].starts_with(" Old"));
+        assert!(rows[2].contains("@@ -1,4 +1,5 @@"));
+        assert_eq!(app.diff_patch_capacity(), inner.height as usize - 2);
+    }
+
+    #[test]
+    fn split_rows_reach_every_wrapped_row_and_the_true_tail() {
+        let patch = format!(
+            "@@ -1 +1 @@\n-{}\n+{}TRUE-TAIL",
+            "o".repeat(90),
+            "n".repeat(900)
+        );
+        // 910 new-side characters at 28 columns need 33 rows, more than
+        // either viewport.
+        for (width, height) in [(120, 32), (120, 16)] {
+            let mut app = focused_patch_app(&patch, width, height);
+            let total = app.position(Pane::Diff).1;
+            let mut new_side = String::new();
+            for index in 0..total {
+                assert_eq!(app.diff_cursor(), index);
+                let (rows, _, _) = diff_pane_rows(&mut app, width, height);
+                // Header row, then the viewport starting at the scroll row.
+                let shown = &rows[1 + index - app.scroll(Pane::Diff)];
+                let projection = app.diff_projection();
+                let row = projection.row(index).unwrap();
+                if let crate::diff_view::DisplayRow::Split { new, .. } = row
+                    && let Some(segment) = new.segment()
+                {
+                    let text = projection.row_text(app.current_diff_lines(), segment);
+                    assert!(shown.contains(text), "row {index} at {width}x{height}");
+                    new_side.push_str(text);
+                }
+                drop(projection);
+                app.handle_input(Input::Character('j'));
+            }
+            assert_eq!(new_side, format!("+{}TRUE-TAIL", "n".repeat(900)));
+            assert_eq!(app.diff_cursor() + 1, total);
+            assert!(app.scroll(Pane::Diff) > 0, "{width}x{height} scrolled");
+        }
+    }
+
     #[test]
     fn long_diff_lines_wrap_resize_and_reach_the_tail_without_panicking() {
         let mut app = demo_patch_app(PatchContent::Text {
@@ -2288,6 +2766,7 @@ mod tests {
                 },
             ],
         });
+        app.set_diff_view_mode(DiffViewMode::Unified);
         app.resize(120, 32);
         for _ in 0..3 {
             app.apply(Command::Open);
@@ -2334,6 +2813,7 @@ mod tests {
                     text: format!("+{}", "#".repeat(300)),
                 }],
             });
+            visible.set_diff_view_mode(DiffViewMode::Unified);
             let output = rendered_text(&mut visible, width, 40);
             assert_eq!(
                 output.matches('#').count(),
@@ -2349,6 +2829,7 @@ mod tests {
                     text: format!("+{}TRUE-TAIL", "x".repeat(1_200)),
                 }],
             });
+            tail.set_diff_view_mode(DiffViewMode::Unified);
             rendered_text(&mut tail, width, 16);
             tail.apply(Command::Open);
             tail.apply(Command::Open);
@@ -2378,7 +2859,12 @@ mod tests {
             .len();
             let output = rendered_diff_prefix(&mut app, width, 24, notice_rows);
             assert!(output.contains(label), "width {width}: {output:?}");
-            assert_eq!(app.diff_notice_texts(), vec![label]);
+            // Both widths are too narrow for split, so the fallback notice
+            // follows the cap notice.
+            assert_eq!(
+                app.diff_notice_texts(),
+                vec![label, crate::app::SPLIT_FALLBACK_NOTICE]
+            );
         }
     }
 

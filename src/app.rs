@@ -10,7 +10,7 @@ use crate::comment_draft::{
     CommentAnchor, CommentDraft, CommentDrafts, CommentTarget, DraftStateError, DraftStore,
     MAX_DRAFT_CHARACTERS, MemoryDraftStore, SubmissionAttempt, line_target,
 };
-use crate::diff_view::{DiffAnchor, DiffProjection, DiffViewMode};
+use crate::diff_view::{DiffAnchor, DiffProjection, DiffSide, DiffViewMode, SplitLayout};
 use crate::external_editor::EditorOutcome;
 use crate::github::{
     CommentFailure, DetailFailure, DetailState, ExistingCommentAnchor, ExistingComments,
@@ -184,6 +184,9 @@ pub enum Command {
     PageUp,
     NextHunk,
     PreviousHunk,
+    ToggleDiffView,
+    SelectOldSide,
+    SelectNewSide,
     Open,
     Back,
     ToggleReviewed,
@@ -252,6 +255,14 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
     HelpBinding {
         keys: "[ / ]",
         action: "diff: previous / next hunk",
+    },
+    HelpBinding {
+        keys: "v",
+        action: "diff: split / unified view",
+    },
+    HelpBinding {
+        keys: "< / >",
+        action: "diff: old / new side for line comments",
     },
     HelpBinding {
         keys: "Enter / Escape",
@@ -387,6 +398,8 @@ struct DiffProjectionKey {
     /// against replaced content.
     lines: (usize, usize),
     viewport_width: usize,
+    /// The preferred mode. The effective mode (split or its unified
+    /// fallback) is a function of the patch, the width and this preference.
     mode: DiffViewMode,
 }
 
@@ -404,6 +417,8 @@ struct DiffReadingAnchor {
     anchor: DiffAnchor,
     relative: usize,
     cursor: usize,
+    /// Active side the anchor was read on.
+    side: DiffSide,
 }
 
 #[derive(Debug)]
@@ -413,6 +428,7 @@ struct CachedDiffProjection {
 }
 
 const MAX_VISIBLE_FAILURES: usize = 3;
+pub(crate) const SPLIT_FALLBACK_NOTICE: &str = "Unified view: pane too narrow for split";
 const DETAIL_CACHE_CAPACITY: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -808,6 +824,10 @@ pub struct App {
     /// commit and file identity, so a cached projection is never reused for
     /// replaced content.
     diff_content_generation: u64,
+    /// Preferred diff layout. Transient view state; never persisted.
+    diff_view_mode: DiffViewMode,
+    /// Side of a split row that line actions target. Transient view state.
+    diff_side: DiffSide,
     #[cfg(test)]
     diff_projection_builds: usize,
     viewport_heights: [usize; 4],
@@ -947,6 +967,8 @@ impl App {
             diff_content_generation: 0,
             #[cfg(test)]
             diff_projection_builds: 0,
+            diff_view_mode: DiffViewMode::default(),
+            diff_side: DiffSide::default(),
             viewport_heights: [0; 4],
             pending_g: false,
             search_query: String::new(),
@@ -1286,6 +1308,9 @@ impl App {
             Input::End => Command::Last,
             Input::Character(']') => Command::NextHunk,
             Input::Character('[') => Command::PreviousHunk,
+            Input::Character('v') => Command::ToggleDiffView,
+            Input::Character('<') => Command::SelectOldSide,
+            Input::Character('>') => Command::SelectNewSide,
             Input::Character(_)
             | Input::Backspace
             | Input::Cancel
@@ -1443,6 +1468,9 @@ impl App {
             Command::PageUp => self.move_page(true, self.page_step()),
             Command::NextHunk => self.move_to_hunk(true),
             Command::PreviousHunk => self.move_to_hunk(false),
+            Command::ToggleDiffView => self.toggle_diff_view(),
+            Command::SelectOldSide => self.select_diff_side(DiffSide::Old),
+            Command::SelectNewSide => self.select_diff_side(DiffSide::New),
             Command::Open => self.open_selected(),
             Command::Back => self.focus_previous("Returned to parent pane"),
             Command::ToggleReviewed => self.toggle_reviewed(),
@@ -2052,10 +2080,24 @@ impl App {
             .diff_cursor_comment_row()
             .and_then(|row| line_target(file, row))
         else {
-            return Err("Selected diff row cannot accept a line comment");
+            return Err(self.line_comment_refusal());
         };
         CommentTarget::line(repository.identity.id, &commit.sha, line)
             .map_err(|_| "Selected diff row cannot accept a line comment")
+    }
+
+    /// Why the diff cursor cannot take a line comment on the active side.
+    fn line_comment_refusal(&self) -> &'static str {
+        if self.effective_diff_mode() == DiffViewMode::Split && self.diff_cursor_on_filler() {
+            let other = self.diff_cursor_other_side_commentable();
+            return match (self.diff_side, other) {
+                (DiffSide::Old, true) => "No old line on this row; press > for the new side",
+                (DiffSide::New, true) => "No new line on this row; press < for the old side",
+                (DiffSide::Old, false) => "No old line on this row",
+                (DiffSide::New, false) => "No new line on this row",
+            };
+        }
+        "Selected diff row cannot accept a line comment"
     }
 
     fn insert_edit_character(&mut self, character: char) {
@@ -3139,6 +3181,36 @@ impl App {
         self.status = format!("Moved to hunk {number}/{count}");
     }
 
+    fn toggle_diff_view(&mut self) {
+        self.diff_view_mode = match self.diff_view_mode {
+            DiffViewMode::Split => DiffViewMode::Unified,
+            DiffViewMode::Unified => DiffViewMode::Split,
+        };
+        self.sync_diff_projection();
+        self.status = match (self.diff_view_mode, self.effective_diff_mode()) {
+            (DiffViewMode::Unified, _) => "Unified diff view".to_owned(),
+            (DiffViewMode::Split, DiffViewMode::Split) => format!(
+                "Split diff view: old | new; line comments use the {} side",
+                self.diff_side.label()
+            ),
+            (DiffViewMode::Split, DiffViewMode::Unified) => {
+                "Split diff view preferred; pane too narrow, showing unified".to_owned()
+            }
+        };
+    }
+
+    fn select_diff_side(&mut self, side: DiffSide) {
+        self.diff_side = side;
+        self.status = if self.effective_diff_mode() == DiffViewMode::Split {
+            format!("Line comments use the {} side", side.label())
+        } else {
+            format!(
+                "Line comments will use the {} side in split view",
+                side.label()
+            )
+        };
+    }
+
     fn move_to_first(&mut self) {
         match self.focus {
             Pane::Repository => self.select_repository(0),
@@ -3287,6 +3359,11 @@ impl App {
                 match_char_offset(&line.text, &query.needle)
             });
         self.sync_diff_projection();
+        // In split mode a match on a deletion or an addition selects the side
+        // that shows it; a context match keeps the current side.
+        if let Some(side) = self.cached_diff_projection().raw_row_side(raw_row) {
+            self.diff_side = side;
+        }
         if let Some(row) = self.cached_diff_projection().row_for_anchor(DiffAnchor {
             raw_row,
             char_offset,
@@ -3318,11 +3395,67 @@ impl App {
             content_generation: self.diff_content_generation,
             lines: (lines.as_ptr() as usize, lines.len()),
             viewport_width: self.diff_viewport_width,
-            mode: DiffViewMode::Unified,
+            mode: self.diff_view_mode,
         }
     }
 
+    /// The split geometry for the current patch and pane, when split is
+    /// preferred, the pane geometry is known and each side is readable.
+    fn diff_split_layout(&self) -> Option<SplitLayout> {
+        if self.diff_view_mode != DiffViewMode::Split || self.diff_viewport_width == 0 {
+            return None;
+        }
+        SplitLayout::fit(self.current_diff_lines(), self.diff_viewport_width)
+    }
+
+    /// The layout the diff pane actually uses: the preference, or unified
+    /// when split does not fit. Uses the cached projection when it is
+    /// current, so it does not scan the patch per call.
+    pub(crate) fn effective_diff_mode(&self) -> DiffViewMode {
+        match &self.diff_view {
+            Some(cached) if cached.key == self.diff_projection_key() => cached.projection.mode(),
+            _ if self.diff_split_layout().is_some() => DiffViewMode::Split,
+            _ => DiffViewMode::Unified,
+        }
+    }
+
+    /// Split is preferred but the pane is too narrow for it.
+    pub(crate) fn diff_split_fallback(&self) -> bool {
+        self.diff_view_mode == DiffViewMode::Split
+            && self.diff_viewport_width > 0
+            && self.effective_diff_mode() == DiffViewMode::Unified
+            && self.current_file().is_some_and(|file| {
+                matches!(
+                    file.patch,
+                    PatchContent::Text { .. }
+                        | PatchContent::Capped {
+                            reason: PatchCapReason::FileLimit,
+                            ..
+                        }
+                ) && !file.patch.lines().is_empty()
+            })
+    }
+
+    pub fn diff_side(&self) -> DiffSide {
+        self.diff_side
+    }
+
+    #[cfg(test)]
+    pub fn diff_view_mode(&self) -> DiffViewMode {
+        self.diff_view_mode
+    }
+
+    /// Selects the preferred diff layout directly, as `v` would.
+    #[cfg(test)]
+    pub(crate) fn set_diff_view_mode(&mut self, mode: DiffViewMode) {
+        self.diff_view_mode = mode;
+        self.normalize();
+    }
+
     fn build_diff_projection(&self) -> DiffProjection {
+        if let Some(layout) = self.diff_split_layout() {
+            return DiffProjection::build_split(self.current_diff_lines(), layout);
+        }
         let lines = self.current_diff_lines();
         let gutter_width = DiffProjection::gutter_width_for(lines);
         // Without known geometry (compact fallback) rows are left unwrapped;
@@ -3349,17 +3482,29 @@ impl App {
             return;
         }
         let stored = self.diff_anchor.take();
-        let restore = self.diff_view.take().and_then(|previous| {
+        let previous = self.diff_view.take();
+        let projection = self.build_diff_projection();
+        #[cfg(test)]
+        {
+            self.diff_projection_builds += 1;
+        }
+        let side = self.diff_side;
+        let restore = previous.and_then(|previous| {
             if !previous.key.same_file(&key) {
                 return None;
             }
-            // A cursor on the last row follows the tail, unless that row is
-            // also the first one, where the start of the patch wins.
-            let at_tail = self.diff_cursor > 0 && self.diff_cursor + 1 == previous.projection.len();
+            let same_mode = previous.projection.mode() == projection.mode();
+            // A cursor on the last row follows the tail across resizes,
+            // unless that row is also the first one, where the start of the
+            // patch wins. A mode switch always keeps the logical line.
+            let at_tail = same_mode
+                && self.diff_cursor > 0
+                && self.diff_cursor + 1 == previous.projection.len();
             let reading = match stored {
                 Some(stored)
-                    if previous.projection.row_for_anchor(stored.anchor)
-                        == Some(self.diff_cursor) =>
+                    if stored.side == side
+                        && previous.projection.row_for_anchor(stored.anchor)
+                            == Some(self.diff_cursor) =>
                 {
                     let relative = if stored.cursor == self.diff_cursor {
                         stored.relative
@@ -3369,21 +3514,23 @@ impl App {
                     (stored.anchor, relative)
                 }
                 _ => (
-                    previous.projection.anchor(self.diff_cursor)?,
+                    previous.projection.anchor(self.diff_cursor, side)?,
                     self.diff_cursor.saturating_sub(self.diff_scroll),
                 ),
             };
-            Some((reading, at_tail))
+            // Entering split from unified selects the side that holds the
+            // anchored line, so the comment target stays the same line.
+            let adopt_side = previous.projection.mode() == DiffViewMode::Unified;
+            Some((reading, at_tail, adopt_side))
         });
-        let projection = self.build_diff_projection();
-        #[cfg(test)]
-        {
-            self.diff_projection_builds += 1;
-        }
         self.diff_view = Some(CachedDiffProjection { key, projection });
-        let Some(((anchor, relative), at_tail)) = restore else {
+        let Some(((anchor, relative), at_tail, adopt_side)) = restore else {
             return;
         };
+        if adopt_side && let Some(side) = self.cached_diff_projection().raw_row_side(anchor.raw_row)
+        {
+            self.diff_side = side;
+        }
         let total = self.cached_diff_projection().len();
         if at_tail {
             self.diff_cursor = total.saturating_sub(1);
@@ -3396,6 +3543,7 @@ impl App {
                 anchor,
                 relative,
                 cursor: row,
+                side: self.diff_side,
             });
         }
     }
@@ -3427,11 +3575,37 @@ impl App {
         }
     }
 
-    /// Raw patch row and comment row under the diff cursor.
+    /// Raw patch row and comment row under the diff cursor, read on the
+    /// active side. Filler on the active side has no comment row; its raw
+    /// row is the other side's, for search and feedback only.
     fn diff_cursor_rows(&self) -> Option<(usize, Option<usize>)> {
+        self.diff_projection().row(self.diff_cursor).map(|row| {
+            (
+                row.segment_or_other(self.diff_side).raw_row,
+                row.comment_row(self.diff_side),
+            )
+        })
+    }
+
+    /// The active side of the split row under the cursor is alignment
+    /// filler.
+    fn diff_cursor_on_filler(&self) -> bool {
         self.diff_projection()
             .row(self.diff_cursor)
-            .map(|row| (row.raw_row, row.comment_row))
+            .is_some_and(|row| row.segment(self.diff_side).is_none())
+    }
+
+    /// Whether the other side of the split row under the cursor has a line
+    /// that can carry a comment.
+    fn diff_cursor_other_side_commentable(&self) -> bool {
+        let Some(file) = self.current_file() else {
+            return false;
+        };
+        self.diff_projection()
+            .row(self.diff_cursor)
+            .and_then(|row| row.comment_row(self.diff_side.other()))
+            .and_then(|row| line_target(file, row))
+            .is_some()
     }
 
     pub fn diff_cursor_raw_row(&self) -> Option<usize> {
@@ -3473,7 +3647,7 @@ impl App {
     }
 
     pub(crate) fn diff_notice_texts(&self) -> Vec<String> {
-        let mut notices = Vec::with_capacity(2);
+        let mut notices = Vec::with_capacity(3);
         if let Some(DetailState::Ready(detail)) = self.current_detail_state()
             && (detail.omitted_files > 0 || detail.more_files_available)
         {
@@ -3492,20 +3666,24 @@ impl App {
                 omitted_bytes.div_ceil(1024)
             ));
         }
+        if self.diff_split_fallback() {
+            notices.push(SPLIT_FALLBACK_NOTICE.to_owned());
+        }
         notices
     }
 
     /// Patch rows that fit in the diff pane: the inner height (borders are
-    /// already excluded) minus the wrapped notice rows drawn above the patch.
-    /// The unified view draws no additional header rows.
+    /// already excluded) minus the wrapped notice rows drawn above the patch
+    /// and, in split mode, the Old | New column header row.
     pub(crate) fn diff_patch_capacity(&self) -> usize {
         let notice_rows = self
             .diff_notice_texts()
             .iter()
             .map(|notice| wrap_text(notice, self.diff_viewport_width).len())
             .sum::<usize>();
+        let header_rows = usize::from(self.effective_diff_mode() == DiffViewMode::Split);
         self.viewport_heights[Pane::Diff.index()]
-            .saturating_sub(notice_rows)
+            .saturating_sub(notice_rows + header_rows)
             .max(1)
     }
 
@@ -3816,11 +3994,27 @@ impl App {
         let Some(file) = self.current_file() else {
             return "line comments unavailable: no diff".to_owned();
         };
+        let split = self.effective_diff_mode() == DiffViewMode::Split;
         if let Some(target) = self
             .diff_cursor_comment_row()
             .and_then(|row| line_target(file, row))
         {
-            return format!("commentable {}:{}", target.path, target.position);
+            return if split {
+                format!(
+                    "commentable {}:{} ({})",
+                    target.path,
+                    target.position,
+                    self.diff_side.label()
+                )
+            } else {
+                format!("commentable {}:{}", target.path, target.position)
+            };
+        }
+        if split && self.diff_cursor_on_filler() {
+            return format!(
+                "line comments unavailable: no {} line on this row",
+                self.diff_side.label()
+            );
         }
         if !file.api_path_is_commentable {
             return "line comments unavailable: unsafe API path".to_owned();
@@ -5188,6 +5382,9 @@ mod tests {
             ("G", "gg / G", &[Input::Character('G')]),
             ("Ctrl-d", "Ctrl-d / Ctrl-u", &[Input::HalfPageDown]),
             ("Ctrl-u", "Ctrl-d / Ctrl-u", &[Input::HalfPageUp]),
+            ("v", "v", &[Input::Character('v')]),
+            ("<", "< / >", &[Input::Character('<')]),
+            (">", "< / >", &[Input::Character('>')]),
             ("Enter", "Enter / Escape", &[Input::Enter]),
             ("Escape", "Enter / Escape", &[Input::Escape]),
             ("/", "/", &[Input::Character('/')]),
@@ -7629,6 +7826,9 @@ mod backlog_tests {
             Input::End,
             Input::Character(']'),
             Input::Character('['),
+            Input::Character('v'),
+            Input::Character('<'),
+            Input::Character('>'),
         ] {
             let mut app = selection_app(HistoryCoverage::Complete);
             app.handle_input(Input::Character('A'));
@@ -7700,7 +7900,7 @@ mod backlog_tests {
         let texts: Vec<_> = projection
             .rows(0, 4)
             .iter()
-            .map(|row| projection.row_text(app.current_diff_lines(), row))
+            .map(|row| projection.row_text(app.current_diff_lines(), row.primary()))
             .collect();
         assert_eq!(texts[2], "+second");
         drop(projection);
@@ -7842,10 +8042,12 @@ mod diff_navigation_tests {
         }])
     }
 
-    /// A focused diff with `height` inner rows and `width` inner columns. All
-    /// fixtures use single-digit line numbers, so the gutter is 7 columns.
+    /// A focused unified diff with `height` inner rows and `width` inner
+    /// columns. All fixtures use single-digit line numbers, so the gutter is
+    /// 7 columns. Split-view tests select the split preference explicitly.
     fn diff_app_with(patch: PatchContent, width: usize, height: usize) -> App {
         let mut app = App::new(inbox(patch));
+        app.diff_view_mode = DiffViewMode::Unified;
         app.viewport_heights = [2, 2, 2, height];
         app.diff_viewport_width = width;
         for _ in 0..3 {
@@ -7888,10 +8090,12 @@ mod diff_navigation_tests {
         assert_cursor_visible(app);
     }
 
-    fn cursor_row(app: &App) -> crate::diff_view::DisplayRow {
+    /// The segment under the diff cursor on the active side.
+    fn cursor_row(app: &App) -> crate::diff_view::Segment {
         app.diff_projection()
             .row(app.diff_cursor())
             .unwrap()
+            .segment_or_other(app.diff_side())
             .clone()
     }
 
@@ -8027,7 +8231,7 @@ mod diff_navigation_tests {
         }
         assert!(visited.iter().all(|seen| *seen), "j skipped rows");
         let segments: Vec<_> = (2..12)
-            .map(|row| app.diff_projection().row(row).unwrap().segment)
+            .map(|row| app.diff_projection().row(row).unwrap().primary().segment)
             .collect();
         assert_eq!(segments, (0..10).collect::<Vec<_>>());
 
@@ -8424,5 +8628,336 @@ mod diff_navigation_tests {
                 .any(|effect| matches!(effect, CommentEffect::Publish { .. })),
             "a cancelled confirmation never publishes"
         );
+    }
+
+    // Split view. Raw rows: 0 header, 1 keep, 2-4 deletions, 5-6 additions,
+    // 7 tail. Display rows: 0 header, 1 keep, 2 [old one|new one],
+    // 3 [old two|new two], 4 [old three|filler], 5 tail.
+    const REPLACEMENT: &str =
+        "@@ -1,4 +1,3 @@\n keep\n-old one\n-old two\n-old three\n+new one\n+new two\n tail";
+
+    /// A focused split diff. At 60 columns each side has 25 text columns.
+    fn split_app(patch: &str, width: usize, height: usize) -> App {
+        let mut app = diff_app(patch, width, height);
+        app.set_diff_view_mode(DiffViewMode::Split);
+        assert_eq!(app.effective_diff_mode(), DiffViewMode::Split);
+        app
+    }
+
+    fn set_width(app: &mut App, width: usize) {
+        app.diff_viewport_width = width;
+        app.normalize();
+    }
+
+    fn target(app: &App) -> Result<u32, &'static str> {
+        app.current_line_comment_target()
+            .map(|target| match target.anchor() {
+                CommentAnchor::Line(line) => line.position,
+                CommentAnchor::Commit => panic!("expected a line target"),
+            })
+    }
+
+    #[test]
+    fn split_projection_is_cached_and_counts_the_header_in_capacity() {
+        let mut app = split_app(REPLACEMENT, 60, 10);
+        assert_eq!(app.diff_row_count(), 6);
+        assert_eq!(app.diff_patch_capacity(), 9, "the Old | New header row");
+        assert!(app.diff_notice_texts().is_empty());
+
+        let builds = app.diff_projection_builds;
+        for input in [Input::Character('j'), Input::Character('<'), Input::End] {
+            press(&mut app, input);
+        }
+        assert_eq!(
+            app.diff_projection_builds, builds,
+            "cursor and side reuse it"
+        );
+        press(&mut app, Input::Character('v'));
+        assert_eq!(app.diff_projection_builds, builds + 1);
+        assert_eq!(app.effective_diff_mode(), DiffViewMode::Unified);
+        assert_eq!(app.diff_patch_capacity(), 10);
+        assert_eq!(app.diff_row_count(), 8);
+        assert_eq!(app.status(), "Unified diff view");
+        assert_eq!(app.diff_view_mode(), DiffViewMode::Unified);
+    }
+
+    #[test]
+    fn view_toggle_and_width_fallback_keep_the_line_and_its_target() {
+        let mut app = split_app(REPLACEMENT, 60, 10);
+        for _ in 0..3 {
+            press(&mut app, Input::Character('j'));
+        }
+        assert_eq!(app.diff_side(), DiffSide::New);
+        assert_eq!(target(&app), Ok(6));
+        press(&mut app, Input::Character('<'));
+        assert_eq!(app.status(), "Line comments use the old side");
+        assert_eq!(target(&app), Ok(3), "paired rows are separate targets");
+        press(&mut app, Input::Character('>'));
+        assert_eq!(target(&app), Ok(6));
+
+        // Split to unified keeps the new-side line.
+        press(&mut app, Input::Character('v'));
+        assert_eq!(state(&app).0, 6);
+        assert_eq!(target(&app), Ok(6));
+        // A deletion selected in unified selects the old side in split.
+        for _ in 0..3 {
+            press(&mut app, Input::Character('k'));
+        }
+        assert_eq!(target(&app), Ok(3));
+        press(&mut app, Input::Character('v'));
+        assert_eq!(app.effective_diff_mode(), DiffViewMode::Split);
+        assert_eq!(app.diff_side(), DiffSide::Old);
+        assert_eq!(state(&app).0, 3);
+        assert_eq!(target(&app), Ok(3));
+
+        // One column below the threshold falls back to unified with a notice
+        // and keeps the preference; widening restores split.
+        set_width(&mut app, 48);
+        assert_eq!(app.effective_diff_mode(), DiffViewMode::Unified);
+        assert_eq!(app.diff_view_mode(), DiffViewMode::Split);
+        assert_eq!(app.diff_notice_texts(), vec![SPLIT_FALLBACK_NOTICE]);
+        assert_eq!(app.diff_patch_capacity(), 9, "the notice row");
+        assert_eq!(target(&app), Ok(3));
+        assert_eq!(state(&app).0, 3);
+        press(&mut app, Input::Character('v'));
+        assert_eq!(app.status(), "Unified diff view");
+        press(&mut app, Input::Character('v'));
+        assert_eq!(
+            app.status(),
+            "Split diff view preferred; pane too narrow, showing unified"
+        );
+        set_width(&mut app, 49);
+        assert_eq!(app.effective_diff_mode(), DiffViewMode::Split);
+        assert!(app.diff_notice_texts().is_empty());
+        assert_eq!(app.diff_side(), DiffSide::Old);
+        assert_eq!(state(&app).0, 3);
+        assert_eq!(target(&app), Ok(3));
+    }
+
+    #[test]
+    fn split_resize_preserves_the_wrapped_anchor_and_side() {
+        let long = "x".repeat(60);
+        let mut app = split_app(&format!("@@ -1 +1 @@\n-{long}\n+short"), 60, 10);
+        // 61 characters at 25 columns: segments start at 0, 25 and 50.
+        press(&mut app, Input::Character('<'));
+        press(&mut app, Input::End);
+        let row = cursor_row(&app);
+        assert_eq!((row.raw_row, row.char_offset), (1, 50));
+
+        set_width(&mut app, 80);
+        let row = cursor_row(&app);
+        // 35 columns per side: the offset is in the segment starting at 35.
+        assert_eq!((row.raw_row, row.char_offset), (1, 35));
+        assert_eq!(app.diff_side(), DiffSide::Old);
+        assert_eq!(target(&app), Ok(1));
+
+        set_width(&mut app, 60);
+        let row = cursor_row(&app);
+        assert_eq!((row.raw_row, row.char_offset), (1, 50));
+        assert_eq!(target(&app), Ok(1));
+    }
+
+    #[test]
+    fn split_targets_are_canonical_on_both_sides_and_filler_refuses() {
+        let long = "a".repeat(40);
+        // Rows: 0 header, 1 ctx, 2 [deletion|addition], 3 [continuation|filler].
+        let mut app = split_app(&format!("@@ -1,2 +1,2 @@\n ctx\n-{long}\n+b"), 60, 10);
+        let cases = [
+            (1, DiffSide::Old, Ok(1)),
+            (1, DiffSide::New, Ok(1)),
+            (2, DiffSide::Old, Ok(2)),
+            (2, DiffSide::New, Ok(3)),
+            (3, DiffSide::Old, Ok(2)),
+            (
+                3,
+                DiffSide::New,
+                Err("No new line on this row; press < for the old side"),
+            ),
+            (
+                0,
+                DiffSide::Old,
+                Err("Selected diff row cannot accept a line comment"),
+            ),
+            (
+                0,
+                DiffSide::New,
+                Err("Selected diff row cannot accept a line comment"),
+            ),
+        ];
+        for (row, side, expected) in cases {
+            app.diff_cursor = row;
+            app.diff_side = side;
+            assert_eq!(target(&app), expected, "row {row} {side:?}");
+            app.handle_input(Input::Character('c'));
+            match expected {
+                Ok(position) => {
+                    assert_eq!(comment_position(&app), Some(position));
+                    app.handle_input(Input::Cancel);
+                }
+                Err(message) => {
+                    assert_eq!(app.mode(), Mode::Normal);
+                    assert_eq!(app.status(), message);
+                }
+            }
+        }
+        app.diff_cursor = 2;
+        app.diff_side = DiffSide::Old;
+        assert_eq!(
+            app.diff_comment_feedback(),
+            format!("commentable {PATH}:2 (old)")
+        );
+        app.diff_cursor = 3;
+        app.diff_side = DiffSide::New;
+        assert_eq!(
+            app.diff_comment_feedback(),
+            "line comments unavailable: no new line on this row"
+        );
+
+        // A pure addition has no old line; a marker is not a target.
+        let marker = "\\ No newline at end of file";
+        // At 70 columns each side has 30, so the marker fits on one row.
+        let mut app = split_app(&format!("@@ -1 +1,2 @@\n-a\n{marker}\n+b\n+c"), 70, 10);
+        // Rows: 0 header, 1 [a|b], 2 [marker|filler], 3 [filler|c].
+        app.diff_side = DiffSide::Old;
+        app.diff_cursor = 3;
+        assert_eq!(
+            target(&app),
+            Err("No old line on this row; press > for the new side")
+        );
+        app.diff_cursor = 2;
+        assert_eq!(
+            target(&app),
+            Err("Selected diff row cannot accept a line comment")
+        );
+        app.diff_side = DiffSide::New;
+        assert_eq!(target(&app), Err("No new line on this row"));
+        app.diff_cursor = 3;
+        assert_eq!(target(&app), Ok(4));
+    }
+
+    #[test]
+    fn genuine_empty_lines_accept_comments_in_split() {
+        let mut app = split_app("@@ -1,2 +1,1 @@\n-\n-\n+", 60, 10);
+        app.diff_cursor = 1;
+        app.diff_side = DiffSide::Old;
+        assert_eq!(target(&app), Ok(1));
+        app.diff_side = DiffSide::New;
+        assert_eq!(target(&app), Ok(3));
+        app.diff_cursor = 2;
+        assert_eq!(
+            target(&app),
+            Err("No new line on this row; press < for the old side")
+        );
+    }
+
+    #[test]
+    fn split_drafts_mark_only_the_side_that_holds_the_line() {
+        let mut app = split_app(REPLACEMENT, 60, 10);
+        app.diff_cursor = 2;
+        app.diff_side = DiffSide::Old;
+        app.handle_input(Input::Character('c'));
+        app.handle_input(Input::Character('x'));
+        app.handle_input(Input::Escape);
+        assert!(app.diff_line_has_draft(2));
+        assert!(!app.diff_line_has_draft(5));
+
+        let output = rendered(&mut app, 60, 10);
+        let line = output
+            .lines()
+            .find(|line| line.contains('◆'))
+            .expect("draft marker");
+        assert_eq!(output.matches('◆').count(), 1, "{output}");
+        let marker = line.chars().position(|c| c == '◆').unwrap();
+        let separator = line.chars().position(|c| c == '│').unwrap();
+        assert!(marker < separator, "marker on the old side: {line}");
+        assert!(line.contains("-old one") && line.contains("+new one"));
+    }
+
+    #[test]
+    fn split_search_selects_the_matching_side_and_wrapped_row() {
+        let mut app = split_app(REPLACEMENT, 60, 10);
+        enter_search(&mut app, "new two");
+        assert_eq!((app.diff_side(), state(&app).0), (DiffSide::New, 3));
+        assert_eq!(target(&app), Ok(6));
+        enter_search(&mut app, "old three");
+        assert_eq!((app.diff_side(), state(&app).0), (DiffSide::Old, 4));
+        assert_eq!(target(&app), Ok(4));
+        enter_search(&mut app, "keep");
+        assert_eq!((app.diff_side(), state(&app).0), (DiffSide::Old, 1));
+        assert_eq!(target(&app), Ok(1), "context keeps the current side");
+
+        let long = "a".repeat(40);
+        let mut app = split_app(&format!("@@ -1 +1 @@\n-{long}NEEDLE\n+b"), 60, 10);
+        enter_search(&mut app, "needle");
+        assert_eq!(app.diff_side(), DiffSide::Old);
+        let row = cursor_row(&app);
+        assert_eq!((row.raw_row, row.char_offset), (1, 25));
+        assert_eq!(state(&app).0, 2);
+        assert!(rendered(&mut app, 60, 10).contains("NEEDLE"));
+
+        // Toggling views keeps the match's line and target.
+        press(&mut app, Input::Character('v'));
+        assert_eq!(cursor_row(&app).raw_row, 1);
+        assert_eq!(target(&app), Ok(1));
+    }
+
+    #[test]
+    fn view_and_side_keys_stay_isolated_in_modal_modes() {
+        let keys = [
+            Input::Character('v'),
+            Input::Character('<'),
+            Input::Character('>'),
+        ];
+        let mut app = split_app(REPLACEMENT, 60, 10);
+        press(&mut app, Input::Character('j'));
+        let snapshot = |app: &App| {
+            (
+                app.diff_view_mode(),
+                app.diff_side(),
+                app.effective_diff_mode(),
+                state(app),
+            )
+        };
+        let before = snapshot(&app);
+
+        app.handle_input(Input::Character('/'));
+        for input in keys {
+            app.handle_input(input);
+        }
+        assert_eq!(app.search_query(), "v<>");
+        app.handle_input(Input::Escape);
+        assert_eq!(snapshot(&app), before);
+
+        app.handle_input(Input::Character('?'));
+        for input in keys {
+            app.handle_input(input);
+        }
+        assert!(matches!(app.mode(), Mode::Help { .. }));
+        app.handle_input(Input::Escape);
+        assert_eq!(snapshot(&app), before);
+
+        app.handle_input(Input::Character('C'));
+        for input in keys {
+            app.handle_input(input);
+        }
+        assert!(matches!(app.mode(), Mode::Comments { .. }));
+        app.handle_input(Input::Escape);
+        assert_eq!(snapshot(&app), before);
+
+        app.handle_input(Input::Character('c'));
+        for input in keys {
+            app.handle_input(input);
+        }
+        assert_eq!(app.edit_buffer().unwrap().text(), "v<>");
+        app.handle_input(Input::Escape);
+        assert_eq!(snapshot(&app), before);
+
+        for input in keys {
+            app.handle_input(Input::Character('P'));
+            assert!(matches!(app.mode(), Mode::ConfirmPublish { .. }));
+            app.handle_input(input);
+            assert_eq!(app.status(), "Publish cancelled");
+            assert_eq!(snapshot(&app), before);
+        }
     }
 }

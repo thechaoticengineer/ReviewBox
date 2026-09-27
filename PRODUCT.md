@@ -96,8 +96,12 @@ canonical GitHub patch position, and no content beyond the patch is fetched.
 Delivered so far: display-row navigation (`j`/`k`, `Ctrl-d`/`Ctrl-u`,
 `PageDown`/`PageUp`, `Home`/`End`, `gg`/`G`, `[`/`]` hunks), patch-row and hunk
 position feedback, wrapped-row comment targeting and search, and resize anchor
-preservation. The side-by-side view, side selection and expanded view are
-still in progress.
+preservation; the default labeled side-by-side view (`v` toggles unified) with
+positional alignment of deletion/addition runs within a hunk, independent
+per-side wrapping, attached no-newline markers and an automatic unified
+fallback with a notice below 20 text columns per side; and active-side
+selection for line comments (`<` old, `>` new) with refusal on alignment
+padding. The expanded diff view is still in progress.
 
 ## Delivery order
 

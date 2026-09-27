@@ -256,6 +256,8 @@ Normal mode:
 | `Ctrl-d / Ctrl-u` | move down / up half a pane |
 | `PageDown / PageUp` | move down / up a full pane |
 | `[ / ]` | diff: previous / next hunk |
+| `v` | diff: split / unified view |
+| `< / >` | diff: old / new side for line comments |
 | `Enter / Escape` | open child / return to parent |
 | `/` | search the focused pane |
 | `n / N` | next / previous search match |
@@ -337,9 +339,48 @@ no-newline markers and unsupported rows cannot take a line comment. Search
 row that contains the match. Resizing keeps the current line and position
 within it, and a cursor at the patch end keeps following the end.
 
-Planned, not yet available: a labeled side-by-side old/new view with a unified
-fallback, choosing the old or new side for line actions, and an expanded
-full-terminal diff view.
+#### Side-by-side view
+
+By default the diff is shown side by side: old content on the left and new
+content on the right, under a labeled `Old │ New` header row. Both columns come
+from one display projection, so they always scroll together. Context lines
+appear on both sides with their real old and new line numbers. Within a hunk,
+a run of deleted lines directly followed by added lines is aligned by
+position (the first deletion beside the first addition, and so on); this is a
+reading aid, not a claim that the lines correspond. Unequal runs leave blank
+padding on the shorter side, pure additions have an empty old side and pure
+deletions an empty new side, and alignment never crosses a hunk boundary.
+Each side wraps independently with its own line-number gutter, and a paired
+row is as tall as its taller side. Hunk headers and unsupported rows span
+both columns. A `\ No newline at end of file` marker stays attached to the
+line it follows, on that line's side (both sides for context), and does not
+break the alignment of a replacement. Only patch content is shown; nothing is
+invented to fill the sides.
+
+`v` toggles between the side-by-side and the single-column unified view. When
+the diff pane leaves fewer than 20 text columns per side after the line-number
+gutters and separator, the pane shows the unified view with the notice
+`Unified view: pane too narrow for split`; the side-by-side preference is kept
+and returns as soon as the pane is wide enough. The header row and the notice
+count toward the page size. Switching views or resizing keeps the current
+line, the position within it and the selected comment target.
+
+Line actions in the side-by-side view use the **active side**: `<` selects the
+old side and `>` the new side (the default); `h`/`l` and `Left`/`Right` still
+move between panes. The header names the active side (`• comment side`), the
+selected row highlights the active side's cell and underlines the other, and
+the Diff title shows the target as `commentable path:position (old|new)`. A
+deletion and the addition beside it are separate targets with their own
+GitHub positions. Blank alignment padding, including rows below a shorter
+wrapped line, has no target: `c` reports, for example, `No old line on this
+row; press > for the new side`. A genuinely empty source line is a real line
+and can take a comment. Draft and comment markers appear in the gutter of the
+side that holds the line. Search matches old and new lines; moving to a match
+selects the side that shows it (context matches keep the current side) and
+the wrapped row containing it. In the unified view every row has a single
+target and the active side does not apply.
+
+Planned, not yet available: an expanded full-terminal diff view.
 
 ## Terminal restoration
 
@@ -375,6 +416,18 @@ continuations resolving to the original GitHub position, refusal on hunk
 headers, no-newline markers and unsupported rows, isolation of the new keys
 in every modal mode, and that cursor movement reuses the cached display
 projection while width changes and same-file content replacement rebuild it.
+Side-by-side tests use fictional patches for a large replacement, unequal
+blocks with padding, pure additions and deletions, runs that never cross hunk
+boundaries, real old/new numbers, no-newline markers on each side (including
+between the two halves of a replacement), per-side Unicode and wide-character
+wrapping, genuine empty lines versus padding, and malformed rows. They include
+rendered snapshots at 120x32 (labeled `Old │ New` columns) and the unified
+fallback notice at 80x24 and 60x16, the exact threshold width, the active-side
+highlight, unchanged empty/binary/unavailable/budget/capped notices,
+canonical positions on both sides of a paired row, on wrapped continuations
+and on context, refusal on padding, headers and markers, search selecting the
+matching side and wrapped row, view toggles and resizes that keep the line
+and its target, and isolation of `v`, `<` and `>` in modal modes.
 Backlog tests drive the real background loader with scripted `gh` responses and
 in-memory pagers. They cover full raw pages whose accepted projection is empty
 followed by older pages (an empty initial batch), entirely reviewed first
