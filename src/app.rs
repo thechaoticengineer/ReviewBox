@@ -6125,6 +6125,117 @@ mod tests {
             "Down arrow must clear pending_g like j"
         );
     }
+
+    type NavigationState = (Mode, Pane, [(usize, usize); 4], usize, usize, bool, String);
+
+    fn navigation_state(app: &App) -> NavigationState {
+        (
+            app.mode(),
+            app.focus(),
+            [Pane::Repository, Pane::Commit, Pane::File, Pane::Diff]
+                .map(|pane| (app.selected(pane), app.scroll(pane))),
+            app.diff_cursor(),
+            app.diff_row_offset(),
+            app.pending_g(),
+            app.status().to_owned(),
+        )
+    }
+
+    fn demo_app_focused_on(pane: Pane) -> App {
+        let mut app = App::new(DemoFixture::load());
+        app.viewport_heights = [2; 4];
+        let opens = match pane {
+            Pane::Repository => 0,
+            Pane::Commit => 1,
+            Pane::File => 2,
+            Pane::Diff => 3,
+        };
+        for _ in 0..opens {
+            app.handle_input(Input::Enter);
+        }
+        assert_eq!(app.focus(), pane, "fixture must reach {pane:?}");
+        // Move away from the top so Up and k have something to undo.
+        for _ in 0..3 {
+            app.handle_input(Input::Character('j'));
+        }
+        app
+    }
+
+    #[test]
+    fn every_arrow_matches_its_hjkl_counterpart_in_every_pane() {
+        let pairs = [
+            (Input::Left, 'h'),
+            (Input::Down, 'j'),
+            (Input::Up, 'k'),
+            (Input::Right, 'l'),
+        ];
+        for pane in [Pane::Repository, Pane::Commit, Pane::File, Pane::Diff] {
+            for (arrow, letter) in pairs {
+                for pending_g in [false, true] {
+                    let mut with_arrow = demo_app_focused_on(pane);
+                    let mut with_letter = demo_app_focused_on(pane);
+                    if pending_g {
+                        with_arrow.handle_input(Input::Character('g'));
+                        with_letter.handle_input(Input::Character('g'));
+                        assert!(with_arrow.pending_g() && with_letter.pending_g());
+                    }
+                    assert_eq!(
+                        navigation_state(&with_arrow),
+                        navigation_state(&with_letter),
+                        "{pane:?} apps must start identical"
+                    );
+                    let before = navigation_state(&with_letter);
+
+                    with_arrow.handle_input(arrow);
+                    with_letter.handle_input(Input::Character(letter));
+
+                    assert_eq!(
+                        navigation_state(&with_arrow),
+                        navigation_state(&with_letter),
+                        "{arrow:?} must match {letter} in {pane:?} (pending g: {pending_g})"
+                    );
+                    assert!(!with_arrow.pending_g(), "{arrow:?} must reset pending g");
+                    if pane != Pane::Repository || !matches!(arrow, Input::Left) {
+                        assert_ne!(
+                            before,
+                            navigation_state(&with_letter),
+                            "{letter} must have an observable effect in {pane:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn readme_keybinding_rows(readme: &str) -> Vec<(String, String)> {
+        let section = readme
+            .split("\n## Keybindings\n")
+            .nth(1)
+            .expect("README has a Keybindings section");
+        let section = section.split("\n## ").next().unwrap_or(section);
+        section
+            .lines()
+            .filter(|line| line.starts_with("| `"))
+            .map(|line| {
+                let cells: Vec<&str> = line.trim_matches('|').split(" | ").map(str::trim).collect();
+                assert_eq!(cells.len(), 2, "malformed README binding row: {line}");
+                (cells[0].replace('`', ""), cells[1].replace('`', ""))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn readme_keybinding_tables_match_help_bindings() {
+        let readme_rows = readme_keybinding_rows(include_str!("../README.md"));
+        let help_rows: Vec<(String, String)> = HELP_BINDINGS
+            .iter()
+            .map(|binding| (binding.keys.to_owned(), binding.action.to_owned()))
+            .collect();
+        assert_eq!(
+            readme_rows, help_rows,
+            "README Keybindings tables must list exactly the HELP_BINDINGS entries in order"
+        );
+    }
 }
 
 #[cfg(test)]
