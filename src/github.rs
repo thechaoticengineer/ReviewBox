@@ -1,4 +1,5 @@
-//! Read-only GitHub discovery and daily commit loading through `gh api`.
+//! Read-only GitHub discovery, daily commit loading and undated incremental
+//! history paging through `gh api`.
 //!
 //! The loader is deliberately independent of the terminal UI. Callers receive
 //! incremental events synchronously and can run it on their own worker thread.
@@ -532,6 +533,199 @@ pub enum LoadEvent {
     },
 }
 
+/// Coverage of undated backlog history. Only `Complete` proves that no
+/// supported source can still contain an unseen commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HistoryCoverage {
+    /// Branches were enumerated, every branch was exhausted and none failed.
+    Complete,
+    /// No failure occurred, but branch enumeration or some branch page is
+    /// still pending.
+    MoreAvailable,
+    /// Branch enumeration or a branch page failed, including rate limits.
+    Incomplete,
+}
+
+impl HistoryCoverage {
+    /// The weaker of two coverages; `Incomplete` dominates `MoreAvailable`,
+    /// which dominates `Complete`.
+    pub fn combine(self, other: Self) -> Self {
+        self.max(other)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchEnumeration {
+    Pending,
+    Loaded,
+    Failed(LoadFailure),
+}
+
+/// Paging position of one branch. The cursor only advances after its page
+/// was received and merged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchCursor {
+    pub name: String,
+    pub next_page: usize,
+    pub exhausted: bool,
+    pub failed: Option<LoadFailure>,
+}
+
+impl BranchCursor {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            next_page: 1,
+            exhausted: false,
+            failed: None,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        !self.exhausted && self.failed.is_none()
+    }
+}
+
+/// Undated, incrementally loaded history of one owned repository. Commits are
+/// deduplicated by full SHA across branches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryHistory {
+    pub identity: RepositoryIdentity,
+    pub repository_index: usize,
+    pub enumeration: BranchEnumeration,
+    pub branches: Vec<BranchCursor>,
+    pub commits: BTreeMap<String, Commit>,
+}
+
+impl RepositoryHistory {
+    pub fn new(identity: RepositoryIdentity, repository_index: usize) -> Self {
+        Self {
+            identity,
+            repository_index,
+            enumeration: BranchEnumeration::Pending,
+            branches: Vec::new(),
+            commits: BTreeMap::new(),
+        }
+    }
+
+    pub fn coverage(&self) -> HistoryCoverage {
+        match self.enumeration {
+            BranchEnumeration::Failed(_) => HistoryCoverage::Incomplete,
+            BranchEnumeration::Pending => HistoryCoverage::MoreAvailable,
+            BranchEnumeration::Loaded => {
+                if self.branches.iter().any(|branch| branch.failed.is_some()) {
+                    HistoryCoverage::Incomplete
+                } else if self.branches.iter().any(|branch| !branch.exhausted) {
+                    HistoryCoverage::MoreAvailable
+                } else {
+                    HistoryCoverage::Complete
+                }
+            }
+        }
+    }
+
+    /// Whether another fetch pass could request anything.
+    pub fn has_pending_pages(&self) -> bool {
+        match self.enumeration {
+            BranchEnumeration::Pending => true,
+            BranchEnumeration::Failed(_) => false,
+            BranchEnumeration::Loaded => self.branches.iter().any(BranchCursor::is_active),
+        }
+    }
+
+    pub fn failures(&self) -> Vec<LoadFailure> {
+        let mut failures = Vec::new();
+        if let BranchEnumeration::Failed(failure) = &self.enumeration {
+            failures.push(failure.clone());
+        }
+        failures.extend(
+            self.branches
+                .iter()
+                .filter_map(|branch| branch.failed.clone()),
+        );
+        failures
+    }
+
+    /// Clear recorded failures so a later pass retries them. Merged commits
+    /// and successful cursor positions are kept.
+    pub fn retry_failed(&mut self) {
+        if matches!(self.enumeration, BranchEnumeration::Failed(_)) {
+            self.enumeration = BranchEnumeration::Pending;
+        }
+        for branch in &mut self.branches {
+            branch.failed = None;
+        }
+    }
+
+    /// Loaded commits, newest authored first, then by SHA.
+    pub fn sorted_commits(&self) -> Vec<Commit> {
+        let mut commits = self.commits.values().cloned().collect::<Vec<_>>();
+        commits.sort_by(|left, right| {
+            right
+                .authored_at
+                .cmp(&left.authored_at)
+                .then_with(|| left.sha.cmp(&right.sha))
+        });
+        commits
+    }
+
+    pub fn repository(&self) -> Repository {
+        Repository {
+            identity: self.identity.clone(),
+            commits: self.sorted_commits(),
+        }
+    }
+}
+
+/// Successful discovery for the undated backlog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryDiscovery {
+    pub login: String,
+    pub repositories: Vec<RepositoryHistory>,
+}
+
+impl HistoryDiscovery {
+    /// Aggregate coverage of all discovered repositories. Discovery itself
+    /// succeeded; a discovery failure is returned as an error instead.
+    pub fn coverage(&self) -> HistoryCoverage {
+        self.repositories
+            .iter()
+            .fold(HistoryCoverage::Complete, |coverage, history| {
+                coverage.combine(history.coverage())
+            })
+    }
+}
+
+/// Bounded progress of undated history loading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryEvent {
+    DiscoveryPage {
+        page: usize,
+        owned_repositories: usize,
+    },
+    BranchPage {
+        repository_index: usize,
+        page: usize,
+        branches: usize,
+    },
+    HistoryPage {
+        repository_index: usize,
+        branch_index: usize,
+        page: usize,
+        accepted_commits: usize,
+        total_commits: usize,
+    },
+    Failure(LoadFailure),
+}
+
+/// Result of one [`GitHubLoader::fetch_next_pages`] pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryPass {
+    pub pages_fetched: usize,
+    pub accepted_commits: usize,
+    pub coverage: HistoryCoverage,
+}
+
 pub struct GitHubLoader<R> {
     runner: R,
     executable: OsString,
@@ -878,6 +1072,198 @@ impl<R: ProcessRunner> GitHubLoader<R> {
             page += 1;
         }
         Ok(accepted)
+    }
+
+    /// Resolve the authenticated account and its owned repositories for the
+    /// undated backlog. Uses the same ownership rule and ordering as the
+    /// day loader; failures are fatal and sanitized.
+    pub fn discover_history(
+        &self,
+        cancellation: &CancellationToken,
+        mut emit: impl FnMut(HistoryEvent),
+    ) -> Result<HistoryDiscovery, LoadFailure> {
+        let user: ApiUser =
+            self.get_json("/user", &[], FailureScope::Authentication, cancellation)?;
+        let repositories = self.discover_repositories(&user.login, cancellation, &mut |event| {
+            if let LoadEvent::DiscoveryPage {
+                page,
+                owned_repositories,
+            } = event
+            {
+                emit(HistoryEvent::DiscoveryPage {
+                    page,
+                    owned_repositories,
+                });
+            }
+        })?;
+        Ok(HistoryDiscovery {
+            login: user.login,
+            repositories: repositories
+                .iter()
+                .enumerate()
+                .map(|(index, repository)| RepositoryHistory::new(repository.identity(), index))
+                .collect(),
+        })
+    }
+
+    /// Enumerate branches of a repository whose enumeration is pending. A
+    /// failure is recorded in the history; only cancellation is returned.
+    pub fn load_history_branches(
+        &self,
+        history: &mut RepositoryHistory,
+        cancellation: &CancellationToken,
+        mut emit: impl FnMut(HistoryEvent),
+    ) -> Result<(), LoadFailure> {
+        if history.enumeration != BranchEnumeration::Pending {
+            return Ok(());
+        }
+        let repository = ApiRepository {
+            id: history.identity.id,
+            name: history.identity.name.clone(),
+            owner: ApiUser {
+                login: history.identity.owner.clone(),
+            },
+        };
+        let result = self.load_branches(
+            &repository,
+            history.repository_index,
+            cancellation,
+            &mut |event| {
+                if let LoadEvent::BranchPage {
+                    repository_index,
+                    page,
+                    branches,
+                } = event
+                {
+                    emit(HistoryEvent::BranchPage {
+                        repository_index,
+                        page,
+                        branches,
+                    });
+                }
+            },
+        );
+        match result {
+            Ok(branches) => {
+                history.branches = branches.into_iter().map(BranchCursor::new).collect();
+                history.enumeration = BranchEnumeration::Loaded;
+                Ok(())
+            }
+            Err(failure) if failure.category == FailureCategory::Cancelled => Err(failure),
+            Err(failure) => {
+                emit(HistoryEvent::Failure(failure.clone()));
+                history.enumeration = BranchEnumeration::Failed(failure);
+                Ok(())
+            }
+        }
+    }
+
+    /// Fetch the next undated page of every active branch, enumerating
+    /// branches first when needed. A branch is exhausted by a short or empty
+    /// raw API page, independent of how many entries pass author filtering.
+    /// Branch failures are recorded without discarding merged commits; only
+    /// cancellation is returned as an error, leaving merged pages intact.
+    pub fn fetch_next_pages(
+        &self,
+        history: &mut RepositoryHistory,
+        login: &str,
+        cancellation: &CancellationToken,
+        mut emit: impl FnMut(HistoryEvent),
+    ) -> Result<HistoryPass, LoadFailure> {
+        let repository_index = history.repository_index;
+        let cancelled = |scope| LoadFailure {
+            category: FailureCategory::Cancelled,
+            scope,
+            http_status: None,
+        };
+        if cancellation.is_cancelled() {
+            return Err(cancelled(FailureScope::Repository { repository_index }));
+        }
+        self.load_history_branches(history, cancellation, &mut emit)?;
+
+        let endpoint = format!(
+            "/repos/{}/{}/commits",
+            encode_path_segment(&history.identity.owner),
+            encode_path_segment(&history.identity.name)
+        );
+        let mut pass = HistoryPass {
+            pages_fetched: 0,
+            accepted_commits: 0,
+            coverage: HistoryCoverage::Complete,
+        };
+        for branch_index in 0..history.branches.len() {
+            if !history.branches[branch_index].is_active() {
+                continue;
+            }
+            let scope = FailureScope::Branch {
+                repository_index,
+                branch_index,
+            };
+            if cancellation.is_cancelled() {
+                return Err(cancelled(scope));
+            }
+            let page = history.branches[branch_index].next_page;
+            let values = match self.get_json::<Vec<ApiCommit>>(
+                &endpoint,
+                &[
+                    ("sha", history.branches[branch_index].name.clone()),
+                    ("author", login.to_owned()),
+                    ("per_page", PAGE_SIZE.to_string()),
+                    ("page", page_fields(page)),
+                ],
+                scope,
+                cancellation,
+            ) {
+                Ok(values) => values,
+                Err(failure) if failure.category == FailureCategory::Cancelled => {
+                    return Err(failure);
+                }
+                Err(failure) => {
+                    emit(HistoryEvent::Failure(failure.clone()));
+                    history.branches[branch_index].failed = Some(failure);
+                    continue;
+                }
+            };
+
+            let raw_len = values.len();
+            let mut accepted = 0;
+            for value in values {
+                let Some(author) = value.author else {
+                    continue;
+                };
+                if !author.login.eq_ignore_ascii_case(login) {
+                    continue;
+                }
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    history.commits.entry(value.sha.clone())
+                {
+                    entry.insert(Commit {
+                        sha: value.sha,
+                        subject: commit_subject(&value.commit.message),
+                        author: GitHubAuthor {
+                            login: author.login,
+                        },
+                        authored_at: value.commit.author.date,
+                        files: ChildPane::Unavailable,
+                    });
+                    accepted += 1;
+                }
+            }
+            let cursor = &mut history.branches[branch_index];
+            cursor.next_page += 1;
+            cursor.exhausted = raw_len < PAGE_SIZE;
+            pass.pages_fetched += 1;
+            pass.accepted_commits += accepted;
+            emit(HistoryEvent::HistoryPage {
+                repository_index,
+                branch_index,
+                page,
+                accepted_commits: accepted,
+                total_commits: history.commits.len(),
+            });
+        }
+        pass.coverage = history.coverage();
+        Ok(pass)
     }
 
     /// Load one commit's changed files on demand. The SHA must be a complete
@@ -3033,6 +3419,537 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn history_fields(branch: &str, page: usize) -> Vec<String> {
+        fields(&[
+            ("sha", branch),
+            ("author", "Octo"),
+            ("per_page", "100"),
+            ("page", &page.to_string()),
+        ])
+    }
+
+    fn history_step(branch: &str, page: usize, commits: Vec<Value>) -> Step {
+        json_step(
+            "/repos/Octo/backlog/commits",
+            history_fields(branch, page),
+            Value::Array(commits),
+        )
+    }
+
+    fn history_sha(value: usize) -> String {
+        format!("{value:040x}")
+    }
+
+    /// A full raw API page with distinct SHAs starting at `first`.
+    fn full_page(first: usize, login: Option<&str>) -> Vec<Value> {
+        (first..first + PAGE_SIZE)
+            .map(|value| {
+                commit(
+                    &history_sha(value),
+                    login,
+                    "2023-06-01T12:00:00Z",
+                    "Paged commit",
+                )
+            })
+            .collect()
+    }
+
+    fn backlog_history() -> RepositoryHistory {
+        RepositoryHistory::new(
+            RepositoryIdentity {
+                id: 901,
+                owner: "Octo".to_owned(),
+                name: "backlog".to_owned(),
+            },
+            0,
+        )
+    }
+
+    fn branches_step(names: &[&str]) -> Step {
+        json_step(
+            "/repos/Octo/backlog/branches",
+            branch_fields(1),
+            Value::Array(names.iter().map(|name| json!({"name": name})).collect()),
+        )
+    }
+
+    fn assert_read_only_calls(runner: &ScriptedRunner) {
+        for arguments in runner.calls() {
+            let text = arguments
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(&text[..4], ["api", "--method", "GET", "--include"]);
+            assert!(!text.iter().any(|argument| {
+                let lower = argument.to_ascii_lowercase();
+                lower.contains("token")
+                    || lower.contains("authorization")
+                    || lower.starts_with("since=")
+                    || lower.starts_with("until=")
+                    || matches!(
+                        lower.as_str(),
+                        "post" | "patch" | "put" | "delete" | "graphql"
+                    )
+            }));
+        }
+    }
+
+    fn shas(history: &RepositoryHistory) -> Vec<String> {
+        history
+            .sorted_commits()
+            .into_iter()
+            .map(|commit| commit.sha)
+            .collect()
+    }
+
+    #[test]
+    fn history_discovery_reuses_ownership_filter_and_ordering() {
+        let runner = ScriptedRunner::new(vec![
+            user_step(),
+            repos_step(json!([
+                {"id": 3, "name": "zeta", "owner": {"login": "octo"}},
+                {"id": 4, "name": "foreign", "owner": {"login": "Other"}},
+                {"id": 5, "name": "Alpha", "owner": {"login": "Octo"}}
+            ])),
+        ]);
+        let mut events = Vec::new();
+        let discovery = GitHubLoader::new(&runner)
+            .discover_history(&CancellationToken::default(), |event| events.push(event))
+            .unwrap();
+
+        assert_eq!(discovery.login, "Octo");
+        assert_eq!(
+            discovery
+                .repositories
+                .iter()
+                .map(|history| (history.identity.id, history.repository_index))
+                .collect::<Vec<_>>(),
+            [(5, 0), (3, 1)]
+        );
+        assert!(
+            discovery
+                .repositories
+                .iter()
+                .all(|history| history.enumeration == BranchEnumeration::Pending)
+        );
+        assert_eq!(discovery.coverage(), HistoryCoverage::MoreAvailable);
+        assert_eq!(
+            events,
+            [HistoryEvent::DiscoveryPage {
+                page: 1,
+                owned_repositories: 2
+            }]
+        );
+        assert_read_only_calls(&runner);
+        runner.assert_finished();
+    }
+
+    #[test]
+    fn history_discovery_failures_are_sanitized_errors() {
+        let runner = ScriptedRunner::new(vec![
+            user_step(),
+            failure_step(
+                "/user/repos",
+                fields(&[("affiliation", "owner"), ("per_page", "100"), ("page", "1")]),
+                403,
+                &[("x-ratelimit-remaining", "0")],
+                b"secret discovery payload",
+            ),
+        ]);
+        let failure = GitHubLoader::new(&runner)
+            .discover_history(&CancellationToken::default(), |_| {})
+            .unwrap_err();
+
+        assert_eq!(failure.category, FailureCategory::RateLimit);
+        assert_eq!(failure.scope, FailureScope::Discovery);
+        assert!(!failure.to_string().contains("secret"));
+        runner.assert_finished();
+    }
+
+    #[test]
+    fn first_history_pass_requests_undated_pages_and_deduplicates_overlapping_branches() {
+        let shared = history_sha(1);
+        let runner = ScriptedRunner::new(vec![
+            branches_step(&["main", "feature"]),
+            history_step(
+                "feature",
+                1,
+                vec![
+                    commit(&shared, Some("Octo"), "2020-02-01T10:00:00Z", "Shared"),
+                    commit(
+                        &history_sha(2),
+                        Some("octo"),
+                        "2020-03-01T10:00:00Z",
+                        "Feature only",
+                    ),
+                    commit(&history_sha(3), None, "2020-03-02T10:00:00Z", "Unlinked"),
+                    commit(
+                        &history_sha(4),
+                        Some("Other"),
+                        "2020-03-03T10:00:00Z",
+                        "Foreign",
+                    ),
+                ],
+            ),
+            history_step(
+                "main",
+                1,
+                vec![
+                    commit(&shared, Some("Octo"), "2020-02-01T10:00:00Z", "Shared"),
+                    commit(
+                        &history_sha(5),
+                        Some("Octo"),
+                        "2020-02-01T10:00:00Z",
+                        "Same time",
+                    ),
+                ],
+            ),
+        ]);
+        let mut history = backlog_history();
+        let mut events = Vec::new();
+        let pass = GitHubLoader::new(&runner)
+            .fetch_next_pages(
+                &mut history,
+                "Octo",
+                &CancellationToken::default(),
+                |event| events.push(event),
+            )
+            .unwrap();
+
+        assert_eq!(
+            shas(&history),
+            [history_sha(2), history_sha(1), history_sha(5)]
+        );
+        assert_eq!(
+            pass,
+            HistoryPass {
+                pages_fetched: 2,
+                accepted_commits: 3,
+                coverage: HistoryCoverage::Complete,
+            }
+        );
+        assert_eq!(history.coverage(), HistoryCoverage::Complete);
+        assert!(!history.has_pending_pages());
+        assert!(history.branches.iter().all(|branch| branch.exhausted));
+        assert_eq!(
+            events,
+            [
+                HistoryEvent::BranchPage {
+                    repository_index: 0,
+                    page: 1,
+                    branches: 2
+                },
+                HistoryEvent::HistoryPage {
+                    repository_index: 0,
+                    branch_index: 0,
+                    page: 1,
+                    accepted_commits: 2,
+                    total_commits: 2
+                },
+                HistoryEvent::HistoryPage {
+                    repository_index: 0,
+                    branch_index: 1,
+                    page: 1,
+                    accepted_commits: 1,
+                    total_commits: 3
+                },
+            ]
+        );
+        assert_read_only_calls(&runner);
+        runner.assert_finished();
+    }
+
+    #[test]
+    fn history_pages_until_a_short_page_exhausts_the_branch() {
+        let old = history_sha(10_000);
+        let runner = ScriptedRunner::new(vec![
+            branches_step(&["main"]),
+            history_step("main", 1, full_page(0, Some("Octo"))),
+            history_step("main", 2, full_page(100, Some("Octo"))),
+            history_step(
+                "main",
+                3,
+                vec![commit(
+                    &old,
+                    Some("Octo"),
+                    "2015-01-01T00:00:00Z",
+                    "Ancient",
+                )],
+            ),
+        ]);
+        let loader = GitHubLoader::new(&runner);
+        let cancellation = CancellationToken::default();
+        let mut history = backlog_history();
+
+        for expected_total in [100, 200] {
+            let pass = loader
+                .fetch_next_pages(&mut history, "Octo", &cancellation, |_| {})
+                .unwrap();
+            assert_eq!(pass.coverage, HistoryCoverage::MoreAvailable);
+            assert_eq!(history.commits.len(), expected_total);
+            assert!(history.has_pending_pages());
+        }
+        let pass = loader
+            .fetch_next_pages(&mut history, "Octo", &cancellation, |_| {})
+            .unwrap();
+        assert_eq!(pass.coverage, HistoryCoverage::Complete);
+        assert_eq!(history.commits.len(), 201);
+        assert_eq!(shas(&history).last(), Some(&old));
+        assert_eq!(history.branches[0].next_page, 4);
+
+        let idle = loader
+            .fetch_next_pages(&mut history, "Octo", &cancellation, |_| {})
+            .unwrap();
+        assert_eq!(idle.pages_fetched, 0);
+        assert_eq!(idle.coverage, HistoryCoverage::Complete);
+        assert_read_only_calls(&runner);
+        runner.assert_finished();
+    }
+
+    #[test]
+    fn a_full_page_without_accepted_commits_keeps_paging_while_an_empty_page_exhausts() {
+        let pending = history_sha(9_000);
+        let runner = ScriptedRunner::new(vec![
+            branches_step(&["main", "stale"]),
+            history_step("main", 1, full_page(0, None)),
+            history_step("stale", 1, Vec::new()),
+            history_step(
+                "main",
+                2,
+                vec![commit(
+                    &pending,
+                    Some("Octo"),
+                    "2016-05-05T05:05:05Z",
+                    "Pending",
+                )],
+            ),
+        ]);
+        let loader = GitHubLoader::new(&runner);
+        let cancellation = CancellationToken::default();
+        let mut history = backlog_history();
+
+        let first = loader
+            .fetch_next_pages(&mut history, "Octo", &cancellation, |_| {})
+            .unwrap();
+        assert_eq!(first.accepted_commits, 0);
+        assert_eq!(first.coverage, HistoryCoverage::MoreAvailable);
+        assert!(history.commits.is_empty());
+        assert!(!history.branches[0].exhausted);
+        assert!(history.branches[1].exhausted);
+
+        let second = loader
+            .fetch_next_pages(&mut history, "Octo", &cancellation, |_| {})
+            .unwrap();
+        assert_eq!(second.pages_fetched, 1);
+        assert_eq!(second.coverage, HistoryCoverage::Complete);
+        assert_eq!(shas(&history), [pending]);
+        runner.assert_finished();
+    }
+
+    #[test]
+    fn branchless_repositories_are_complete_and_empty() {
+        let runner = ScriptedRunner::new(vec![branches_step(&[])]);
+        let mut history = backlog_history();
+        assert_eq!(history.coverage(), HistoryCoverage::MoreAvailable);
+        let pass = GitHubLoader::new(&runner)
+            .fetch_next_pages(&mut history, "Octo", &CancellationToken::default(), |_| {})
+            .unwrap();
+        assert_eq!(pass.coverage, HistoryCoverage::Complete);
+        assert!(history.commits.is_empty());
+        runner.assert_finished();
+    }
+
+    #[test]
+    fn a_mid_history_branch_failure_is_incomplete_and_retains_partial_commits() {
+        let secret = b"secret branch payload";
+        let runner = ScriptedRunner::new(vec![
+            branches_step(&["broken", "main"]),
+            history_step("broken", 1, full_page(0, Some("Octo"))),
+            history_step("main", 1, full_page(1_000, Some("Octo"))),
+            failure_step(
+                "/repos/Octo/backlog/commits",
+                history_fields("broken", 2),
+                500,
+                &[],
+                secret,
+            ),
+            history_step(
+                "main",
+                2,
+                vec![commit(
+                    &history_sha(5_000),
+                    Some("Octo"),
+                    "2017-01-01T00:00:00Z",
+                    "Last",
+                )],
+            ),
+            history_step("broken", 2, Vec::new()),
+        ]);
+        let loader = GitHubLoader::new(&runner);
+        let cancellation = CancellationToken::default();
+        let mut history = backlog_history();
+
+        loader
+            .fetch_next_pages(&mut history, "Octo", &cancellation, |_| {})
+            .unwrap();
+        let mut events = Vec::new();
+        let pass = loader
+            .fetch_next_pages(&mut history, "Octo", &cancellation, |event| {
+                events.push(event)
+            })
+            .unwrap();
+
+        assert_eq!(pass.coverage, HistoryCoverage::Incomplete);
+        assert_eq!(history.coverage(), HistoryCoverage::Incomplete);
+        assert_eq!(history.commits.len(), 201);
+        assert_eq!(history.branches[0].next_page, 2);
+        assert!(!history.branches[0].exhausted);
+        assert!(history.branches[1].exhausted);
+        assert!(!history.has_pending_pages());
+        let failures = history.failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].category, FailureCategory::Api);
+        assert_eq!(
+            failures[0].scope,
+            FailureScope::Branch {
+                repository_index: 0,
+                branch_index: 0
+            }
+        );
+        assert!(events.contains(&HistoryEvent::Failure(failures[0].clone())));
+        assert!(!failures[0].to_string().contains("secret"));
+
+        let idle = loader
+            .fetch_next_pages(&mut history, "Octo", &cancellation, |_| {})
+            .unwrap();
+        assert_eq!(idle.pages_fetched, 0);
+        assert_eq!(idle.coverage, HistoryCoverage::Incomplete);
+
+        history.retry_failed();
+        let retried = loader
+            .fetch_next_pages(&mut history, "Octo", &cancellation, |_| {})
+            .unwrap();
+        assert_eq!(retried.coverage, HistoryCoverage::Complete);
+        assert_eq!(history.commits.len(), 201);
+        assert_read_only_calls(&runner);
+        runner.assert_finished();
+    }
+
+    #[test]
+    fn rate_limits_are_classified_for_branch_pages_and_enumeration() {
+        let runner = ScriptedRunner::new(vec![
+            branches_step(&["main"]),
+            failure_step(
+                "/repos/Octo/backlog/commits",
+                history_fields("main", 1),
+                403,
+                &[("x-ratelimit-remaining", "0")],
+                b"secret rate payload",
+            ),
+            failure_step(
+                "/repos/Octo/backlog/branches",
+                branch_fields(1),
+                429,
+                &[("retry-after", "60")],
+                b"secret rate payload",
+            ),
+        ]);
+        let loader = GitHubLoader::new(&runner);
+        let cancellation = CancellationToken::default();
+
+        let mut paged = backlog_history();
+        let pass = loader
+            .fetch_next_pages(&mut paged, "Octo", &cancellation, |_| {})
+            .unwrap();
+        assert_eq!(pass.coverage, HistoryCoverage::Incomplete);
+        assert_eq!(paged.branches[0].next_page, 1);
+        let failure = paged.branches[0].failed.clone().unwrap();
+        assert_eq!(failure.category, FailureCategory::RateLimit);
+        assert_eq!(failure.http_status, Some(403));
+
+        let mut unenumerated = backlog_history();
+        let mut events = Vec::new();
+        let pass = loader
+            .fetch_next_pages(&mut unenumerated, "Octo", &cancellation, |event| {
+                events.push(event)
+            })
+            .unwrap();
+        assert_eq!(pass.pages_fetched, 0);
+        assert_eq!(pass.coverage, HistoryCoverage::Incomplete);
+        let BranchEnumeration::Failed(failure) = &unenumerated.enumeration else {
+            panic!("enumeration failure must be recorded");
+        };
+        assert_eq!(failure.category, FailureCategory::RateLimit);
+        assert_eq!(
+            failure.scope,
+            FailureScope::Repository {
+                repository_index: 0
+            }
+        );
+        assert_eq!(events, [HistoryEvent::Failure(failure.clone())]);
+        assert!(!failure.to_string().contains("secret"));
+        assert!(!failure.to_string().contains("backlog"));
+
+        let combined = HistoryDiscovery {
+            login: "Octo".to_owned(),
+            repositories: vec![paged, unenumerated],
+        };
+        assert_eq!(combined.coverage(), HistoryCoverage::Incomplete);
+        assert_read_only_calls(&runner);
+        runner.assert_finished();
+    }
+
+    #[test]
+    fn pre_cancelled_history_requests_never_invoke_the_runner() {
+        let runner = ScriptedRunner::new(Vec::new());
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let loader = GitHubLoader::new(&runner);
+
+        let failure = loader.discover_history(&cancellation, |_| {}).unwrap_err();
+        assert_eq!(failure.category, FailureCategory::Cancelled);
+
+        let mut history = backlog_history();
+        let failure = loader
+            .fetch_next_pages(&mut history, "Octo", &cancellation, |_| {})
+            .unwrap_err();
+        assert_eq!(failure.category, FailureCategory::Cancelled);
+        assert_eq!(history.enumeration, BranchEnumeration::Pending);
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn mid_pass_cancellation_stops_further_calls_and_keeps_merged_pages() {
+        let runner = ScriptedRunner::new(vec![
+            branches_step(&["first", "second"]),
+            history_step("first", 1, full_page(0, Some("Octo"))),
+        ]);
+        let cancellation = CancellationToken::default();
+        let mut history = backlog_history();
+        let failure = GitHubLoader::new(&runner)
+            .fetch_next_pages(&mut history, "Octo", &cancellation, |event| {
+                if matches!(event, HistoryEvent::HistoryPage { .. }) {
+                    cancellation.cancel();
+                }
+            })
+            .unwrap_err();
+
+        assert_eq!(failure.category, FailureCategory::Cancelled);
+        assert_eq!(history.commits.len(), 100);
+        assert_eq!(history.branches[0].next_page, 2);
+        assert_eq!(history.branches[1].next_page, 1);
+        assert!(
+            history
+                .branches
+                .iter()
+                .all(|branch| branch.failed.is_none())
+        );
+        assert_eq!(history.coverage(), HistoryCoverage::MoreAvailable);
+        assert_eq!(runner.calls().len(), 2);
+        assert_read_only_calls(&runner);
+        runner.assert_finished();
     }
 
     #[derive(Default)]
