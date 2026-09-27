@@ -4083,9 +4083,9 @@ mod tests {
             Ok(ReviewMarks::default())
         }
 
-        fn set_reviewed(
+        fn set_reviewed_many(
             &self,
-            _key: &ReviewKey,
+            _keys: &[ReviewKey],
             _reviewed: bool,
         ) -> Result<ReviewMarks, ReviewStateError> {
             Err(ReviewStateError::Write(

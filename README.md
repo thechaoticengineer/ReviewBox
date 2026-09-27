@@ -108,7 +108,9 @@ file-backed store; it never writes relative to the working directory. On Unix,
 new ReviewBox data directories are created with mode `0700` and replacement
 files with mode `0600`. Existing parent-directory permissions are not repaired.
 Writes use a same-directory temporary file and atomic rename, but concurrent
-ReviewBox processes are not locked and can race.
+ReviewBox processes are not locked and can race. A review change covering several
+commits is saved as a single atomic replacement of `review-state.json`; if that
+save fails, the previously saved marks remain unchanged.
 
 `review-state.json` contains only a version, numeric GitHub repository IDs, and
 complete lowercase commit SHAs. `comment-drafts.json` contains repository IDs,

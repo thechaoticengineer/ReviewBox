@@ -75,6 +75,26 @@ impl ReviewMarks {
         self.repositories.len()
     }
 
+    fn set_reviewed_many(&mut self, keys: &[ReviewKey], reviewed: bool) {
+        let unique: BTreeSet<(u64, &str)> = keys
+            .iter()
+            .map(|key| (key.repository_id, key.sha.as_str()))
+            .collect();
+        for (repository_id, sha) in unique {
+            if reviewed {
+                self.repositories
+                    .entry(repository_id)
+                    .or_default()
+                    .insert(sha.to_owned());
+            } else if let Some(repository) = self.repositories.get_mut(&repository_id) {
+                repository.remove(sha);
+                if repository.is_empty() {
+                    self.repositories.remove(&repository_id);
+                }
+            }
+        }
+    }
+
     fn set_reviewed(&mut self, key: &ReviewKey, reviewed: bool) {
         if reviewed {
             self.repositories
@@ -134,6 +154,17 @@ pub trait ReviewStore: fmt::Debug {
     fn set_reviewed(
         &self,
         key: &ReviewKey,
+        reviewed: bool,
+    ) -> Result<ReviewMarks, ReviewStateError> {
+        self.set_reviewed_many(std::slice::from_ref(key), reviewed)
+    }
+
+    /// Applies one reviewed flag to every key as a single all-or-nothing
+    /// change. On error the previously stored marks remain unchanged. An empty
+    /// slice returns the current marks without creating storage.
+    fn set_reviewed_many(
+        &self,
+        keys: &[ReviewKey],
         reviewed: bool,
     ) -> Result<ReviewMarks, ReviewStateError>;
 }
@@ -207,13 +238,16 @@ impl ReviewStore for FileReviewStore {
         self.read_marks()
     }
 
-    fn set_reviewed(
+    fn set_reviewed_many(
         &self,
-        key: &ReviewKey,
+        keys: &[ReviewKey],
         reviewed: bool,
     ) -> Result<ReviewMarks, ReviewStateError> {
         let mut marks = self.read_marks()?;
-        marks.set_reviewed(key, reviewed);
+        if keys.is_empty() {
+            return Ok(marks);
+        }
+        marks.set_reviewed_many(keys, reviewed);
         self.write_marks(&marks)?;
         Ok(marks)
     }
@@ -237,13 +271,13 @@ impl ReviewStore for MemoryReviewStore {
         Ok(self.marks.borrow().clone())
     }
 
-    fn set_reviewed(
+    fn set_reviewed_many(
         &self,
-        key: &ReviewKey,
+        keys: &[ReviewKey],
         reviewed: bool,
     ) -> Result<ReviewMarks, ReviewStateError> {
         let mut marks = self.marks.borrow_mut();
-        marks.set_reviewed(key, reviewed);
+        marks.set_reviewed_many(keys, reviewed);
         Ok(marks.clone())
     }
 }
@@ -648,6 +682,248 @@ mod tests {
         assert!(!message.contains(secret));
         assert!(!message.contains(directory.0.to_string_lossy().as_ref()));
         assert!(message.contains("malformed"));
+    }
+
+    fn application_entries(directory: &TestDirectory) -> usize {
+        fs::read_dir(directory.0.join(APPLICATION_DIRECTORY))
+            .unwrap()
+            .count()
+    }
+
+    #[test]
+    fn batch_mark_and_unmark_round_trip_across_fresh_store_instances() {
+        let directory = TestDirectory::new();
+        let first = ReviewKey::new(21, sha('a')).unwrap();
+        let second = ReviewKey::new(21, sha('b')).unwrap();
+        let third = ReviewKey::new(22, sha('c')).unwrap();
+        let batch = [first.clone(), second.clone(), third.clone(), first.clone()];
+
+        let saved = store(&directory).set_reviewed_many(&batch, true).unwrap();
+        let loaded = store(&directory).load().unwrap();
+        assert_eq!(loaded, saved);
+        assert_eq!(loaded.reviewed_count(), 3);
+        assert_eq!(loaded.repository_count(), 2);
+
+        let unmarked = store(&directory)
+            .set_reviewed_many(&[second.clone(), third.clone(), third.clone()], false)
+            .unwrap();
+        let reloaded = store(&directory).load().unwrap();
+        assert_eq!(reloaded, unmarked);
+        assert!(reloaded.is_reviewed(&first));
+        assert!(!reloaded.is_reviewed(&second));
+        assert!(!reloaded.is_reviewed(&third));
+        assert_eq!(reloaded.repository_count(), 1);
+    }
+
+    #[test]
+    fn batch_leaves_other_repositories_untouched() {
+        let directory = TestDirectory::new();
+        let other = ReviewKey::new(30, sha('d')).unwrap();
+        let shared_sha_other_repository = ReviewKey::new(30, sha('e')).unwrap();
+        let target = ReviewKey::new(31, sha('e')).unwrap();
+        store(&directory)
+            .set_reviewed_many(&[other.clone(), shared_sha_other_repository.clone()], true)
+            .unwrap();
+
+        store(&directory)
+            .set_reviewed_many(std::slice::from_ref(&target), true)
+            .unwrap();
+        let marks = store(&directory)
+            .set_reviewed_many(std::slice::from_ref(&target), false)
+            .unwrap();
+
+        assert!(marks.is_reviewed(&other));
+        assert!(marks.is_reviewed(&shared_sha_other_repository));
+        assert!(!marks.is_reviewed(&target));
+        assert_eq!(store(&directory).load().unwrap(), marks);
+    }
+
+    #[test]
+    fn existing_version_one_file_loads_and_is_preserved_by_batch() {
+        let directory = TestDirectory::new();
+        fs::create_dir(directory.0.join(APPLICATION_DIRECTORY)).unwrap();
+        let fixture = format!(
+            concat!(
+                "{{\n",
+                "  \"version\": 1,\n",
+                "  \"repositories\": {{\n",
+                "    \"101\": {{\n",
+                "      \"reviewed\": [\n",
+                "        \"{}\"\n",
+                "      ]\n",
+                "    }},\n",
+                "    \"202\": {{\n",
+                "      \"reviewed\": [\n",
+                "        \"{}\",\n",
+                "        \"{}\"\n",
+                "      ]\n",
+                "    }}\n",
+                "  }}\n",
+                "}}\n"
+            ),
+            sha('1'),
+            sha('2'),
+            sha('3')
+        );
+        fs::write(directory.state_path(), &fixture).unwrap();
+        let existing = [
+            ReviewKey::new(101, sha('1')).unwrap(),
+            ReviewKey::new(202, sha('2')).unwrap(),
+            ReviewKey::new(202, sha('3')).unwrap(),
+        ];
+
+        let loaded = store(&directory).load().unwrap();
+        assert!(existing.iter().all(|key| loaded.is_reviewed(key)));
+        assert_eq!(loaded.reviewed_count(), 3);
+        assert_eq!(
+            encode(&loaded).unwrap(),
+            fixture.as_bytes(),
+            "the v1 schema and serialization are unchanged"
+        );
+
+        let added = [
+            ReviewKey::new(101, sha('4')).unwrap(),
+            ReviewKey::new(303, sha('5')).unwrap(),
+        ];
+        let saved = store(&directory).set_reviewed_many(&added, true).unwrap();
+        let reloaded = store(&directory).load().unwrap();
+
+        assert_eq!(reloaded, saved);
+        assert_eq!(reloaded.reviewed_count(), 5);
+        assert!(
+            existing
+                .iter()
+                .chain(&added)
+                .all(|key| reloaded.is_reviewed(key))
+        );
+        let file: StateFile =
+            serde_json::from_slice(&fs::read(directory.state_path()).unwrap()).unwrap();
+        assert_eq!(file.version, 1);
+    }
+
+    #[test]
+    fn injected_batch_write_failure_preserves_previous_file_and_cleans_temp_file() {
+        let directory = TestDirectory::new();
+        let first = ReviewKey::new(40, sha('1')).unwrap();
+        let second = ReviewKey::new(41, sha('2')).unwrap();
+        store(&directory)
+            .set_reviewed_many(&[first.clone(), second.clone()], true)
+            .unwrap();
+        let before = fs::read(directory.state_path()).unwrap();
+
+        for (keys, reviewed) in [
+            (
+                vec![
+                    ReviewKey::new(40, sha('3')).unwrap(),
+                    ReviewKey::new(42, sha('4')).unwrap(),
+                ],
+                true,
+            ),
+            (vec![first.clone(), second.clone()], false),
+        ] {
+            let error = store(&directory)
+                .failing_before_rename()
+                .set_reviewed_many(&keys, reviewed)
+                .unwrap_err();
+
+            assert!(matches!(error, ReviewStateError::Write(_)));
+            assert_eq!(fs::read(directory.state_path()).unwrap(), before);
+            assert_eq!(
+                application_entries(&directory),
+                1,
+                "failed replacement must leave no temporary file"
+            );
+        }
+        let marks = store(&directory).load().unwrap();
+        assert!(marks.is_reviewed(&first));
+        assert!(marks.is_reviewed(&second));
+        assert_eq!(marks.reviewed_count(), 2);
+    }
+
+    #[test]
+    fn malformed_or_unsupported_files_make_batches_fail_without_overwriting() {
+        let cases = [
+            (b"not json".as_slice(), ReviewStateError::Malformed),
+            (
+                br#"{"version":2,"repositories":{}}"#.as_slice(),
+                ReviewStateError::UnsupportedVersion,
+            ),
+            (
+                br#"{"version":1,"repositories":{},"foreign":true}"#.as_slice(),
+                ReviewStateError::Malformed,
+            ),
+        ];
+        let keys = [
+            ReviewKey::new(8, sha('8')).unwrap(),
+            ReviewKey::new(9, sha('9')).unwrap(),
+        ];
+
+        for (index, (bytes, expected)) in cases.into_iter().enumerate() {
+            let directory = TestDirectory::new();
+            fs::create_dir(directory.0.join(APPLICATION_DIRECTORY)).unwrap();
+            fs::write(directory.state_path(), bytes).unwrap();
+            let review_store = store(&directory);
+
+            for reviewed in [true, false] {
+                assert_eq!(
+                    review_store.set_reviewed_many(&keys, reviewed).unwrap_err(),
+                    expected,
+                    "case {index}"
+                );
+            }
+            assert_eq!(
+                review_store.set_reviewed_many(&[], true).unwrap_err(),
+                expected,
+                "case {index}"
+            );
+            assert_eq!(
+                fs::read(directory.state_path()).unwrap(),
+                bytes,
+                "case {index}"
+            );
+            assert_eq!(application_entries(&directory), 1, "case {index}");
+        }
+    }
+
+    #[test]
+    fn empty_batch_is_a_noop_that_creates_no_file() {
+        let directory = TestDirectory::new();
+        for reviewed in [true, false] {
+            let marks = store(&directory).set_reviewed_many(&[], reviewed).unwrap();
+            assert_eq!(marks, ReviewMarks::default());
+        }
+        assert!(!directory.state_path().exists());
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+
+        let key = ReviewKey::new(50, sha('5')).unwrap();
+        store(&directory).set_reviewed(&key, true).unwrap();
+        let before = fs::read(directory.state_path()).unwrap();
+        let marks = store(&directory).set_reviewed_many(&[], false).unwrap();
+        assert!(marks.is_reviewed(&key));
+        assert_eq!(fs::read(directory.state_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn memory_store_batch_marks_unmarks_and_ignores_empty_batches() {
+        let existing = ReviewKey::new(60, sha('6')).unwrap();
+        let mut initial = ReviewMarks::default();
+        initial.set_reviewed(&existing, true);
+        let review_store = MemoryReviewStore::new(initial.clone());
+        let first = ReviewKey::new(61, sha('7')).unwrap();
+        let second = ReviewKey::new(61, sha('8')).unwrap();
+
+        assert_eq!(review_store.set_reviewed_many(&[], true).unwrap(), initial);
+        let marked = review_store
+            .set_reviewed_many(&[first.clone(), second.clone(), first.clone()], true)
+            .unwrap();
+        assert_eq!(marked.reviewed_count(), 3);
+        assert_eq!(review_store.load().unwrap(), marked);
+
+        let unmarked = review_store
+            .set_reviewed_many(&[first, second], false)
+            .unwrap();
+        assert_eq!(unmarked, initial);
+        assert_eq!(review_store.load().unwrap(), initial);
     }
 
     #[test]
