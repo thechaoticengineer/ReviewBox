@@ -23,14 +23,18 @@ use std::process::ExitCode;
 use app::App;
 use cli::Command;
 use comment::CommentSession;
-use comment_draft::{DraftStore, FileDraftStore};
+use comment_draft::{DraftStore, FileDraftStore, MemoryDraftStore};
+use day::DaySelection;
 use detail::DetailSession;
-use event::{CrosstermEventSource, DetailRequester, ExternalEditorSession};
+use event::{
+    CrosstermEventSource, DetailRequester, ExternalEditorSession, FakeComments, LoaderEventSource,
+    NoDetails,
+};
 use external_editor::{CommandEditorProcess, PrivateEditorTempFiles};
-use fixture::DemoFixture;
-use inbox::Inbox;
-use inbox::InboxSource;
-use loader::LoaderSession;
+use fixture::{DemoFixture, DemoHistoryPager};
+use github::{CommandRunner, GitHubLoader};
+use inbox::{BacklogOrigin, Inbox, InboxSource};
+use loader::{BacklogSession, LoaderSession};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use review_state::{FileReviewStore, ReviewStore};
@@ -38,6 +42,13 @@ use terminal::{CrosstermOps, with_terminal_session};
 
 fn main() -> ExitCode {
     match cli::parse(std::env::args_os().skip(1)) {
+        Ok(Command::Backlog) => match run_inbox(Inbox::backlog(BacklogOrigin::GitHub)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("reviewbox: {error}");
+                ExitCode::FAILURE
+            }
+        },
         Ok(Command::Live(selection)) => match run_inbox(Inbox::live(selection)) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -45,7 +56,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Ok(Command::Demo) => match run_inbox(DemoFixture::load()) {
+        Ok(Command::Demo) => match run_inbox(Inbox::backlog(BacklogOrigin::Demo)) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("reviewbox: {error}");
@@ -73,19 +84,37 @@ fn main() -> ExitCode {
     }
 }
 
+enum Services {
+    Day(DaySelection),
+    GitHubBacklog,
+    DemoBacklog,
+    StaticDemo,
+}
+
 fn run_inbox(inbox: Inbox) -> io::Result<()> {
-    let selection = match &inbox.source {
-        InboxSource::Live { selection } => Some(selection.clone()),
-        InboxSource::Demo => None,
+    let services = match &inbox.source {
+        InboxSource::Live { selection } => Services::Day(selection.clone()),
+        InboxSource::Backlog {
+            origin: BacklogOrigin::GitHub,
+        } => Services::GitHubBacklog,
+        InboxSource::Backlog {
+            origin: BacklogOrigin::Demo,
+        } => Services::DemoBacklog,
+        InboxSource::Demo => Services::StaticDemo,
     };
-    let mut app = match &inbox.source {
-        InboxSource::Live { .. } => App::with_store_results(
+    let mut app = match services {
+        Services::Day(_) | Services::GitHubBacklog => App::with_store_results(
             inbox,
             FileReviewStore::from_process_env()
                 .map(|store| Box::new(store) as Box<dyn ReviewStore>),
             FileDraftStore::from_process_env().map(|store| Box::new(store) as Box<dyn DraftStore>),
         ),
-        InboxSource::Demo => App::new(inbox),
+        Services::DemoBacklog => App::with_stores(
+            inbox,
+            Box::new(DemoFixture::review_store()),
+            Box::new(MemoryDraftStore::default()),
+        ),
+        Services::StaticDemo => App::new(inbox),
     };
     with_terminal_session(CrosstermOps, |terminal_session| {
         let backend = CrosstermBackend::new(io::stdout());
@@ -102,25 +131,75 @@ fn run_inbox(inbox: Inbox) -> io::Result<()> {
             &mut editor_temp_files,
             &editor_lookup,
         );
-        if let Some(selection) = selection {
-            let mut loader = LoaderSession::start(selection);
-            let mut details = DetailSession::new();
-            let mut comments = CommentSession::new();
-            let result = event::run_with_services_and_editor(
-                &mut terminal,
-                &mut app,
-                &mut events,
-                &mut loader,
-                &mut details,
-                &mut comments,
-                &mut editor,
-            );
-            loader.shutdown();
-            details.shutdown();
-            event::CommentRequester::shutdown(&mut comments);
-            result
-        } else {
-            event::run_with_editor(&mut terminal, &mut app, &mut events, &mut editor)
+        match services {
+            Services::Day(selection) => {
+                let mut loader = LoaderSession::start(selection);
+                run_live(
+                    &mut terminal,
+                    &mut app,
+                    &mut events,
+                    &mut loader,
+                    &mut editor,
+                )
+            }
+            Services::GitHubBacklog => {
+                let mut loader = BacklogSession::start(GitHubLoader::new(CommandRunner));
+                run_live(
+                    &mut terminal,
+                    &mut app,
+                    &mut events,
+                    &mut loader,
+                    &mut editor,
+                )
+            }
+            Services::DemoBacklog => {
+                let mut loader = BacklogSession::start(DemoHistoryPager::interactive());
+                let mut details = NoDetails;
+                let mut comments = FakeComments::default();
+                let result = event::run_with_services_and_editor(
+                    &mut terminal,
+                    &mut app,
+                    &mut events,
+                    &mut loader,
+                    &mut details,
+                    &mut comments,
+                    &mut editor,
+                );
+                loader.shutdown();
+                result
+            }
+            Services::StaticDemo => {
+                event::run_with_editor(&mut terminal, &mut app, &mut events, &mut editor)
+            }
         }
     })
+}
+
+/// Run a GitHub-backed session with real detail and comment services, then
+/// cancel and join every worker.
+fn run_live<B: ratatui::backend::Backend, L: LoaderEventSource>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    events: &mut CrosstermEventSource,
+    loader: &mut L,
+    editor: &mut ExternalEditorSession<'_>,
+) -> io::Result<()>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    let mut details = DetailSession::new();
+    let mut comments = CommentSession::new();
+    let result = event::run_with_services_and_editor(
+        terminal,
+        app,
+        events,
+        loader,
+        &mut details,
+        &mut comments,
+        editor,
+    );
+    loader.cancel();
+    details.shutdown();
+    event::CommentRequester::shutdown(&mut comments);
+    result
 }

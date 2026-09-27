@@ -6,17 +6,20 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 
 use crate::app::{
-    App, CommentListState, HELP_BINDINGS, LivePhase, MIN_FULL_HEIGHT, MIN_FULL_WIDTH, Mode, Pane,
+    App, BacklogView, CommentListState, DiscoveryState, HELP_BINDINGS, HistoryLoadKind, LivePhase,
+    MIN_FULL_HEIGHT, MIN_FULL_WIDTH, Mode, Pane,
 };
 use crate::comment_draft::CommentAnchor;
 use crate::day::TimezoneSource;
 use crate::github::{
     CommentFailureKind, DetailFailure, DetailState, ExistingCommentAnchor, FailureCategory,
-    RESPONSE_TRUNCATED_LABEL,
+    HistoryCoverage, RESPONSE_TRUNCATED_LABEL, failure_category_label,
 };
-use crate::inbox::{DiffLineKind, InboxSource, PatchContent};
+use crate::inbox::{DiffLineKind, InboxSource, PatchContent, Repository};
 use crate::ui_layout::{ReviewPaneLayout, wrap_text};
 use unicode_width::UnicodeWidthChar;
+
+const MAX_SUMMARY_FAILURES: usize = 3;
 
 pub(crate) const NO_PATCH_LABEL: &str =
     "No GitHub text patch (binary, rename/mode-only, or empty file)";
@@ -45,13 +48,9 @@ fn draw_review_panes(frame: &mut Frame<'_>, layout: ReviewPaneLayout, app: &App)
         app,
         app.visible_repositories()
             .iter()
-            .map(|repository| sanitize_display_text(&repository.display_name()))
+            .map(|repository| repository_label(app, repository))
             .collect(),
-        if app.all_reviewed_empty() {
-            "ALL REVIEWED — press f to show all commits"
-        } else {
-            "repositories"
-        },
+        repository_empty_text(app),
     );
     draw_list_pane(
         frame,
@@ -84,7 +83,7 @@ fn draw_review_panes(frame: &mut Frame<'_>, layout: ReviewPaneLayout, app: &App)
                 )
             })
             .collect(),
-        "commits",
+        commit_empty_text(app),
     );
     draw_list_pane(
         frame,
@@ -95,9 +94,303 @@ fn draw_review_panes(frame: &mut Frame<'_>, layout: ReviewPaneLayout, app: &App)
             .iter()
             .map(|file| sanitize_display_text(&file.path))
             .collect(),
-        "files",
+        "  (no files)".to_owned(),
     );
     draw_diff_pane(frame, layout.diff, app);
+}
+
+fn repository_label(app: &App, repository: &Repository) -> String {
+    let name = sanitize_display_text(&repository.display_name());
+    let Some(state) = app.backlog_state() else {
+        return name;
+    };
+    let count = match app.backlog_view() {
+        Some(BacklogView::Reviewed) => {
+            repository.commits.len() - app.repository_pending(repository)
+        }
+        _ => app.repository_pending(repository),
+    };
+    let id = repository.identity.id;
+    let loaded = state
+        .repository(id)
+        .is_some_and(|repository| repository.loaded);
+    let coverage = match state.coverage(id) {
+        HistoryCoverage::Complete => "",
+        HistoryCoverage::MoreAvailable
+            if !loaded
+                && state
+                    .active()
+                    .is_some_and(|active| active.kind == HistoryLoadKind::Initial) =>
+        {
+            " loading"
+        }
+        HistoryCoverage::MoreAvailable => " +older",
+        HistoryCoverage::Incomplete => " !incomplete",
+    };
+    format!("{name} ({count}){coverage}")
+}
+
+fn repository_empty_text(app: &App) -> String {
+    match app.backlog_view() {
+        None if app.all_reviewed_empty() => {
+            "  (no ALL REVIEWED — press f to show all commits)".to_owned()
+        }
+        None => "  (no repositories)".to_owned(),
+        Some(BacklogView::Reviewed) => {
+            "  (no reviewed commits loaded — f returns to the backlog)".to_owned()
+        }
+        Some(BacklogView::Pending) => format!(
+            "  ({})",
+            backlog_headline(app).map_or_else(|| "no repositories".to_owned(), |(text, _)| text)
+        ),
+    }
+}
+
+fn commit_empty_text(app: &App) -> String {
+    let (Some(view), Some(state), Some(repository)) = (
+        app.backlog_view(),
+        app.backlog_state(),
+        app.current_repository(),
+    ) else {
+        return "  (no commits)".to_owned();
+    };
+    match (view, state.coverage(repository.identity.id)) {
+        (BacklogView::Reviewed, _) => "  (no reviewed commits loaded)".to_owned(),
+        (BacklogView::Pending, HistoryCoverage::Complete) => "  (no pending commits)".to_owned(),
+        (BacklogView::Pending, HistoryCoverage::MoreAvailable) => {
+            "  (no pending commits in loaded history — older history not loaded; o/O)".to_owned()
+        }
+        (BacklogView::Pending, HistoryCoverage::Incomplete) => {
+            "  (no pending commits in loaded history — history incomplete; o/O retries)".to_owned()
+        }
+    }
+}
+
+/// One-line backlog completeness state. An incomplete or partially loaded
+/// history is never described as clear.
+pub(crate) fn backlog_headline(app: &App) -> Option<(String, Color)> {
+    let state = app.backlog_state()?;
+    if let Some(active) = state.active() {
+        let text = if active.cancelling {
+            "Cancelling history loading; loaded commits are kept".to_owned()
+        } else {
+            match (active.kind, &state.discovery) {
+                (
+                    HistoryLoadKind::Initial,
+                    DiscoveryState::Discovering {
+                        page,
+                        owned_repositories,
+                    },
+                ) => format!(
+                    "Loading backlog: discovering repositories (page {}, {owned_repositories} owned) — x cancels",
+                    (*page).max(1)
+                ),
+                (HistoryLoadKind::Initial, _) => format!(
+                    "Loading backlog: {}/{} repositories, {} pages — x cancels",
+                    state.repositories_loaded(),
+                    app.inbox().repositories.len(),
+                    active.pages_fetched
+                ),
+                (HistoryLoadKind::Older, _) => format!(
+                    "Loading older history: {} pages, {} commits loaded — x cancels",
+                    active.pages_fetched, active.commits_loaded
+                ),
+                (HistoryLoadKind::All, _) => format!(
+                    "Loading all history: {} pages, {} commits loaded — x cancels",
+                    active.pages_fetched, active.commits_loaded
+                ),
+            }
+        };
+        return Some((text, Color::Cyan));
+    }
+    match &state.discovery {
+        DiscoveryState::Failed(failure) => {
+            return Some((
+                format!("LOAD FAILED — {}", failure_category_label(failure.category)),
+                Color::Red,
+            ));
+        }
+        DiscoveryState::Cancelled => {
+            return Some((
+                "Cancelled — repository discovery incomplete; relaunch to load the backlog"
+                    .to_owned(),
+                Color::Yellow,
+            ));
+        }
+        DiscoveryState::Discovering { .. } => {
+            return Some((
+                "Backlog loading stopped before discovery finished".to_owned(),
+                Color::Yellow,
+            ));
+        }
+        DiscoveryState::Complete => {}
+    }
+    if let Some(loaded) = state.cancelled() {
+        return Some((
+            format!("Cancelled — {loaded} commits loaded, history incomplete"),
+            Color::Yellow,
+        ));
+    }
+    if app.inbox().repositories.is_empty() {
+        return Some((
+            "NO OWNED REPOSITORIES — nothing available to review".to_owned(),
+            Color::Green,
+        ));
+    }
+    let (pending, _) = app.backlog_counts();
+    Some(match state.aggregate_coverage() {
+        _ if app.backlog_clear() => (
+            "Backlog clear — all history loaded and reviewed".to_owned(),
+            Color::Green,
+        ),
+        HistoryCoverage::Complete => (
+            format!("{pending} pending — all history loaded"),
+            Color::Green,
+        ),
+        HistoryCoverage::MoreAvailable if pending == 0 => (
+            "No pending commits in loaded history — older history not loaded (o/O)".to_owned(),
+            Color::Yellow,
+        ),
+        HistoryCoverage::MoreAvailable => (
+            format!("{pending} pending in loaded history — older history not loaded (o/O)"),
+            Color::Cyan,
+        ),
+        HistoryCoverage::Incomplete => (
+            format!(
+                "History incomplete: {} — {pending} pending in loaded history",
+                state
+                    .failures()
+                    .first()
+                    .map_or("unknown failure", |failure| failure_category_label(
+                        failure.category
+                    ))
+            ),
+            Color::Yellow,
+        ),
+    })
+}
+
+fn coverage_text(app: &App, repository_id: u64) -> String {
+    let Some(state) = app.backlog_state() else {
+        return String::new();
+    };
+    match state.coverage(repository_id) {
+        HistoryCoverage::Complete => "history complete".to_owned(),
+        HistoryCoverage::MoreAvailable => "older history not loaded (o/O)".to_owned(),
+        HistoryCoverage::Incomplete => format!(
+            "history incomplete: {}",
+            state
+                .repository(repository_id)
+                .and_then(|repository| repository.failures.first())
+                .map_or("unknown failure", |failure| failure_category_label(
+                    failure.category
+                ))
+        ),
+    }
+}
+
+fn draw_backlog_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(state) = app.backlog_state() else {
+        return;
+    };
+    let demo = app.inbox().child_panes_available();
+    let (headline, color) = backlog_headline(app).unwrap_or_default();
+    let (pending, reviewed) = app.backlog_counts();
+    let mut lines = vec![
+        Line::styled(
+            if demo {
+                "Fictional offline backlog: unreviewed commits, no date limit"
+            } else {
+                "Backlog: your unreviewed commits, no date limit"
+            },
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(headline, Style::default().fg(color)),
+        Line::styled(
+            if state.active().is_some() {
+                "Loaded commits stay browsable; x cancels loading"
+            } else {
+                "o loads older history of the selected repository • O loads all"
+            },
+            Style::default().fg(Color::Cyan),
+        ),
+        Line::raw(format!(
+            "Repositories: {} discovered • {} complete • {} with older history not loaded • {} incomplete",
+            app.inbox().repositories.len(),
+            state.count_coverage(HistoryCoverage::Complete),
+            app.inbox().repositories.len().saturating_sub(
+                state.count_coverage(HistoryCoverage::Complete)
+                    + state.count_coverage(HistoryCoverage::Incomplete)
+            ),
+            state.count_coverage(HistoryCoverage::Incomplete),
+        )),
+        Line::raw(format!(
+            "Loaded commits: {} • pending {pending} • reviewed {reviewed}",
+            app.loaded_commit_count()
+        )),
+    ];
+    if let Some(repository) = app.current_repository() {
+        let pages = state
+            .repository(repository.identity.id)
+            .map_or(0, |repository| repository.pages_loaded);
+        lines.push(Line::raw(format!(
+            "Selected: {} — {}, {pages} pages loaded",
+            sanitize_display_text(&repository.display_name()),
+            coverage_text(app, repository.identity.id)
+        )));
+    }
+    lines.push(Line::raw(match app.backlog_view() {
+        Some(BacklogView::Reviewed) => {
+            "View: reviewed commits — m unmarks, f returns to the backlog"
+        }
+        _ => "View: backlog of unreviewed commits — f shows reviewed commits",
+    }));
+    if !demo {
+        lines.push(Line::raw(
+            "Load all can take many GitHub requests and may reach rate limits",
+        ));
+    }
+    if let Some(warning) = app.review_warning() {
+        lines.push(Line::styled(
+            format!("Review progress warning: {warning}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if let Some(warning) = app.draft_warning() {
+        lines.push(Line::styled(
+            format!("Comment draft warning: {warning}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    let failures = state.failures();
+    if !failures.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "Bounded error summary:",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        lines.extend(failures.iter().take(MAX_SUMMARY_FAILURES).map(|failure| {
+            Line::styled(
+                format!("• {failure}"),
+                Style::default().fg(failure_color(failure.category)),
+            )
+        }));
+        if failures.len() > MAX_SUMMARY_FAILURES {
+            lines.push(Line::raw(format!(
+                "• {} additional errors omitted",
+                failures.len() - MAX_SUMMARY_FAILURES
+            )));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                pane_block(Pane::Diff, app.focus() == Pane::Diff, app)
+                    .title(" Diff — backlog summary "),
+            )
+            .wrap(Wrap { trim: true }),
+        area,
+    );
 }
 
 fn draw_live_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -186,7 +479,7 @@ fn draw_live_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let progress = &state.progress;
     let mut lines = vec![
         Line::styled(
-            format!("Selected day: {}", selection.date),
+            format!("Selected day: {} (single-day view)", selection.date),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Line::raw(format!("Timezone: {}{fallback}", selection.timezone_name)),
@@ -253,7 +546,7 @@ fn draw_live_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(lines)
             .block(
                 pane_block(Pane::Diff, app.focus() == Pane::Diff, app)
-                    .title(" Diff — GitHub daily inbox "),
+                    .title(" Diff — single-day view "),
             )
             .wrap(Wrap { trim: true }),
         area,
@@ -273,22 +566,6 @@ fn failure_color(category: FailureCategory) -> Color {
     match category {
         FailureCategory::RateLimit | FailureCategory::PermissionOrNotFound => Color::Yellow,
         _ => Color::Red,
-    }
-}
-
-fn failure_category_label(category: FailureCategory) -> &'static str {
-    match category {
-        FailureCategory::Authentication => "authentication failed",
-        FailureCategory::MissingGh => "GitHub CLI not found",
-        FailureCategory::PermissionOrNotFound => "permission denied or resource unavailable",
-        FailureCategory::RateLimit => "GitHub API rate limit reached",
-        FailureCategory::MalformedResponse => "unreadable GitHub response",
-        FailureCategory::MalformedJson => "malformed GitHub JSON",
-        FailureCategory::Offline => "offline",
-        FailureCategory::Transport => "GitHub transport failure",
-        FailureCategory::Command => "GitHub CLI request failure",
-        FailureCategory::Api => "GitHub API failure",
-        FailureCategory::Cancelled => "loading cancelled",
     }
 }
 
@@ -354,13 +631,13 @@ fn draw_list_pane(
     pane: Pane,
     app: &App,
     items: Vec<String>,
-    empty_label: &str,
+    empty_text: String,
 ) {
     let selected = app.selected(pane);
     let scroll = app.scroll(pane);
     let lines = if items.is_empty() {
         vec![Line::styled(
-            format!("  (no {empty_label})"),
+            empty_text,
             Style::default().fg(Color::DarkGray),
         )]
     } else {
@@ -410,6 +687,13 @@ fn draw_diff_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
         draw_live_summary(frame, area, app);
         return;
     }
+    if app.inbox().is_backlog()
+        && (app.current_commit().is_none()
+            || (app.inbox().loads_remote_details() && app.current_detail_state().is_none()))
+    {
+        draw_backlog_summary(frame, area, app);
+        return;
+    }
 
     let lines = if matches!(app.current_detail_state(), Some(DetailState::Loading)) {
         diff_message(
@@ -428,7 +712,7 @@ fn draw_diff_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
         };
         let message = format!("{label} — {}", detail_failure_action(failure));
         diff_message(app, area, &message, Style::default().fg(Color::Red))
-    } else if matches!(app.inbox().source, InboxSource::Demo)
+    } else if app.inbox().child_panes_available()
         && matches!(
             app.current_commit().map(|commit| &commit.files),
             Some(crate::inbox::ChildPane::ResponseTruncated)
@@ -439,7 +723,7 @@ fn draw_diff_pane(frame: &mut Frame<'_>, area: Rect, app: &App) {
             detail_failure_action(&DetailFailure::ResponseTruncated)
         );
         diff_message(app, area, &message, Style::default().fg(Color::Red))
-    } else if matches!(app.inbox().source, InboxSource::Demo)
+    } else if app.inbox().child_panes_available()
         && matches!(
             app.current_commit().map(|commit| &commit.files),
             Some(crate::inbox::ChildPane::Unavailable)
@@ -641,11 +925,7 @@ fn pane_block<'a>(pane: Pane, focused: bool, app: &App) -> Block<'a> {
     };
     let (position, length) = app.position(pane);
     let (reviewed, total) = app.review_progress();
-    let filter = if app.remaining_only() {
-        "remaining"
-    } else {
-        "all"
-    };
+    let filter = app.view_label();
     let title = if pane == Pane::Diff {
         format!(
             " {} • {} • {filter} {reviewed}/{total} reviewed • {position}/{length} ",
@@ -699,6 +979,16 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(Color::Yellow),
         ));
     }
+    if app
+        .backlog_state()
+        .is_some_and(|state| state.active().is_some())
+        && let Some((headline, color)) = backlog_headline(app)
+    {
+        spans.push(Span::styled(
+            format!(" • {headline}"),
+            Style::default().fg(color),
+        ));
+    }
     spans.push(Span::raw(" • ? help • q quit"));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -725,12 +1015,15 @@ fn draw_compact(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .map(|warning| format!("\nCOMMENT DRAFT WARNING: {warning}"))
         .unwrap_or_default();
     let (reviewed, total) = app.review_progress();
+    let backlog = backlog_headline(app)
+        .map(|(headline, _)| format!("\n{headline}"))
+        .unwrap_or_default();
     let message = Paragraph::new(format!(
-        "terminal too small\nneed 60×16 (now {}×{})\n{mode} • {} • {} {reviewed}/{total} reviewed\n{}\n? help • Ctrl-c quit{review_warning}{draft_warning}",
+        "terminal too small\nneed 60×16 (now {}×{})\n{mode} • {} • {} {reviewed}/{total} reviewed\n{}{backlog}\n? help • Ctrl-c quit{review_warning}{draft_warning}",
         area.width,
         area.height,
         app.focus().title(),
-        if app.remaining_only() { "remaining" } else { "all" },
+        app.view_label(),
         app.status(),
     ))
     .block(block)
@@ -2267,5 +2560,197 @@ mod tests {
             assert!(output.contains(label), "missing failure label {label:?}");
             assert!(output.contains(action), "missing failure action {action:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod backlog_render_tests {
+    use chrono::{TimeZone, Utc};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use super::*;
+    use crate::app::Input;
+    use crate::comment_draft::MemoryDraftStore;
+    use crate::github::{FailureScope, LoadFailure};
+    use crate::inbox::{BacklogOrigin, ChildPane, Commit, GitHubAuthor, Inbox, RepositoryIdentity};
+    use crate::loader::{BacklogEvent, HistoryOutcome, INITIAL_GENERATION};
+    use crate::review_state::{MemoryReviewStore, ReviewKey, ReviewStore};
+
+    fn sha(value: u32) -> String {
+        format!("{value:040x}")
+    }
+
+    fn repository(id: u64, values: &[u32]) -> Repository {
+        Repository {
+            identity: RepositoryIdentity {
+                id,
+                owner: "octo".to_owned(),
+                name: format!("fictional-{id}"),
+            },
+            commits: values
+                .iter()
+                .map(|value| Commit {
+                    sha: sha(*value),
+                    subject: format!("Fictional change {value}"),
+                    author: GitHubAuthor {
+                        login: "octo".to_owned(),
+                    },
+                    authored_at: Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap(),
+                    files: ChildPane::Unavailable,
+                })
+                .collect(),
+        }
+    }
+
+    /// Backlog with every loaded commit reviewed and the given coverage.
+    fn reviewed_backlog(coverage: HistoryCoverage, failures: Vec<LoadFailure>) -> App {
+        let store = MemoryReviewStore::default();
+        store
+            .set_reviewed_many(&[ReviewKey::new(7, sha(1)).unwrap()], true)
+            .unwrap();
+        let mut app = App::with_stores(
+            Inbox::backlog(BacklogOrigin::GitHub),
+            Box::new(store),
+            Box::new(MemoryDraftStore::default()),
+        );
+        let repository = repository(7, &[1]);
+        app.apply_backlog_event(BacklogEvent::Discovered {
+            generation: INITIAL_GENERATION,
+            repositories: vec![repository.identity.clone()],
+        });
+        app.apply_backlog_event(BacklogEvent::Snapshot {
+            generation: INITIAL_GENERATION,
+            repository,
+            coverage,
+            failures,
+            pages_loaded: 1,
+        });
+        app.apply_backlog_event(BacklogEvent::Finished {
+            generation: INITIAL_GENERATION,
+            repository_id: None,
+            outcome: HistoryOutcome::Finished,
+        });
+        app
+    }
+
+    fn text(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        app.resize(width, height);
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .chars()
+            .filter(|character| {
+                !character.is_whitespace() && !('\u{2500}'..='\u{257f}').contains(character)
+            })
+            .collect()
+    }
+
+    fn compact(value: &str) -> String {
+        value.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    #[test]
+    fn backlog_clear_requires_complete_history() {
+        let mut clear = reviewed_backlog(HistoryCoverage::Complete, Vec::new());
+        assert!(text(&mut clear, 120, 32).contains(&compact("Backlog clear")));
+
+        let mut partial = reviewed_backlog(HistoryCoverage::MoreAvailable, Vec::new());
+        let output = text(&mut partial, 120, 32);
+        assert!(!output.contains(&compact("Backlog clear")));
+        assert!(output.contains(&compact(
+            "No pending commits in loaded history — older history not loaded (o/O)"
+        )));
+        assert!(output.contains(&compact("fictional-7 (0) +older")));
+    }
+
+    #[test]
+    fn incomplete_history_shows_a_sanitized_reason() {
+        let mut app = reviewed_backlog(
+            HistoryCoverage::Incomplete,
+            vec![LoadFailure {
+                category: FailureCategory::RateLimit,
+                scope: FailureScope::Branch {
+                    repository_index: 0,
+                    branch_index: 1,
+                },
+                http_status: Some(403),
+            }],
+        );
+        let output = text(&mut app, 120, 32);
+        assert!(output.contains(&compact(
+            "History incomplete: GitHub API rate limit reached"
+        )));
+        assert!(output.contains(&compact("!incomplete")));
+        assert!(!output.contains(&compact("Backlog clear")));
+    }
+
+    #[test]
+    fn loading_progress_and_cancellation_are_visible() {
+        let mut app = reviewed_backlog(HistoryCoverage::MoreAvailable, Vec::new());
+        app.handle_input(Input::Character('O'));
+        let effects = app.take_backlog_effects();
+        let crate::loader::BacklogEffect::Load { generation, .. } = effects[0] else {
+            panic!("expected a load request");
+        };
+        app.apply_backlog_event(BacklogEvent::Progress {
+            generation,
+            repository_id: 7,
+            pages_fetched: 3,
+            commits_loaded: 250,
+        });
+        let output = text(&mut app, 120, 32);
+        assert!(output.contains(&compact("Loading all history: 3 pages, 250 commits loaded")));
+        assert!(output.contains(&compact("x cancels")));
+
+        app.handle_input(Input::Character('x'));
+        app.apply_backlog_event(BacklogEvent::Finished {
+            generation,
+            repository_id: Some(7),
+            outcome: HistoryOutcome::Cancelled,
+        });
+        let output = text(&mut app, 120, 32);
+        assert!(output.contains(&compact("Cancelled — 1 commits loaded, history incomplete")));
+
+        // The summary keeps reporting the cancellation after the status line
+        // moves on, until another load starts.
+        app.handle_input(Input::Character('j'));
+        assert!(!app.status().contains("Cancelled"));
+        let output = text(&mut app, 120, 32);
+        assert!(output.contains(&compact("Cancelled — 1 commits loaded, history incomplete")));
+        app.handle_input(Input::Character('o'));
+        assert_eq!(app.backlog_state().unwrap().cancelled(), None);
+    }
+
+    #[test]
+    fn backlog_states_render_without_panicking_in_compact_layouts() {
+        for (width, height) in [(60, 16), (59, 15), (40, 8), (20, 5)] {
+            let mut app = reviewed_backlog(HistoryCoverage::MoreAvailable, Vec::new());
+            let output = text(&mut app, width, height);
+            if width >= 60 {
+                assert!(output.contains("(o/O)"));
+            } else if width >= 40 {
+                assert!(output.contains(&compact("terminal too small")));
+                assert!(output.contains(&compact("backlog")));
+            }
+            let mut loading = App::new(Inbox::backlog(BacklogOrigin::GitHub));
+            text(&mut loading, width, height);
+        }
+    }
+
+    #[test]
+    fn reviewed_view_empty_state_explains_how_to_return() {
+        let mut app = reviewed_backlog(HistoryCoverage::Complete, Vec::new());
+        app.handle_input(Input::Character('m'));
+        app.handle_input(Input::Character('f'));
+        let output = text(&mut app, 120, 32);
+        assert!(output.contains(&compact("reviewed")));
+        assert!(output.contains(&compact("Fictional change 1")));
     }
 }

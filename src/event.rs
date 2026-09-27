@@ -16,6 +16,7 @@ use crate::external_editor::{
 };
 use crate::github::LoadEvent;
 use crate::github::{ExistingComment, ExistingCommentAnchor, ExistingComments, PublishOutcome};
+use crate::loader::{BacklogEffect, BacklogEvent};
 use crate::render;
 use crate::terminal::TerminalSuspend;
 
@@ -64,6 +65,17 @@ pub trait EventSource {
 pub trait LoaderEventSource {
     fn try_next(&mut self) -> Option<LoadEvent>;
     fn cancel(&mut self) {}
+
+    /// Next undated backlog event, for sources that page history.
+    fn try_next_backlog(&mut self) -> Option<BacklogEvent> {
+        None
+    }
+
+    /// Forward a Load older / Load all / cancel request. Returns whether the
+    /// source accepted it.
+    fn request_history(&mut self, _effect: BacklogEffect) -> bool {
+        false
+    }
 }
 
 pub struct NoLoaderEvents;
@@ -399,6 +411,7 @@ where
 
         apply_detail_effects(app, details);
         apply_comment_effects(app, comments);
+        apply_backlog_effects(app, loader);
 
         if app.should_quit() {
             break;
@@ -409,6 +422,12 @@ where
                 break;
             };
             app.apply_load_event(event);
+        }
+        for _ in 0..MAX_LOADER_EVENTS_PER_TICK {
+            let Some(event) = loader.try_next_backlog() else {
+                break;
+            };
+            app.apply_backlog_event(event);
         }
         apply_detail_effects(app, details);
 
@@ -430,6 +449,14 @@ where
     }
 
     Ok(())
+}
+
+fn apply_backlog_effects<L: LoaderEventSource>(app: &mut App, loader: &mut L) {
+    for effect in app.take_backlog_effects() {
+        if !loader.request_history(effect.clone()) {
+            app.reject_backlog_effect(effect);
+        }
+    }
 }
 
 fn apply_comment_effects<C: CommentRequester>(app: &mut App, comments: &mut C) {
@@ -1948,5 +1975,149 @@ mod tests {
             app.current_comments(),
             Some(crate::app::CommentListState::Loaded(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod backlog_loop_tests {
+    use std::collections::VecDeque;
+
+    use chrono::{TimeZone, Utc};
+    use ratatui::backend::TestBackend;
+
+    use super::*;
+    use crate::github::HistoryCoverage;
+    use crate::inbox::{
+        BacklogOrigin, ChildPane, Commit, GitHubAuthor, Inbox, Repository, RepositoryIdentity,
+    };
+    use crate::loader::{HistoryOutcome, HistoryRequest, INITIAL_GENERATION};
+
+    struct Script(VecDeque<Option<AppEvent>>);
+
+    impl EventSource for Script {
+        fn poll(&mut self, _timeout: Duration) -> io::Result<Option<AppEvent>> {
+            self.0
+                .pop_front()
+                .ok_or_else(|| io::Error::other("script exhausted"))
+        }
+    }
+
+    /// Synchronous history source: answers each load with one older page.
+    #[derive(Default)]
+    struct FakeHistory {
+        events: VecDeque<BacklogEvent>,
+        requests: Vec<BacklogEffect>,
+        cancelled: bool,
+    }
+
+    fn repository(values: &[u32]) -> Repository {
+        Repository {
+            identity: RepositoryIdentity {
+                id: 7,
+                owner: "octo".to_owned(),
+                name: "fictional".to_owned(),
+            },
+            commits: values
+                .iter()
+                .map(|value| Commit {
+                    sha: format!("{value:040x}"),
+                    subject: format!("Fictional change {value}"),
+                    author: GitHubAuthor {
+                        login: "octo".to_owned(),
+                    },
+                    authored_at: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()
+                        - chrono::TimeDelta::days(i64::from(*value) * 400),
+                    files: ChildPane::Unavailable,
+                })
+                .collect(),
+        }
+    }
+
+    impl LoaderEventSource for FakeHistory {
+        fn try_next(&mut self) -> Option<LoadEvent> {
+            None
+        }
+
+        fn try_next_backlog(&mut self) -> Option<BacklogEvent> {
+            self.events.pop_front()
+        }
+
+        fn request_history(&mut self, effect: BacklogEffect) -> bool {
+            if let BacklogEffect::Load { generation, .. } = effect {
+                self.events.push_back(BacklogEvent::Snapshot {
+                    generation,
+                    repository: repository(&[1, 2]),
+                    coverage: HistoryCoverage::Complete,
+                    failures: Vec::new(),
+                    pages_loaded: 2,
+                });
+                self.events.push_back(BacklogEvent::Finished {
+                    generation,
+                    repository_id: Some(7),
+                    outcome: HistoryOutcome::Finished,
+                });
+            }
+            self.requests.push(effect);
+            true
+        }
+
+        fn cancel(&mut self) {
+            self.cancelled = true;
+        }
+    }
+
+    #[test]
+    fn event_loop_forwards_history_requests_and_applies_results() {
+        let mut history = FakeHistory::default();
+        history.events.extend([
+            BacklogEvent::Discovered {
+                generation: INITIAL_GENERATION,
+                repositories: vec![repository(&[]).identity],
+            },
+            BacklogEvent::Snapshot {
+                generation: INITIAL_GENERATION,
+                repository: repository(&[1]),
+                coverage: HistoryCoverage::MoreAvailable,
+                failures: Vec::new(),
+                pages_loaded: 1,
+            },
+            BacklogEvent::Finished {
+                generation: INITIAL_GENERATION,
+                repository_id: None,
+                outcome: HistoryOutcome::Finished,
+            },
+        ]);
+        let mut app = App::new(Inbox::backlog(BacklogOrigin::GitHub));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut events = Script(VecDeque::from([
+            None,
+            Some(AppEvent::Input(Input::Character('o'))),
+            None,
+            Some(AppEvent::Input(Input::Character('q'))),
+        ]));
+        let mut details = NoDetails;
+        run_with_loader(
+            &mut terminal,
+            &mut app,
+            &mut events,
+            &mut history,
+            &mut details,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            history.requests.as_slice(),
+            [BacklogEffect::Load {
+                repository_id: 7,
+                request: HistoryRequest::Older,
+                ..
+            }]
+        ));
+        assert!(history.cancelled);
+        assert_eq!(app.loaded_commit_count(), 2);
+        assert_eq!(
+            app.backlog_state().unwrap().coverage(7),
+            HistoryCoverage::Complete
+        );
     }
 }

@@ -8,10 +8,13 @@ use crate::day::{
     detected_timezone, parse_date, parse_timezone, select_day,
 };
 
-pub const USAGE: &str = "ReviewBox daily GitHub inbox\n\nUsage:\n  reviewbox [--date YYYY-MM-DD] [--timezone IANA_NAME]\n  reviewbox --demo\n  reviewbox --demo-smoke\n  reviewbox --help\n\nOptions:\n  --date DATE        Select an ISO calendar date for the live inbox\n  --timezone ZONE     Select an IANA timezone for the live inbox\n  --demo              Run the fictional, offline terminal demo\n  --demo-smoke        Verify the demo noninteractively with an in-memory terminal\n  -h, --help          Show this help\n\nWithout a mode, ReviewBox starts the live inbox for today in the detected local timezone. If local timezone detection is unavailable, it uses Etc/UTC.\n";
+pub const USAGE: &str = "ReviewBox GitHub review inbox\n\nUsage:\n  reviewbox\n  reviewbox [--date YYYY-MM-DD] [--timezone IANA_NAME]\n  reviewbox --demo\n  reviewbox --demo-smoke\n  reviewbox --help\n\nOptions:\n  --date DATE        Show a single-day view of an ISO calendar date\n  --timezone ZONE     Show a single-day view in an IANA timezone\n  --demo              Run the fictional, offline terminal demo\n  --demo-smoke        Verify the demo noninteractively with an in-memory terminal\n  -h, --help          Show this help\n\nWithout options, ReviewBox starts the backlog: your unreviewed commits in owned repositories, with no date limit. Commits stay pending until marked reviewed; o and O load older history. With --date and/or --timezone it shows only that single day instead; a missing date means today, and a missing timezone uses the detected local timezone or Etc/UTC.\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    /// Default undated backlog of unreviewed commits.
+    Backlog,
+    /// Explicit single-day view.
     Live(DaySelection),
     Demo,
     DemoSmoke,
@@ -127,6 +130,7 @@ pub fn parse_with(
             Ok(Command::Help)
         }
         Some(_) => unreachable!("only user-selectable modes are stored"),
+        None if date.is_none() && timezone.is_none() => Ok(Command::Backlog),
         None => {
             let (detected_timezone, detected_source) = detected_timezone(detector);
             let (timezone, timezone_source) = match timezone {
@@ -173,21 +177,41 @@ mod tests {
     }
 
     #[test]
-    fn default_mode_is_live_today_in_detected_timezone() {
-        let command = parse_at(&[], Detector(Ok("Europe/Warsaw".to_owned()))).unwrap();
+    fn default_mode_is_the_undated_backlog() {
+        assert_eq!(
+            parse_at(&[], Detector(Ok("Europe/Warsaw".to_owned()))),
+            Ok(Command::Backlog)
+        );
+        assert_eq!(
+            parse_at(&[], Detector(Err("unavailable".to_owned()))),
+            Ok(Command::Backlog)
+        );
+    }
+
+    #[test]
+    fn explicit_timezone_alone_selects_today_in_that_timezone() {
+        let command = parse_at(
+            &["--timezone", "Europe/Warsaw"],
+            Detector(Err("unused".to_owned())),
+        )
+        .unwrap();
         let Command::Live(selection) = command else {
-            panic!("expected live mode")
+            panic!("expected the single-day view")
         };
         assert_eq!(selection.date.to_string(), "2024-01-16");
         assert_eq!(selection.timezone_name, "Europe/Warsaw");
-        assert_eq!(selection.timezone_source, TimezoneSource::Detected);
+        assert_eq!(selection.timezone_source, TimezoneSource::Explicit);
     }
 
     #[test]
     fn fallback_timezone_is_deterministic_when_detection_fails() {
-        let command = parse_at(&[], Detector(Err("unavailable".to_owned()))).unwrap();
+        let command = parse_at(
+            &["--date", "2024-01-15"],
+            Detector(Err("unavailable".to_owned())),
+        )
+        .unwrap();
         let Command::Live(selection) = command else {
-            panic!("expected live mode")
+            panic!("expected the single-day view")
         };
         assert_eq!(selection.date.to_string(), "2024-01-15");
         assert_eq!(selection.timezone_name, "Etc/UTC");

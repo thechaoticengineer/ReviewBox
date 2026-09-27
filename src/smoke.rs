@@ -4,6 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use chrono::{TimeZone, Utc};
 use ratatui::Terminal;
@@ -14,13 +15,19 @@ use crate::app::{App, AttemptSource, Input, Mode, Pane};
 use crate::cli::{self, Command};
 use crate::comment_draft::{MemoryDraftStore, SubmissionAttempt};
 use crate::day::LocalTimezoneDetector;
-use crate::event::{self, AppEvent, CommentRequester, EventSource, FakeComments};
+use crate::event::{
+    self, AppEvent, CommentRequester, EventSource, FakeComments, LoaderEventSource,
+};
 use crate::external_editor::{
     EditorCommand, EditorError, EditorOutcome, EditorProcess, EditorTempFiles, edit_draft,
 };
-use crate::fixture::DemoFixture;
+use crate::fixture::{
+    DemoFixture, DemoHistoryPager, VACATION_OLDEST_SUBJECT, VACATION_PENDING_SUBJECT,
+    VACATION_REPOSITORY_ID,
+};
 use crate::github::{CommentFailure, CommentFailureKind, PublishOutcome, RESPONSE_TRUNCATED_LABEL};
-use crate::inbox::Inbox;
+use crate::inbox::{BacklogOrigin, Inbox};
+use crate::loader::BacklogSession;
 use crate::render;
 use crate::render::NO_PATCH_LABEL;
 use crate::review_state::MemoryReviewStore;
@@ -32,6 +39,9 @@ const FIXED_ATTEMPTS: [&str; 2] = [
     "0123456789abcdef0123456789abcdef",
     "fedcba9876543210fedcba9876543210",
 ];
+// Visible prefixes of the fictional vacation commits in the commit pane.
+const PENDING_LABEL: &str = "71de003  Restore fictional tide";
+const OLDEST_LABEL: &str = "71de004  Sketch fictional harbor";
 const EDITOR_REPLACEMENT: &str = "Fictional external-editor replacement.";
 
 #[derive(Debug, Default)]
@@ -679,7 +689,8 @@ pub fn run() -> io::Result<SmokeReport> {
     for binding in [
         "n / N",
         "mark commit reviewed / unreviewed",
-        "show remaining / all commits",
+        "backlog / reviewed (day: remaining / all)",
+        "load older / all history; cancel loading",
     ] {
         ensure_contains(&help, binding, "help frame")?;
     }
@@ -702,9 +713,176 @@ pub fn run() -> io::Result<SmokeReport> {
         "compact resize frame",
     )?;
 
+    exercise_backlog_demo(&mut terminal, &mut frames)?;
     exercise_event_loop_exits()?;
 
     Ok(SmokeReport { frames })
+}
+
+/// Drive the production `--demo` backlog: the fictional pager runs on the
+/// same background worker as GitHub history, entirely in memory.
+fn exercise_backlog_demo(
+    terminal: &mut Terminal<TestBackend>,
+    frames: &mut usize,
+) -> io::Result<()> {
+    let mut app = App::with_stores(
+        Inbox::backlog(BacklogOrigin::Demo),
+        Box::new(DemoFixture::review_store()),
+        Box::new(MemoryDraftStore::default()),
+    );
+    resize(terminal, FULL_WIDTH, FULL_HEIGHT)?;
+    let mut session = BacklogSession::start(DemoHistoryPager::instant());
+    pump_backlog(&mut app, &mut session)?;
+    let initial = render_frame(terminal, &mut app, frames)?;
+    ensure_contains(
+        &initial,
+        "tidepool-archive-demo (0) +older",
+        "fully reviewed first page keeps its repository listed",
+    )?;
+    ensure_not_contains(
+        &initial,
+        "Backlog clear",
+        "partially loaded backlog must not claim to be clear",
+    )?;
+
+    input(&mut app, 'G');
+    ensure(
+        app.current_repository()
+            .is_some_and(|repository| repository.identity.id == VACATION_REPOSITORY_ID)
+            && app.current_commits().is_empty(),
+        "the vacation repository must be selectable with no pending loaded commits",
+    )?;
+    ensure_contains(
+        &render_frame(terminal, &mut app, frames)?,
+        "older history not loaded (o/O)",
+        "empty loaded projection frame",
+    )?;
+
+    input(&mut app, 'o');
+    pump_backlog(&mut app, &mut session)?;
+    let older = render_frame(terminal, &mut app, frames)?;
+    ensure_contains(&older, PENDING_LABEL, "Load older frame")?;
+    ensure_contains(
+        &older,
+        "Loaded older history: 1 new commits",
+        "Load older status",
+    )?;
+    ensure(
+        app.current_repository()
+            .is_some_and(|repository| repository.identity.id == VACATION_REPOSITORY_ID),
+        "loading must keep the selected repository",
+    )?;
+
+    app.handle_input(Input::Enter);
+    let pending = app
+        .current_commit()
+        .filter(|commit| commit.subject == VACATION_PENDING_SUBJECT)
+        .map(|commit| commit.sha.clone())
+        .ok_or_else(|| io::Error::other("smoke invariant failed: old pending commit selectable"))?;
+    app.handle_input(Input::Enter);
+    ensure(
+        app.focus() == Pane::File && !app.is_reviewed(VACATION_REPOSITORY_ID, &pending),
+        "opening an old commit must not mark it reviewed",
+    )?;
+    app.handle_input(Input::Escape);
+    input(&mut app, 'm');
+    ensure(
+        app.is_reviewed(VACATION_REPOSITORY_ID, &pending),
+        "m must mark the old commit reviewed",
+    )?;
+    let reviewed = render_frame(terminal, &mut app, frames)?;
+    ensure_not_contains(&reviewed, PENDING_LABEL, "reviewed commit frame")?;
+    ensure_contains(&reviewed, "left the backlog", "reviewed commit status")?;
+
+    input(&mut app, 'f');
+    ensure(
+        app.current_repository()
+            .is_some_and(|repository| repository.identity.id == VACATION_REPOSITORY_ID)
+            && app
+                .current_commits()
+                .iter()
+                .any(|commit| commit.sha == pending),
+        "the Reviewed view must list the reviewed commit",
+    )?;
+    if app.focus() == Pane::Repository {
+        app.handle_input(Input::Enter);
+    }
+    for _ in 0..app.current_commits().len() {
+        if app
+            .current_commit()
+            .is_some_and(|commit| commit.sha == pending)
+        {
+            break;
+        }
+        input(&mut app, 'j');
+    }
+    ensure_contains(
+        &render_frame(terminal, &mut app, frames)?,
+        PENDING_LABEL,
+        "Reviewed view frame",
+    )?;
+    input(&mut app, 'm');
+    ensure(
+        !app.is_reviewed(VACATION_REPOSITORY_ID, &pending),
+        "m in the Reviewed view must unmark the commit",
+    )?;
+    input(&mut app, 'f');
+    ensure_contains(
+        &render_frame(terminal, &mut app, frames)?,
+        PENDING_LABEL,
+        "unmarked commit returns to the backlog",
+    )?;
+
+    input(&mut app, 'O');
+    pump_backlog(&mut app, &mut session)?;
+    let all = render_frame(terminal, &mut app, frames)?;
+    ensure_contains(&all, OLDEST_LABEL, "Load all frame")?;
+    ensure(
+        app.current_commits()
+            .iter()
+            .any(|commit| commit.subject == VACATION_OLDEST_SUBJECT),
+        "Load all must make the oldest fictional commit selectable",
+    )?;
+    ensure_contains(&all, "history complete", "Load all completeness status")?;
+    ensure_not_contains(
+        &all,
+        "tidepool-archive-demo (2) +older",
+        "complete repository label",
+    )?;
+    input(&mut app, 'x');
+    ensure(
+        app.status() == "No history load is active",
+        "x without an active load must report that nothing is cancelled",
+    )?;
+    session.shutdown();
+    Ok(())
+}
+
+/// Forward backlog requests and apply events until no history load is active.
+fn pump_backlog(app: &mut App, session: &mut BacklogSession) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        for effect in app.take_backlog_effects() {
+            if !session.request_history(effect.clone()) {
+                app.reject_backlog_effect(effect);
+            }
+        }
+        while let Some(event) = session.try_next_backlog() {
+            app.apply_backlog_event(event);
+        }
+        if app
+            .backlog_state()
+            .is_some_and(|state| state.active().is_none())
+        {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            return Err(io::Error::other(
+                "smoke invariant failed: fictional history loading must finish",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn exercise_selected_day_presentation() -> io::Result<usize> {
@@ -722,8 +900,18 @@ fn exercise_selected_day_presentation() -> io::Result<usize> {
             "smoke expected an explicit live day selection",
         ));
     };
-    let fallback = cli::parse_with(
+    let backlog = cli::parse_with(
         std::iter::empty::<OsString>(),
+        &SmokeTimezoneDetector(Err("fictional detector unavailable".to_owned())),
+        now,
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    ensure(
+        backlog == Command::Backlog,
+        "launching without options must select the undated backlog",
+    )?;
+    let fallback = cli::parse_with(
+        ["--date", "2024-03-10"].into_iter().map(OsString::from),
         &SmokeTimezoneDetector(Err("fictional detector unavailable".to_owned())),
         now,
     )
@@ -743,6 +931,11 @@ fn exercise_selected_day_presentation() -> io::Result<usize> {
         Box::new(MemoryDraftStore::default()),
     );
     let explicit_frame = render_frame(&mut terminal, &mut app, &mut frames)?;
+    ensure_contains(
+        &explicit_frame,
+        "(single-day view)",
+        "explicit single-day view label",
+    )?;
     ensure_contains(
         &explicit_frame,
         "Selected day: 2024-03-10",

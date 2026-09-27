@@ -12,12 +12,15 @@ use crate::comment_draft::{
 use crate::external_editor::EditorOutcome;
 use crate::github::{
     CommentFailure, DetailFailure, DetailState, ExistingCommentAnchor, ExistingComments,
-    FailureCategory, LoadEvent, LoadFailure, LoadProgress, LoadStatus, LoadedRepository,
-    PublishOutcome, RepositoryCoverage,
+    FailureCategory, FailureScope, HistoryCoverage, LoadEvent, LoadFailure, LoadProgress,
+    LoadStatus, LoadedRepository, PublishOutcome, RepositoryCoverage, failure_category_label,
 };
 use crate::inbox::{
-    Commit, CommitDetail, DiffLine, DiffLineKind, FileChange, Inbox, InboxSource, PatchCapReason,
-    PatchContent, Repository, RepositoryIdentity,
+    BacklogOrigin, Commit, CommitDetail, DiffLine, DiffLineKind, FileChange, Inbox, InboxSource,
+    PatchCapReason, PatchContent, Repository, RepositoryIdentity,
+};
+use crate::loader::{
+    BacklogEffect, BacklogEvent, HistoryOutcome, HistoryRequest, INITIAL_GENERATION,
 };
 use crate::review_state::{
     MemoryReviewStore, ReviewKey, ReviewMarks, ReviewStateError, ReviewStore,
@@ -131,6 +134,9 @@ pub enum Command {
     Back,
     ToggleReviewed,
     ToggleRemaining,
+    LoadOlder,
+    LoadAll,
+    CancelLoad,
     SearchNext,
     SearchPrevious,
     Unrelated,
@@ -197,7 +203,11 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
     },
     HelpBinding {
         keys: "f",
-        action: "show remaining / all commits",
+        action: "backlog / reviewed (day: remaining / all)",
+    },
+    HelpBinding {
+        keys: "o / O / x",
+        action: "load older / all history; cancel loading",
     },
     HelpBinding {
         keys: "c",
@@ -236,12 +246,8 @@ pub const HELP_BINDINGS: &[HelpBinding] = &[
         action: "apply / cancel",
     },
     HelpBinding {
-        keys: "Help: j/k or arrows",
-        action: "scroll this binding list",
-    },
-    HelpBinding {
-        keys: "Help: Escape",
-        action: "close help; other keys stay isolated",
+        keys: "Help: j/k, arrows / Esc",
+        action: "scroll / close; other keys stay isolated",
     },
     HelpBinding {
         keys: "Edit: printable / Enter",
@@ -506,6 +512,174 @@ impl LiveInboxState {
     }
 }
 
+/// Which loaded backlog commits are shown. Reviewed state comes only from
+/// the review store; the Reviewed view exists to inspect and unmark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BacklogView {
+    Pending,
+    Reviewed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoveryState {
+    Discovering {
+        page: usize,
+        owned_repositories: usize,
+    },
+    Complete,
+    Failed(LoadFailure),
+    Cancelled,
+}
+
+/// Loaded coverage of one repository's undated history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryBacklog {
+    pub coverage: HistoryCoverage,
+    pub failures: Vec<LoadFailure>,
+    pub pages_loaded: usize,
+    pub loaded: bool,
+}
+
+impl Default for RepositoryBacklog {
+    fn default() -> Self {
+        Self {
+            coverage: HistoryCoverage::MoreAvailable,
+            failures: Vec::new(),
+            pages_loaded: 0,
+            loaded: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryLoadKind {
+    Initial,
+    Older,
+    All,
+}
+
+/// The single active history operation, identified by its generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryLoad {
+    pub generation: u64,
+    pub kind: HistoryLoadKind,
+    pub repository_id: Option<u64>,
+    pub pages_fetched: usize,
+    pub commits_loaded: usize,
+    pub commits_before: usize,
+    pub cancelling: bool,
+}
+
+#[derive(Debug)]
+pub struct BacklogState {
+    pub discovery: DiscoveryState,
+    repositories: HashMap<u64, RepositoryBacklog>,
+    active: Option<HistoryLoad>,
+    next_generation: u64,
+    cancelled: Option<usize>,
+}
+
+impl BacklogState {
+    fn new() -> Self {
+        Self {
+            discovery: DiscoveryState::Discovering {
+                page: 0,
+                owned_repositories: 0,
+            },
+            repositories: HashMap::new(),
+            active: Some(HistoryLoad {
+                generation: INITIAL_GENERATION,
+                kind: HistoryLoadKind::Initial,
+                repository_id: None,
+                pages_fetched: 0,
+                commits_loaded: 0,
+                commits_before: 0,
+                cancelling: false,
+            }),
+            next_generation: INITIAL_GENERATION + 1,
+            cancelled: None,
+        }
+    }
+
+    /// Commits loaded when the most recent load was cancelled, until another
+    /// load starts.
+    pub fn cancelled(&self) -> Option<usize> {
+        self.cancelled
+    }
+
+    pub fn active(&self) -> Option<&HistoryLoad> {
+        self.active.as_ref()
+    }
+
+    pub fn repository(&self, repository_id: u64) -> Option<&RepositoryBacklog> {
+        self.repositories.get(&repository_id)
+    }
+
+    /// Coverage of a repository; an unloaded repository may still hold
+    /// unseen commits.
+    pub fn coverage(&self, repository_id: u64) -> HistoryCoverage {
+        self.repositories
+            .get(&repository_id)
+            .map_or(HistoryCoverage::MoreAvailable, |repository| {
+                repository.coverage
+            })
+    }
+
+    pub fn repositories_loaded(&self) -> usize {
+        self.repositories
+            .values()
+            .filter(|repository| repository.loaded)
+            .count()
+    }
+
+    pub fn count_coverage(&self, coverage: HistoryCoverage) -> usize {
+        self.repositories
+            .values()
+            .filter(|repository| repository.coverage == coverage)
+            .count()
+    }
+
+    /// Aggregate coverage; incomplete discovery can hide whole repositories.
+    pub fn aggregate_coverage(&self) -> HistoryCoverage {
+        let discovery = match self.discovery {
+            DiscoveryState::Complete => HistoryCoverage::Complete,
+            DiscoveryState::Discovering { .. } => HistoryCoverage::MoreAvailable,
+            DiscoveryState::Failed(_) | DiscoveryState::Cancelled => HistoryCoverage::Incomplete,
+        };
+        self.repositories
+            .values()
+            .fold(discovery, |coverage, repository| {
+                coverage.combine(repository.coverage)
+            })
+    }
+
+    /// Sanitized failures across repositories, in repository-index order.
+    pub fn failures(&self) -> Vec<&LoadFailure> {
+        let mut failures = self
+            .repositories
+            .values()
+            .flat_map(|repository| repository.failures.iter())
+            .collect::<Vec<_>>();
+        if let DiscoveryState::Failed(failure) = &self.discovery {
+            failures.insert(0, failure);
+        }
+        failures.sort_by_key(|failure| failure_order(failure));
+        failures
+    }
+}
+
+fn failure_order(failure: &LoadFailure) -> (usize, usize) {
+    match failure.scope {
+        FailureScope::Authentication | FailureScope::Discovery => (0, 0),
+        FailureScope::Repository { repository_index } => (repository_index + 1, 0),
+        FailureScope::Branch {
+            repository_index,
+            branch_index,
+        } => (repository_index + 1, branch_index + 1),
+        FailureScope::CommitDetail => (usize::MAX, 0),
+    }
+}
+
 #[derive(Debug)]
 pub struct App {
     inbox: Inbox,
@@ -528,6 +702,9 @@ pub struct App {
     status: String,
     should_quit: bool,
     live: Option<LiveInboxState>,
+    backlog: Option<BacklogState>,
+    backlog_view: BacklogView,
+    backlog_effects: VecDeque<BacklogEffect>,
     review_store: Option<Box<dyn ReviewStore>>,
     review_marks: ReviewMarks,
     review_warning: Option<String>,
@@ -624,11 +801,18 @@ impl App {
         let mut status = match &inbox.source {
             InboxSource::Demo => "Offline fictional demo".to_owned(),
             InboxSource::Live { .. } => "GitHub loading started".to_owned(),
+            InboxSource::Backlog {
+                origin: BacklogOrigin::GitHub,
+            } => "GitHub backlog loading started".to_owned(),
+            InboxSource::Backlog {
+                origin: BacklogOrigin::Demo,
+            } => "Offline fictional backlog demo".to_owned(),
         };
         if drafts.iter().any(|draft| draft.submission.is_some()) {
             status = "A comment publish is unverified; press P or open C to reconcile".to_owned();
         }
         let live = matches!(inbox.source, InboxSource::Live { .. }).then(LiveInboxState::new);
+        let backlog = inbox.is_backlog().then(BacklogState::new);
         let mut app = Self {
             inbox,
             terminal_width: 0,
@@ -650,6 +834,9 @@ impl App {
             status,
             should_quit: false,
             live,
+            backlog,
+            backlog_view: BacklogView::Pending,
+            backlog_effects: VecDeque::new(),
             review_store,
             review_marks,
             review_warning,
@@ -938,6 +1125,9 @@ impl App {
             Input::Character('G') => Command::Last,
             Input::Character('m') => Command::ToggleReviewed,
             Input::Character('f') => Command::ToggleRemaining,
+            Input::Character('o') => Command::LoadOlder,
+            Input::Character('O') => Command::LoadAll,
+            Input::Character('x') => Command::CancelLoad,
             Input::Character('c') => {
                 self.open_comment_editor();
                 return;
@@ -1094,6 +1284,9 @@ impl App {
             Command::Back => self.focus_previous("Returned to parent pane"),
             Command::ToggleReviewed => self.toggle_reviewed(),
             Command::ToggleRemaining => self.toggle_remaining(),
+            Command::LoadOlder => self.request_history(HistoryRequest::Older),
+            Command::LoadAll => self.request_history(HistoryRequest::All),
+            Command::CancelLoad => self.cancel_history_load(),
             Command::SearchNext => self.repeat_search(false),
             Command::SearchPrevious => self.repeat_search(true),
             Command::Unrelated => self.status = "Key has no action in normal mode".to_owned(),
@@ -1102,6 +1295,17 @@ impl App {
 
     fn quit(&mut self) {
         self.cancel_active_detail();
+        if let Some(active) = self
+            .backlog
+            .as_mut()
+            .and_then(|state| state.active.as_mut())
+            && !active.cancelling
+        {
+            active.cancelling = true;
+            self.backlog_effects.push_back(BacklogEffect::Cancel {
+                generation: active.generation,
+            });
+        }
         if let Some(active) = self.active_comment_load.take() {
             self.comment_effects.push_back(CommentEffect::Cancel {
                 request_id: active.request_id,
@@ -1836,7 +2040,7 @@ impl App {
     }
 
     fn open_selected(&mut self) {
-        if matches!(self.inbox.source, InboxSource::Live { .. })
+        if self.inbox.loads_remote_details()
             && (self.focus == Pane::Commit
                 || matches!(self.current_detail_state(), Some(DetailState::Failed(_))))
         {
@@ -1914,10 +2118,15 @@ impl App {
                 self.review_marks = marks;
                 self.rebuild_projection(Some(selection));
                 self.cancel_detail_if_selection_changed();
-                self.status = if reviewed {
-                    "Marked commit reviewed".to_owned()
-                } else {
-                    "Marked commit unreviewed".to_owned()
+                self.status = match (self.inbox.is_backlog(), reviewed) {
+                    (false, true) => "Marked commit reviewed".to_owned(),
+                    (false, false) => "Marked commit unreviewed".to_owned(),
+                    (true, true) => {
+                        "Marked commit reviewed; it left the backlog (f shows reviewed)".to_owned()
+                    }
+                    (true, false) => {
+                        "Marked commit unreviewed; it returned to the backlog".to_owned()
+                    }
                 };
             }
             Err(error) => {
@@ -1929,7 +2138,14 @@ impl App {
     fn toggle_remaining(&mut self) {
         let before = self.current_detail_key();
         let selection = self.selection_identity();
-        self.remaining_only = !self.remaining_only;
+        if self.backlog.is_some() {
+            self.backlog_view = match self.backlog_view {
+                BacklogView::Pending => BacklogView::Reviewed,
+                BacklogView::Reviewed => BacklogView::Pending,
+            };
+        } else {
+            self.remaining_only = !self.remaining_only;
+        }
         self.rebuild_projection(Some(selection));
         if before != self.current_detail_key() {
             self.reset_diff_position();
@@ -1940,11 +2156,325 @@ impl App {
             self.clear_diff_match();
         }
         self.cancel_detail_if_selection_changed();
-        self.status = if self.remaining_only {
-            "Showing remaining commits only".to_owned()
-        } else {
-            "Showing all commits".to_owned()
+        self.status = match (
+            self.backlog.is_some(),
+            self.backlog_view,
+            self.remaining_only,
+        ) {
+            (true, BacklogView::Pending, _) => {
+                "Showing the backlog of unreviewed commits".to_owned()
+            }
+            (true, BacklogView::Reviewed, _) => {
+                "Showing reviewed commits; m unmarks, f returns to the backlog".to_owned()
+            }
+            (false, _, true) => "Showing remaining commits only".to_owned(),
+            (false, _, false) => "Showing all commits".to_owned(),
         };
+    }
+
+    fn request_history(&mut self, request: HistoryRequest) {
+        let current = self
+            .current_repository()
+            .map(|repository| (repository.identity.id, repository.commits.len()));
+        let Some(state) = self.backlog.as_mut() else {
+            self.status = "Loading older history is available only in the backlog".to_owned();
+            return;
+        };
+        if let Some(active) = &state.active {
+            self.status = if active.cancelling {
+                "History loading is stopping; wait before starting another load".to_owned()
+            } else {
+                "A history load is already running; press x to cancel it".to_owned()
+            };
+            return;
+        }
+        let Some((repository_id, commits_before)) = current else {
+            self.status = "No repository selected; nothing to load".to_owned();
+            return;
+        };
+        if state.coverage(repository_id) == HistoryCoverage::Complete {
+            self.status = "All history of this repository is already loaded".to_owned();
+            return;
+        }
+        let generation = state.next_generation;
+        state.next_generation = state.next_generation.saturating_add(1);
+        state.cancelled = None;
+        state.active = Some(HistoryLoad {
+            generation,
+            kind: match request {
+                HistoryRequest::Older => HistoryLoadKind::Older,
+                HistoryRequest::All => HistoryLoadKind::All,
+            },
+            repository_id: Some(repository_id),
+            pages_fetched: 0,
+            commits_loaded: commits_before,
+            commits_before,
+            cancelling: false,
+        });
+        self.backlog_effects.push_back(BacklogEffect::Load {
+            generation,
+            repository_id,
+            request,
+        });
+        self.status = match request {
+            HistoryRequest::Older => "Loading older history; x cancels".to_owned(),
+            HistoryRequest::All => {
+                "Loading all history; x cancels (many requests may hit rate limits)".to_owned()
+            }
+        };
+    }
+
+    fn cancel_history_load(&mut self) {
+        let Some(state) = self.backlog.as_mut() else {
+            self.status = "No history load is active".to_owned();
+            return;
+        };
+        match state.active.as_mut() {
+            None => self.status = "No history load is active".to_owned(),
+            Some(active) if active.cancelling => {
+                self.status = "History loading is already stopping".to_owned();
+            }
+            Some(active) => {
+                active.cancelling = true;
+                self.backlog_effects.push_back(BacklogEffect::Cancel {
+                    generation: active.generation,
+                });
+                self.status = "Cancelling history loading; loaded commits are kept".to_owned();
+            }
+        }
+    }
+
+    pub fn take_backlog_effects(&mut self) -> Vec<BacklogEffect> {
+        self.backlog_effects.drain(..).collect()
+    }
+
+    /// The history source refused a request, for example after its worker
+    /// stopped. The operation is abandoned without claiming progress.
+    pub fn reject_backlog_effect(&mut self, effect: BacklogEffect) {
+        let BacklogEffect::Load { generation, .. } = effect else {
+            return;
+        };
+        let Some(state) = self.backlog.as_mut() else {
+            return;
+        };
+        if state
+            .active
+            .as_ref()
+            .is_some_and(|active| active.generation == generation)
+        {
+            state.active = None;
+            self.status =
+                "History loading is unavailable in this session; relaunch to retry".to_owned();
+        }
+    }
+
+    /// Apply an event from the backlog history session. Events whose
+    /// generation is not the active operation are stale and ignored.
+    pub fn apply_backlog_event(&mut self, event: BacklogEvent) {
+        let Some(state) = self.backlog.as_ref() else {
+            return;
+        };
+        if state
+            .active
+            .as_ref()
+            .is_none_or(|active| active.generation != event.generation())
+        {
+            return;
+        }
+
+        let selection = self.selection_identity();
+        let previous_detail = self.current_detail_key();
+        let state = self.backlog.as_mut().expect("checked above");
+        let active = state.active.as_mut().expect("checked above");
+        let mut projection_changed = false;
+        match event {
+            BacklogEvent::DiscoveryPage {
+                page,
+                owned_repositories,
+                ..
+            } => {
+                state.discovery = DiscoveryState::Discovering {
+                    page,
+                    owned_repositories,
+                };
+            }
+            BacklogEvent::Discovered { repositories, .. } => {
+                state.discovery = DiscoveryState::Complete;
+                for identity in repositories {
+                    state.repositories.entry(identity.id).or_default();
+                    if !self
+                        .inbox
+                        .repositories
+                        .iter()
+                        .any(|repository| repository.identity.id == identity.id)
+                    {
+                        self.inbox.repositories.push(Repository {
+                            identity,
+                            commits: Vec::new(),
+                        });
+                    }
+                }
+                projection_changed = true;
+            }
+            BacklogEvent::Progress {
+                repository_id,
+                pages_fetched,
+                commits_loaded,
+                ..
+            } => {
+                active.pages_fetched = pages_fetched;
+                if active.kind == HistoryLoadKind::Initial {
+                    active.repository_id = Some(repository_id);
+                } else {
+                    active.commits_loaded = commits_loaded;
+                }
+            }
+            BacklogEvent::Snapshot {
+                repository,
+                coverage,
+                failures,
+                pages_loaded,
+                ..
+            } => {
+                let id = repository.identity.id;
+                if active.kind != HistoryLoadKind::Initial {
+                    active.commits_loaded = repository.commits.len();
+                }
+                state.repositories.insert(
+                    id,
+                    RepositoryBacklog {
+                        coverage,
+                        failures,
+                        pages_loaded,
+                        loaded: true,
+                    },
+                );
+                match self
+                    .inbox
+                    .repositories
+                    .iter_mut()
+                    .find(|existing| existing.identity.id == id)
+                {
+                    Some(existing) => *existing = repository,
+                    None => self.inbox.repositories.push(repository),
+                }
+                projection_changed = true;
+            }
+            BacklogEvent::Finished {
+                repository_id,
+                outcome,
+                ..
+            } => {
+                let finished = state.active.take().expect("checked above");
+                if outcome == HistoryOutcome::Cancelled
+                    && matches!(state.discovery, DiscoveryState::Discovering { .. })
+                {
+                    state.discovery = DiscoveryState::Cancelled;
+                }
+                if let HistoryOutcome::DiscoveryFailed(failure) = &outcome {
+                    state.discovery = DiscoveryState::Failed(failure.clone());
+                }
+                self.status = self.history_finished_status(&finished, repository_id, &outcome);
+                if outcome == HistoryOutcome::Cancelled {
+                    let loaded = match (finished.kind, repository_id) {
+                        (HistoryLoadKind::Initial, _) | (_, None) => self.loaded_commit_count(),
+                        (_, Some(repository_id)) => self
+                            .inbox
+                            .repositories
+                            .iter()
+                            .find(|repository| repository.identity.id == repository_id)
+                            .map_or(0, |repository| repository.commits.len()),
+                    };
+                    self.backlog.as_mut().expect("backlog source").cancelled = Some(loaded);
+                }
+                projection_changed = true;
+            }
+        }
+
+        if projection_changed {
+            self.rebuild_projection(Some(selection));
+            if previous_detail != self.current_detail_key() {
+                self.reset_diff_position();
+                self.clear_diff_match();
+            }
+            self.cancel_detail_if_selection_changed();
+        }
+        self.normalize();
+    }
+
+    fn history_finished_status(
+        &self,
+        finished: &HistoryLoad,
+        repository_id: Option<u64>,
+        outcome: &HistoryOutcome,
+    ) -> String {
+        let state = self.backlog.as_ref().expect("backlog source");
+        let loaded_in = |repository_id: u64| {
+            self.inbox
+                .repositories
+                .iter()
+                .find(|repository| repository.identity.id == repository_id)
+                .map_or(0, |repository| repository.commits.len())
+        };
+        match outcome {
+            HistoryOutcome::DiscoveryFailed(failure) => {
+                format!("LOAD FAILED — {}", failure_category_label(failure.category))
+            }
+            HistoryOutcome::UnknownRepository => {
+                "History of this repository is unavailable in this session".to_owned()
+            }
+            HistoryOutcome::Cancelled => {
+                let loaded = match (finished.kind, repository_id) {
+                    (HistoryLoadKind::Initial, _) | (_, None) => self.loaded_commit_count(),
+                    (_, Some(repository_id)) => loaded_in(repository_id),
+                };
+                format!("Cancelled — {loaded} commits loaded, history incomplete")
+            }
+            HistoryOutcome::Finished => match (finished.kind, repository_id) {
+                (HistoryLoadKind::Initial, _) | (_, None) => {
+                    let (pending, _) = self.backlog_counts();
+                    match state.aggregate_coverage() {
+                        HistoryCoverage::Complete if pending == 0 => {
+                            "Backlog clear — all history loaded and reviewed".to_owned()
+                        }
+                        HistoryCoverage::Complete => {
+                            format!("Backlog loaded: {pending} pending; all history loaded")
+                        }
+                        HistoryCoverage::MoreAvailable => format!(
+                            "Backlog loaded: {pending} pending in loaded history; older history not loaded (o/O)"
+                        ),
+                        HistoryCoverage::Incomplete => format!(
+                            "Backlog loaded: {pending} pending in loaded history; history incomplete"
+                        ),
+                    }
+                }
+                (kind, Some(repository_id)) => {
+                    let loaded = loaded_in(repository_id);
+                    let added = loaded.saturating_sub(finished.commits_before);
+                    let prefix = if kind == HistoryLoadKind::All {
+                        "Loaded all available history"
+                    } else {
+                        "Loaded older history"
+                    };
+                    let coverage = match state.coverage(repository_id) {
+                        HistoryCoverage::Complete => "history complete".to_owned(),
+                        HistoryCoverage::MoreAvailable => {
+                            "older history not loaded (o/O)".to_owned()
+                        }
+                        HistoryCoverage::Incomplete => format!(
+                            "history incomplete: {}",
+                            state
+                                .repository(repository_id)
+                                .and_then(|repository| repository.failures.first())
+                                .map_or("unknown failure", |failure| {
+                                    failure_category_label(failure.category)
+                                })
+                        ),
+                    };
+                    format!("{prefix}: {added} new commits, {loaded} loaded; {coverage}")
+                }
+            },
+        }
     }
 
     pub fn apply_detail_result(&mut self, result: DetailResult) {
@@ -2097,7 +2627,7 @@ impl App {
     }
 
     fn focus_next(&mut self, status: &'static str) {
-        if matches!(self.inbox.source, InboxSource::Live { .. }) && self.focus == Pane::Commit {
+        if self.inbox.loads_remote_details() && self.focus == Pane::Commit {
             self.open_live_commit();
             return;
         }
@@ -2258,7 +2788,7 @@ impl App {
     fn deepest_meaningful_pane(&self) -> Pane {
         if self.visible.is_empty() || self.current_commits().is_empty() {
             Pane::Repository
-        } else if matches!(self.inbox.source, InboxSource::Live { .. }) {
+        } else if self.inbox.loads_remote_details() {
             match self.current_detail_state() {
                 Some(DetailState::Loading | DetailState::Ready(_) | DetailState::Failed(_)) => {
                     Pane::Diff
@@ -2572,6 +3102,58 @@ impl App {
         self.remaining_only
     }
 
+    pub fn backlog_state(&self) -> Option<&BacklogState> {
+        self.backlog.as_ref()
+    }
+
+    /// The backlog view, or `None` for the single-day and static fixture
+    /// inboxes.
+    pub fn backlog_view(&self) -> Option<BacklogView> {
+        self.backlog.as_ref().map(|_| self.backlog_view)
+    }
+
+    /// Short label of the current commit filter.
+    pub fn view_label(&self) -> &'static str {
+        match self.backlog_view() {
+            Some(BacklogView::Pending) => "backlog",
+            Some(BacklogView::Reviewed) => "reviewed",
+            None if self.remaining_only => "remaining",
+            None => "all",
+        }
+    }
+
+    pub fn loaded_commit_count(&self) -> usize {
+        self.inbox
+            .repositories
+            .iter()
+            .map(|repository| repository.commits.len())
+            .sum()
+    }
+
+    /// Pending and reviewed counts among loaded commits.
+    pub fn backlog_counts(&self) -> (usize, usize) {
+        let (reviewed, total) = self.review_progress();
+        (total - reviewed, reviewed)
+    }
+
+    pub fn repository_pending(&self, repository: &Repository) -> usize {
+        repository
+            .commits
+            .iter()
+            .filter(|commit| !self.is_reviewed(repository.identity.id, &commit.sha))
+            .count()
+    }
+
+    /// The backlog is clear only when discovery and every repository's
+    /// history are complete and no loaded commit is pending.
+    pub fn backlog_clear(&self) -> bool {
+        self.backlog.as_ref().is_some_and(|state| {
+            state.active.is_none()
+                && state.aggregate_coverage() == HistoryCoverage::Complete
+                && self.backlog_counts().0 == 0
+        })
+    }
+
     pub fn all_reviewed_empty(&self) -> bool {
         self.remaining_only
             && self.visible.is_empty()
@@ -2755,17 +3337,34 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(inbox_index, repository)| {
+                let backlog_view = self.backlog.as_ref().map(|_| self.backlog_view);
                 let commit_indices: Vec<_> = repository
                     .commits
                     .iter()
                     .enumerate()
                     .filter_map(|(commit_index, commit)| {
-                        (!self.remaining_only
-                            || !self.is_reviewed(repository.identity.id, &commit.sha))
-                        .then_some(commit_index)
+                        let reviewed = self.is_reviewed(repository.identity.id, &commit.sha);
+                        let shown = match backlog_view {
+                            Some(BacklogView::Pending) => !reviewed,
+                            Some(BacklogView::Reviewed) => reviewed,
+                            None => !self.remaining_only || !reviewed,
+                        };
+                        shown.then_some(commit_index)
                     })
                     .collect();
-                (!self.remaining_only || !commit_indices.is_empty()).then_some(VisibleRepository {
+                let listed = match backlog_view {
+                    // A repository whose loaded history is fully reviewed stays
+                    // listed while older history may still hold pending commits.
+                    Some(BacklogView::Pending) => {
+                        !commit_indices.is_empty()
+                            || self.backlog.as_ref().is_some_and(|state| {
+                                state.coverage(repository.identity.id) != HistoryCoverage::Complete
+                            })
+                    }
+                    Some(BacklogView::Reviewed) => !commit_indices.is_empty(),
+                    None => !self.remaining_only || !commit_indices.is_empty(),
+                };
+                listed.then_some(VisibleRepository {
                     inbox_index,
                     commit_indices,
                 })
@@ -5196,5 +5795,639 @@ mod tests {
             !app_arrows.pending_g(),
             "Down arrow must clear pending_g like j"
         );
+    }
+}
+
+#[cfg(test)]
+mod backlog_tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use chrono::{TimeZone, Utc};
+
+    use super::*;
+    use crate::comment_draft::FileDraftStore;
+    use crate::inbox::{ChildPane, GitHubAuthor};
+    use crate::review_state::FileReviewStore;
+
+    static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "reviewbox-backlog-app-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn file(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn sha(value: u32) -> String {
+        format!("{value:040x}")
+    }
+
+    fn commit(value: u32, year: i32) -> Commit {
+        Commit {
+            sha: sha(value),
+            subject: format!("Fictional change {value}"),
+            author: GitHubAuthor {
+                login: "octo".to_owned(),
+            },
+            authored_at: Utc.with_ymd_and_hms(year, 6, 1, 12, 0, 0).unwrap()
+                + chrono::TimeDelta::minutes(i64::from(value)),
+            files: ChildPane::Unavailable,
+        }
+    }
+
+    fn identity(id: u64) -> RepositoryIdentity {
+        RepositoryIdentity {
+            id,
+            owner: "octo".to_owned(),
+            name: format!("repository-{id}"),
+        }
+    }
+
+    fn repository(id: u64, commits: Vec<Commit>) -> Repository {
+        Repository {
+            identity: identity(id),
+            commits,
+        }
+    }
+
+    fn backlog_app_with(store: Box<dyn ReviewStore>) -> App {
+        App::with_stores(
+            Inbox::backlog(BacklogOrigin::GitHub),
+            store,
+            Box::new(MemoryDraftStore::default()),
+        )
+    }
+
+    fn backlog_app() -> App {
+        backlog_app_with(Box::new(MemoryReviewStore::default()))
+    }
+
+    fn discovered(app: &mut App, ids: &[u64]) {
+        app.apply_backlog_event(BacklogEvent::Discovered {
+            generation: INITIAL_GENERATION,
+            repositories: ids.iter().map(|id| identity(*id)).collect(),
+        });
+    }
+
+    fn snapshot(
+        app: &mut App,
+        generation: u64,
+        repository: Repository,
+        coverage: HistoryCoverage,
+        failures: Vec<LoadFailure>,
+    ) {
+        app.apply_backlog_event(BacklogEvent::Snapshot {
+            generation,
+            repository,
+            coverage,
+            failures,
+            pages_loaded: 1,
+        });
+    }
+
+    fn finished(app: &mut App, generation: u64, repository_id: Option<u64>) {
+        app.apply_backlog_event(BacklogEvent::Finished {
+            generation,
+            repository_id,
+            outcome: HistoryOutcome::Finished,
+        });
+    }
+
+    fn marked(keys: &[(u64, u32)]) -> MemoryReviewStore {
+        let store = MemoryReviewStore::default();
+        let keys = keys
+            .iter()
+            .map(|(id, value)| ReviewKey::new(*id, sha(*value)).unwrap())
+            .collect::<Vec<_>>();
+        store.set_reviewed_many(&keys, true).unwrap();
+        store
+    }
+
+    fn rate_limited(repository_index: usize) -> LoadFailure {
+        LoadFailure {
+            category: FailureCategory::RateLimit,
+            scope: FailureScope::Branch {
+                repository_index,
+                branch_index: 0,
+            },
+            http_status: Some(403),
+        }
+    }
+
+    fn shas(app: &App) -> Vec<String> {
+        app.current_commits()
+            .iter()
+            .map(|commit| commit.sha.clone())
+            .collect()
+    }
+
+    fn load_effect(app: &mut App) -> (u64, u64, HistoryRequest) {
+        match app.take_backlog_effects().as_slice() {
+            [
+                BacklogEffect::Load {
+                    generation,
+                    repository_id,
+                    request,
+                },
+            ] => (*generation, *repository_id, *request),
+            other => panic!("expected one load effect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backlog_defaults_to_pending_view_and_starts_the_initial_load() {
+        let app = backlog_app();
+        assert_eq!(app.backlog_view(), Some(BacklogView::Pending));
+        let active = app.backlog_state().unwrap().active().unwrap();
+        assert_eq!(active.generation, INITIAL_GENERATION);
+        assert_eq!(active.kind, HistoryLoadKind::Initial);
+        assert!(!app.backlog_clear());
+    }
+
+    #[test]
+    fn entirely_reviewed_first_batch_keeps_repository_reachable_until_history_completes() {
+        let mut app = backlog_app_with(Box::new(marked(&[(7, 1), (7, 2)])));
+        discovered(&mut app, &[7]);
+        snapshot(
+            &mut app,
+            INITIAL_GENERATION,
+            repository(7, vec![commit(1, 2024), commit(2, 2024)]),
+            HistoryCoverage::MoreAvailable,
+            Vec::new(),
+        );
+        finished(&mut app, INITIAL_GENERATION, None);
+
+        assert_eq!(app.visible_repositories().len(), 1);
+        assert!(app.current_commits().is_empty());
+        assert!(!app.backlog_clear());
+        assert!(app.status().contains("older history not loaded"));
+
+        app.handle_input(Input::Character('o'));
+        let (generation, repository_id, request) = load_effect(&mut app);
+        assert_eq!(
+            (repository_id, request),
+            (7, HistoryRequest::Older),
+            "o loads older history for the current repository"
+        );
+        assert!(generation > INITIAL_GENERATION);
+        app.apply_backlog_event(BacklogEvent::Progress {
+            generation,
+            repository_id: 7,
+            pages_fetched: 1,
+            commits_loaded: 3,
+        });
+        assert_eq!(
+            app.backlog_state()
+                .unwrap()
+                .active()
+                .map(|active| (active.pages_fetched, active.commits_loaded)),
+            Some((1, 3))
+        );
+        // A commit from years ago behind the reviewed page is pending.
+        snapshot(
+            &mut app,
+            generation,
+            repository(7, vec![commit(1, 2024), commit(2, 2024), commit(3, 2019)]),
+            HistoryCoverage::Complete,
+            Vec::new(),
+        );
+        finished(&mut app, generation, Some(7));
+        assert_eq!(shas(&app), [sha(3)]);
+        assert!(app.status().contains("1 new commits"));
+        assert!(app.status().contains("history complete"));
+        assert!(!app.backlog_clear());
+
+        app.handle_input(Input::Enter);
+        app.handle_input(Input::Character('m'));
+        assert!(app.is_reviewed(7, &sha(3)));
+        assert!(app.backlog_clear());
+        assert!(app.visible_repositories().is_empty());
+    }
+
+    #[test]
+    fn stale_generations_and_events_without_an_active_load_are_ignored() {
+        let mut app = backlog_app();
+        discovered(&mut app, &[7]);
+        snapshot(
+            &mut app,
+            INITIAL_GENERATION,
+            repository(7, vec![commit(1, 2024)]),
+            HistoryCoverage::MoreAvailable,
+            Vec::new(),
+        );
+        finished(&mut app, INITIAL_GENERATION, None);
+
+        // After the initial load finished, its generation is stale.
+        snapshot(
+            &mut app,
+            INITIAL_GENERATION,
+            repository(7, Vec::new()),
+            HistoryCoverage::Complete,
+            Vec::new(),
+        );
+        assert_eq!(shas(&app), [sha(1)]);
+
+        app.handle_input(Input::Character('O'));
+        let (generation, _, request) = load_effect(&mut app);
+        assert_eq!(request, HistoryRequest::All);
+        snapshot(
+            &mut app,
+            generation + 1,
+            repository(7, Vec::new()),
+            HistoryCoverage::Complete,
+            Vec::new(),
+        );
+        assert_eq!(shas(&app), [sha(1)]);
+        assert_eq!(
+            app.backlog_state().unwrap().coverage(7),
+            HistoryCoverage::MoreAvailable
+        );
+    }
+
+    #[test]
+    fn only_one_history_load_runs_and_cancellation_keeps_loaded_commits() {
+        let mut app = backlog_app();
+        discovered(&mut app, &[7]);
+        snapshot(
+            &mut app,
+            INITIAL_GENERATION,
+            repository(7, vec![commit(1, 2024)]),
+            HistoryCoverage::MoreAvailable,
+            Vec::new(),
+        );
+        finished(&mut app, INITIAL_GENERATION, None);
+
+        app.handle_input(Input::Character('O'));
+        let (generation, ..) = load_effect(&mut app);
+        app.handle_input(Input::Character('o'));
+        assert!(app.take_backlog_effects().is_empty());
+        assert!(app.status().contains("already running"));
+
+        snapshot(
+            &mut app,
+            generation,
+            repository(7, vec![commit(1, 2024), commit(2, 2020)]),
+            HistoryCoverage::MoreAvailable,
+            Vec::new(),
+        );
+        app.handle_input(Input::Character('x'));
+        assert_eq!(
+            app.take_backlog_effects(),
+            [BacklogEffect::Cancel { generation }]
+        );
+        assert!(app.backlog_state().unwrap().active().unwrap().cancelling);
+        app.handle_input(Input::Character('x'));
+        assert!(app.take_backlog_effects().is_empty());
+
+        app.apply_backlog_event(BacklogEvent::Finished {
+            generation,
+            repository_id: Some(7),
+            outcome: HistoryOutcome::Cancelled,
+        });
+        assert_eq!(
+            app.status(),
+            "Cancelled — 2 commits loaded, history incomplete"
+        );
+        assert_eq!(shas(&app), [sha(1), sha(2)]);
+        assert!(!app.backlog_clear());
+        app.handle_input(Input::Character('x'));
+        assert_eq!(app.status(), "No history load is active");
+    }
+
+    #[test]
+    fn cancelling_the_initial_load_and_quitting_cancel_the_active_generation() {
+        let mut app = backlog_app();
+        app.handle_input(Input::Character('x'));
+        assert_eq!(
+            app.take_backlog_effects(),
+            [BacklogEffect::Cancel {
+                generation: INITIAL_GENERATION
+            }]
+        );
+        app.apply_backlog_event(BacklogEvent::Finished {
+            generation: INITIAL_GENERATION,
+            repository_id: None,
+            outcome: HistoryOutcome::Cancelled,
+        });
+        assert_eq!(
+            app.backlog_state().unwrap().discovery,
+            DiscoveryState::Cancelled
+        );
+        assert!(!app.backlog_clear());
+
+        let mut app = backlog_app();
+        app.handle_input(Input::Quit);
+        assert!(app.should_quit());
+        assert_eq!(
+            app.take_backlog_effects(),
+            [BacklogEffect::Cancel {
+                generation: INITIAL_GENERATION
+            }]
+        );
+    }
+
+    #[test]
+    fn partial_failure_is_incomplete_even_when_every_loaded_commit_is_reviewed() {
+        let mut app = backlog_app_with(Box::new(marked(&[(7, 1)])));
+        discovered(&mut app, &[7]);
+        snapshot(
+            &mut app,
+            INITIAL_GENERATION,
+            repository(7, vec![commit(1, 2024)]),
+            HistoryCoverage::Incomplete,
+            vec![rate_limited(0)],
+        );
+        finished(&mut app, INITIAL_GENERATION, None);
+        assert!(!app.backlog_clear());
+        assert_eq!(
+            app.backlog_state().unwrap().aggregate_coverage(),
+            HistoryCoverage::Incomplete
+        );
+        assert!(app.status().contains("history incomplete"));
+        assert_eq!(app.visible_repositories().len(), 1);
+
+        // An incomplete repository can be retried explicitly.
+        app.handle_input(Input::Character('o'));
+        let (generation, ..) = load_effect(&mut app);
+        snapshot(
+            &mut app,
+            generation,
+            repository(7, vec![commit(1, 2024)]),
+            HistoryCoverage::Incomplete,
+            vec![rate_limited(0)],
+        );
+        finished(&mut app, generation, Some(7));
+        assert!(
+            app.status()
+                .contains("history incomplete: GitHub API rate limit reached")
+        );
+    }
+
+    #[test]
+    fn discovery_failure_and_incomplete_discovery_never_report_a_clear_backlog() {
+        let mut app = backlog_app();
+        app.apply_backlog_event(BacklogEvent::Finished {
+            generation: INITIAL_GENERATION,
+            repository_id: None,
+            outcome: HistoryOutcome::DiscoveryFailed(LoadFailure {
+                category: FailureCategory::Authentication,
+                scope: FailureScope::Authentication,
+                http_status: Some(401),
+            }),
+        });
+        assert!(!app.backlog_clear());
+        assert!(app.status().starts_with("LOAD FAILED"));
+
+        let mut app = backlog_app();
+        discovered(&mut app, &[]);
+        finished(&mut app, INITIAL_GENERATION, None);
+        assert!(app.inbox().repositories.is_empty());
+        assert!(app.backlog_clear());
+    }
+
+    #[test]
+    fn incremental_snapshots_keep_the_selected_commit_by_sha() {
+        let mut app = backlog_app();
+        discovered(&mut app, &[7, 8]);
+        snapshot(
+            &mut app,
+            INITIAL_GENERATION,
+            repository(8, vec![commit(10, 2024), commit(11, 2023)]),
+            HistoryCoverage::MoreAvailable,
+            Vec::new(),
+        );
+        app.handle_input(Input::Character('j'));
+        app.handle_input(Input::Enter);
+        app.handle_input(Input::Character('j'));
+        assert_eq!(app.current_commit().unwrap().sha, sha(11));
+
+        // A newer commit sorts before the selection and another repository
+        // appears in the list while loading continues.
+        snapshot(
+            &mut app,
+            INITIAL_GENERATION,
+            repository(7, vec![commit(1, 2024)]),
+            HistoryCoverage::MoreAvailable,
+            Vec::new(),
+        );
+        snapshot(
+            &mut app,
+            INITIAL_GENERATION,
+            repository(
+                8,
+                vec![commit(12, 2025), commit(10, 2024), commit(11, 2023)],
+            ),
+            HistoryCoverage::MoreAvailable,
+            Vec::new(),
+        );
+        assert_eq!(app.current_repository().unwrap().identity.id, 8);
+        assert_eq!(app.current_commit().unwrap().sha, sha(11));
+        assert_eq!(app.focus(), Pane::Commit);
+    }
+
+    #[test]
+    fn viewing_never_marks_and_reviewed_view_unmarks_back_into_the_backlog() {
+        let mut app = backlog_app();
+        discovered(&mut app, &[7]);
+        snapshot(
+            &mut app,
+            INITIAL_GENERATION,
+            repository(7, vec![commit(1, 2024), commit(2, 2018)]),
+            HistoryCoverage::Complete,
+            Vec::new(),
+        );
+        finished(&mut app, INITIAL_GENERATION, None);
+
+        app.handle_input(Input::Enter);
+        app.handle_input(Input::Enter);
+        let effects = app.take_detail_effects();
+        assert!(matches!(effects.as_slice(), [DetailEffect::Request { .. }]));
+        app.handle_input(Input::Escape);
+        app.handle_input(Input::Character('j'));
+        app.handle_input(Input::Character('k'));
+        assert!(!app.is_reviewed(7, &sha(1)));
+        assert!(!app.is_reviewed(7, &sha(2)));
+
+        app.handle_input(Input::Character('m'));
+        assert_eq!(shas(&app), [sha(2)]);
+        assert!(app.status().contains("left the backlog"));
+
+        app.handle_input(Input::Character('f'));
+        assert_eq!(app.backlog_view(), Some(BacklogView::Reviewed));
+        assert_eq!(app.view_label(), "reviewed");
+        assert_eq!(shas(&app), [sha(1)]);
+        app.handle_input(Input::Character('m'));
+        assert!(!app.is_reviewed(7, &sha(1)));
+        assert!(app.status().contains("returned to the backlog"));
+        assert!(app.visible_repositories().is_empty());
+
+        app.handle_input(Input::Character('f'));
+        assert_eq!(shas(&app), [sha(1), sha(2)]);
+    }
+
+    #[test]
+    fn marks_survive_restart_and_existing_state_and_drafts_load_unchanged() {
+        let directory = TestDirectory::new();
+        let state = directory.file("review-state.json");
+        let drafts = directory.file("comment-drafts.json");
+        std::fs::write(
+            &state,
+            format!(
+                "{{\n  \"version\": 1,\n  \"repositories\": {{\n    \"7\": {{\n      \"reviewed\": [\n        \"{}\"\n      ]\n    }}\n  }}\n}}\n",
+                sha(1)
+            ),
+        )
+        .unwrap();
+        let draft_store = FileDraftStore::at(&drafts).unwrap();
+        draft_store
+            .save(
+                &CommentDraft::new(
+                    CommentTarget::commit(7, sha(2)).unwrap(),
+                    "Existing fictional draft",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let draft_bytes = std::fs::read(&drafts).unwrap();
+
+        let open = || {
+            let mut app = App::with_stores(
+                Inbox::backlog(BacklogOrigin::GitHub),
+                Box::new(FileReviewStore::at(&state).unwrap()),
+                Box::new(FileDraftStore::at(&drafts).unwrap()),
+            );
+            discovered(&mut app, &[7]);
+            snapshot(
+                &mut app,
+                INITIAL_GENERATION,
+                repository(7, vec![commit(1, 2024), commit(2, 2023), commit(3, 2016)]),
+                HistoryCoverage::Complete,
+                Vec::new(),
+            );
+            finished(&mut app, INITIAL_GENERATION, None);
+            app
+        };
+
+        let mut app = open();
+        assert_eq!(shas(&app), [sha(2), sha(3)]);
+        assert_eq!(app.draft_count(), 1);
+        assert!(app.commit_has_draft(7, &sha(2)));
+        app.handle_input(Input::Enter);
+        app.handle_input(Input::Character('j'));
+        app.handle_input(Input::Character('m'));
+        drop(app);
+
+        let mut restarted = open();
+        assert!(restarted.is_reviewed(7, &sha(1)));
+        assert!(restarted.is_reviewed(7, &sha(3)));
+        assert_eq!(shas(&restarted), [sha(2)]);
+        assert_eq!(std::fs::read(&drafts).unwrap(), draft_bytes);
+
+        restarted.handle_input(Input::Character('f'));
+        restarted.handle_input(Input::Enter);
+        restarted.handle_input(Input::Character('j'));
+        restarted.handle_input(Input::Character('m'));
+        drop(restarted);
+        let reopened = open();
+        assert_eq!(shas(&reopened), [sha(2), sha(3)]);
+    }
+
+    #[test]
+    fn failed_review_save_reports_failure_and_keeps_prior_marks() {
+        let directory = TestDirectory::new();
+        let state = directory.file("review-state.json");
+        std::fs::write(&state, b"not json").unwrap();
+        let mut app = App::with_review_store_result(
+            Inbox::backlog(BacklogOrigin::GitHub),
+            FileReviewStore::at(&state).map(|store| Box::new(store) as Box<dyn ReviewStore>),
+        );
+        discovered(&mut app, &[7]);
+        snapshot(
+            &mut app,
+            INITIAL_GENERATION,
+            repository(7, vec![commit(1, 2024)]),
+            HistoryCoverage::Complete,
+            Vec::new(),
+        );
+        app.handle_input(Input::Enter);
+        app.handle_input(Input::Character('m'));
+        assert!(!app.is_reviewed(7, &sha(1)));
+        assert!(app.status().contains("unchanged"));
+        assert_eq!(std::fs::read(&state).unwrap(), b"not json");
+    }
+
+    #[test]
+    fn history_keys_are_backlog_only_and_documented() {
+        let selection = crate::day::select_day(
+            crate::day::parse_date("2024-01-15").unwrap(),
+            crate::day::parse_timezone("Etc/UTC").unwrap(),
+            crate::day::TimezoneSource::Explicit,
+        )
+        .unwrap();
+        for inbox in [Inbox::live(selection), Inbox::demo(Vec::new())] {
+            let mut app = App::new(inbox);
+            for key in ['o', 'O'] {
+                app.handle_input(Input::Character(key));
+                assert_eq!(
+                    app.status(),
+                    "Loading older history is available only in the backlog"
+                );
+            }
+            app.handle_input(Input::Character('x'));
+            assert_eq!(app.status(), "No history load is active");
+            assert!(app.take_backlog_effects().is_empty());
+        }
+        assert!(
+            HELP_BINDINGS
+                .iter()
+                .any(|binding| binding.keys == "o / O / x")
+        );
+
+        let mut app = backlog_app();
+        discovered(&mut app, &[7]);
+        snapshot(
+            &mut app,
+            INITIAL_GENERATION,
+            repository(7, vec![commit(1, 2024)]),
+            HistoryCoverage::Complete,
+            Vec::new(),
+        );
+        finished(&mut app, INITIAL_GENERATION, None);
+        app.handle_input(Input::Character('O'));
+        assert!(app.take_backlog_effects().is_empty());
+        assert_eq!(
+            app.status(),
+            "All history of this repository is already loaded"
+        );
+    }
+
+    #[test]
+    fn rejected_requests_abandon_the_operation_without_claiming_progress() {
+        let mut app = backlog_app();
+        discovered(&mut app, &[7]);
+        finished(&mut app, INITIAL_GENERATION, None);
+        app.handle_input(Input::Character('o'));
+        let effects = app.take_backlog_effects();
+        app.reject_backlog_effect(effects[0].clone());
+        assert!(app.backlog_state().unwrap().active().is_none());
+        assert!(app.status().contains("unavailable"));
     }
 }

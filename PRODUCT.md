@@ -14,8 +14,10 @@ directory, outside Git repositories.
 
 ## First usable version
 
-- Today is the default date; allow choosing another day and a timezone (default
-  to the local timezone). Explain precisely which commit timestamp is filtered.
+- Allow choosing a single day and a timezone (default to the local timezone) as
+  an explicit view. Explain precisely which commit timestamp is filtered. The
+  original "today is the default date" requirement is superseded by the
+  backlog direction below.
 - Discover all repositories owned by the authenticated user, including private
   ones where authorized, with pagination. Filter commits by the user's authorship.
   Include branch coverage, deduplicate shared SHAs within each repository, and
@@ -36,6 +38,38 @@ directory, outside Git repositories.
   network writes. Tests must not post comments to real repositories.
 - Document installation, launch, keybindings, authentication, data storage,
   coverage limitations, and verification commands.
+
+## Accepted backlog direction
+
+This direction supersedes the original default-today requirement.
+
+Delivered in the backlog increment:
+
+- The default inbox is the user's unreviewed commits across the supported
+  repositories, with no date limit. A commit stays pending until it is
+  explicitly marked reviewed, regardless of age or a long absence; opening a
+  commit does not mark it. Marks survive restarts; existing marks and drafts are
+  preserved.
+- History loads progressively. The initial batch is only a fetch optimization.
+  In-app Load older (`o`) and Load all (`O`) work on the current repository with
+  progress, cancellation (`x`), and accurate complete, incomplete, rate-limited,
+  and cancelled states. Old commits stay reachable even when the first batch is
+  empty or entirely reviewed. An incomplete load is never shown as an empty or
+  fully reviewed backlog.
+- `--date` and `--timezone` remain as an explicitly labeled single-day view; they
+  do not limit the default backlog. There is no date-range picker or date filter.
+- A Reviewed view (`f`) exists only to inspect loaded reviewed commits and
+  unmark them, returning them to the backlog.
+- In normal browsing mode, arrow keys mirror `h`/`j`/`k`/`l`.
+
+Not yet delivered (next increment):
+
+- Selecting individual commits or all loaded commits in the current repository,
+  and marking the selection reviewed or unreviewed in one confirmed action with
+  an explicit scope and count. Selection stays distinct from the durable
+  reviewed flag, never covers unloaded history silently, and never applies to
+  commits discovered after confirmation. There is no global cross-repository
+  bulk operation.
 
 ## Delivery order
 

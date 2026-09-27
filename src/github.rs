@@ -409,6 +409,23 @@ impl fmt::Display for LoadFailure {
 
 impl std::error::Error for LoadFailure {}
 
+/// Short, sanitized description of a failure category.
+pub fn failure_category_label(category: FailureCategory) -> &'static str {
+    match category {
+        FailureCategory::Authentication => "authentication failed",
+        FailureCategory::MissingGh => "GitHub CLI not found",
+        FailureCategory::PermissionOrNotFound => "permission denied or resource unavailable",
+        FailureCategory::RateLimit => "GitHub API rate limit reached",
+        FailureCategory::MalformedResponse => "unreadable GitHub response",
+        FailureCategory::MalformedJson => "malformed GitHub JSON",
+        FailureCategory::Offline => "offline",
+        FailureCategory::Transport => "GitHub transport failure",
+        FailureCategory::Command => "GitHub CLI request failure",
+        FailureCategory::Api => "GitHub API failure",
+        FailureCategory::Cancelled => "loading cancelled",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetailFailure {
     ResponseTruncated,

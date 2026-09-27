@@ -24,15 +24,56 @@ impl Inbox {
         }
     }
 
+    /// The undated backlog of unreviewed commits. Repositories and commits
+    /// arrive from a history session; nothing is bounded by date.
+    pub fn backlog(origin: BacklogOrigin) -> Self {
+        Self {
+            source: InboxSource::Backlog { origin },
+            repositories: Vec::new(),
+        }
+    }
+
+    /// Whether commits carry their changed files, as fictional fixtures do.
     pub fn child_panes_available(&self) -> bool {
-        matches!(self.source, InboxSource::Demo)
+        matches!(
+            self.source,
+            InboxSource::Demo
+                | InboxSource::Backlog {
+                    origin: BacklogOrigin::Demo
+                }
+        )
+    }
+
+    /// Whether commit details are loaded on demand from GitHub.
+    pub fn loads_remote_details(&self) -> bool {
+        matches!(
+            self.source,
+            InboxSource::Live { .. }
+                | InboxSource::Backlog {
+                    origin: BacklogOrigin::GitHub
+                }
+        )
+    }
+
+    pub fn is_backlog(&self) -> bool {
+        matches!(self.source, InboxSource::Backlog { .. })
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InboxSource {
+    /// Static fictional fixture inbox used by tests and the workflow smoke.
     Demo,
+    /// Explicit single-day view selected with `--date` and/or `--timezone`.
     Live { selection: DaySelection },
+    /// Default undated backlog of unreviewed commits.
+    Backlog { origin: BacklogOrigin },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BacklogOrigin {
+    GitHub,
+    Demo,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

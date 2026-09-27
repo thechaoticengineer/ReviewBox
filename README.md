@@ -3,12 +3,20 @@
 A keyboard-first terminal inbox for reviewing your own GitHub commits across
 projects.
 
-**Current status: delivery increment 5 of 5 — usability and release readiness.**
-The first usable release described in [PRODUCT.md](PRODUCT.md) is implemented:
-live and fictional inboxes share the repository → commit → file → diff workflow,
-reviewed progress and comment drafts are durable in live mode, comments require
-an explicit publish confirmation, loading and failure states are actionable, and
-the terminal UI has compact layouts and deterministic end-to-end smoke coverage.
+**Current status: first release complete; the durable review backlog is
+delivered, bulk selection is planned.** The first usable release described in
+[PRODUCT.md](PRODUCT.md) is implemented: live and fictional inboxes share the
+repository → commit → file → diff workflow, reviewed progress and comment drafts
+are durable in live mode, comments require an explicit publish confirmation,
+loading and failure states are actionable, and the terminal UI has compact
+layouts and deterministic end-to-end smoke coverage.
+
+The default inbox is now an undated **backlog** of your unreviewed commits: a
+commit stays pending until you mark it reviewed, however old it is. History
+loads progressively with in-app Load older / Load all, progress, cancellation,
+and explicit completeness states. Selecting several commits and marking them
+reviewed or unreviewed in one action is **not implemented yet**; it is the next
+planned increment. Today, `m` marks or unmarks one commit at a time.
 
 ## Prerequisites
 
@@ -37,8 +45,55 @@ cargo build --release
 ./target/release/reviewbox
 ```
 
-With no options, live mode chooses today in the detected local IANA timezone.
-Choose a date, a timezone, or both:
+### Default: the review backlog
+
+With no options, ReviewBox opens the backlog: your unreviewed commits across the
+repositories you own, with **no date limit**. A commit stays in the backlog until
+you explicitly mark it reviewed with `m`; opening or browsing a commit never
+marks it, and a long absence does not expire anything. Marks persist across
+restarts (see [Storage and privacy](#storage-and-privacy)).
+
+Loading is progressive so the terminal stays responsive:
+
+1. The initial batch discovers your owned repositories, enumerates their
+   branches, and fetches the **first page (up to 100 commits) of every branch**.
+   This is only a fetch optimization, never an age cutoff.
+2. `o` (**Load older**) fetches one more page of every branch of the selected
+   repository. `O` (**Load all**) keeps paging that repository until its history
+   is complete, a failure makes it incomplete, or you cancel.
+3. `x` cancels the active load promptly. Commits loaded before cancellation stay
+   browsable, and the status reads `Cancelled — N commits loaded, history
+   incomplete`.
+
+Only one history load runs at a time. A repository whose loaded commits are all
+reviewed stays listed while older history may exist, so old pending commits
+remain reachable. Repository rows show the pending count and a coverage marker:
+`+older` (older history not loaded), `!incomplete` (a request failed), or
+`loading` (initial batch pending); complete repositories have no marker. The
+diff pane shows a backlog summary with progress, per-repository coverage, and a
+bounded, sanitized error list whenever no commit detail is open.
+
+Completeness is stated explicitly and never overstated:
+
+| State | Meaning |
+| --- | --- |
+| `Loading backlog: …` / `Loading older history: N pages, M commits loaded` | A load is running; `x` cancels. |
+| `Backlog clear — all history loaded and reviewed` | Discovery succeeded, every repository's history is complete, and no loaded commit is pending. Only this state claims an empty backlog. |
+| `No pending commits in loaded history — older history not loaded (o/O)` | Everything loaded is reviewed, but older pages may still hold pending commits. |
+| `History incomplete: <reason>` | A branch or page failed, for example `GitHub API rate limit reached`; press `o`/`O` to retry. |
+| `Cancelled — N commits loaded, history incomplete` | You cancelled a load. |
+| `NO OWNED REPOSITORIES` / `LOAD FAILED — <reason>` | Discovery finished empty or failed. |
+
+`f` switches between the backlog of unreviewed commits and a **Reviewed** view
+that lists loaded reviewed commits so you can inspect them and press `m` to
+unmark one; it returns to the backlog. There is no date filter.
+
+### Single-day view: `--date` / `--timezone`
+
+The previous day-scoped inbox remains available when you pass `--date`,
+`--timezone`, or both. It is labeled as a single-day view and does not affect
+the default backlog. A missing date means today; a missing timezone means the
+detected local IANA timezone:
 
 ```sh
 reviewbox --date 2026-09-12
@@ -51,7 +106,9 @@ including, the following local midnight. Each boundary is converted to UTC
 independently, so daylight-saving days may be 23 or 25 hours. Invalid arguments
 exit with status 2 before terminal setup. If local timezone detection fails,
 ReviewBox visibly falls back to `Etc/UTC`. `--date` and `--timezone` cannot be
-combined with `--demo`, `--demo-smoke`, or `--help`.
+combined with `--demo`, `--demo-smoke`, or `--help`. In the single-day view,
+`f` keeps its earlier meaning (all commits / remaining commits only), and `o`,
+`O`, and `x` are unavailable.
 
 Run the interactive fictional demo or its noninteractive smoke workflow with:
 
@@ -60,11 +117,20 @@ cargo run -- --demo
 cargo run -- --demo-smoke
 ```
 
-The demo uses fictional fixtures, makes no GitHub request, and keeps review and
-draft state in memory. The smoke drives the complete workflow through an
+The demo is a fictional backlog served by an in-memory history pager through the
+same background loader as live mode. It makes no GitHub request and keeps
+review and draft state in memory. The last repository,
+`fictional-harbor/tidepool-archive-demo`, has a first page that is already
+marked reviewed, so it starts with `(0) +older`; `o` reveals a pending commit
+from 2023 and `O` loads the rest. Older demo pages arrive with a short delay so
+progress and `x` are observable.
+
+The smoke drives the static fixture workflow and the backlog demo through an
 in-memory terminal, fake comment service, mock editor, memory-only stores, and
-recorded terminal operations. It never invokes `gh`, opens a real editor,
-reaches the network, or writes to HOME/XDG storage.
+recorded terminal operations. For the backlog it loads older history, marks the
+old pending commit reviewed, confirms that it leaves the backlog and appears in
+the Reviewed view, unmarks it, and loads all history. It never invokes `gh`,
+opens a real editor, reaches the network, or writes to HOME/XDG storage.
 
 ## GitHub authentication and access
 
@@ -145,7 +211,8 @@ Normal mode:
 | `/` | search the focused pane |
 | `n / N` | next / previous search match |
 | `m` | mark commit reviewed / unreviewed |
-| `f` | show remaining / all commits |
+| `f` | backlog / reviewed (day: remaining / all) |
+| `o / O / x` | load older / all history; cancel loading |
 | `c` | edit commit or selected-line draft |
 | `E` | edit draft with `$VISUAL / $EDITOR` |
 | `P` | publish draft after confirmation |
@@ -165,8 +232,7 @@ Help mode:
 
 | Keys | Action |
 | --- | --- |
-| `Help: j/k or arrows` | scroll this binding list |
-| `Help: Escape` | close help; other keys stay isolated |
+| `Help: j/k, arrows / Esc` | scroll / close; other keys stay isolated |
 
 Edit mode:
 
@@ -215,7 +281,15 @@ or `stty sane`, then remove any leftover private editor temporary directory.
 ### Fixture-tested behavior
 
 The test suite and `--demo-smoke` use fictional, network-incapable dependencies.
-They cover day/timezone presentation, all four panes, navigation and search,
+Backlog tests drive the real background loader with scripted `gh` responses and
+in-memory pagers. They cover full raw pages whose accepted projection is empty
+followed by older pages, entirely reviewed first batches, multiple pages,
+overlapping branches, selection kept on the same SHA during loading,
+cancellation during Load all, rate-limited branches left incomplete and then
+retried, discovery failure, shutdown of blocked loads, stale-generation events,
+restart persistence with a temporary `review-state.json`, existing marks and
+drafts loading unchanged, and that viewing a commit never marks it. They also
+cover day/timezone presentation, all four panes, navigation and search,
 representative and truncated diffs, resize/compact rendering, reviewed/filter
 state, commit and eligible-line drafts, unsupported-line refusal, external
 editing with terminal suspend/resume, existing comments, confirmed mocked
@@ -235,7 +309,9 @@ no POST/PATCH/PUT/DELETE request, and published no comment. No account name,
 repository name, SHA, path, body, token, or capture is retained in the project.
 
 This is evidence for one available authenticated environment and suitable
-commit, not universal coverage. Live permission-denied, authentication-expired,
+commit, not universal coverage. It predates the backlog: the default undated
+backlog, Load older, Load all, and cancellation are fixture-tested only and
+have not been verified against GitHub. Live permission-denied, authentication-expired,
 offline, rate-limited, oversized-response, empty-account, empty-day, and
 incomplete-branch outcomes remain fixture-tested rather than induced against
 GitHub. Live line-position publishing was deliberately not tested.
@@ -249,13 +325,24 @@ GitHub. Live line-position publishing was deliberately not tested.
 - Every currently returned branch is paginated and queried independently.
   Tag-only, dangling, deleted-ref, or inaccessible-ref commits are not covered;
   refs can also change during traversal, so this is not a transactional snapshot.
-- Repository, branch, and commit pages request 100 items and continue until a
-  short or empty page; there is no smaller local page cap. Commit-comment lists
+  Backlog branches are paged independently by page number over a possibly long
+  session; if a branch changes between requests, a commit can be missed or seen
+  twice. Duplicates are removed by SHA, but ReviewBox does not claim a stable
+  snapshot of GitHub history.
+- Repository, branch, and commit pages request 100 items. The single-day view
+  continues until a short or empty page. The backlog fetches one commit page per
+  branch initially and more only on `o`/`O`; a branch is exhausted only by a
+  short or empty raw page, regardless of how many entries pass the author
+  filter. Load all on a large history can take many requests and may reach the
+  GitHub API rate limit; the repository is then shown as incomplete and keeps
+  what was loaded. Commit-comment lists
   are capped at 10 pages of 100 and are labeled incomplete when the cap or an
   oversized page is encountered.
-- GitHub receives the branch, authenticated `author`, and UTC `since`/`until`
-  interval. ReviewBox defensively keeps only a case-insensitive exact match on
-  top-level `author.login` and filters `commit.author.date` into `[start, end)`.
+- The backlog sends GitHub the branch and authenticated `author` with no date
+  bounds. The single-day view also sends the UTC `since`/`until` interval.
+  ReviewBox defensively keeps only a case-insensitive exact match on top-level
+  `author.login`; the single-day view also filters `commit.author.date` into
+  `[start, end)`.
   It does not use committer time, push time, contribution-calendar time, or
   author name/email. A null top-level GitHub author is excluded.
 - A full SHA reached from multiple branches is deduplicated within its repository,
