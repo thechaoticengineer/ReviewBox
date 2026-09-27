@@ -3,13 +3,15 @@
 A keyboard-first terminal inbox for reviewing your own GitHub commits across
 projects.
 
-**Current status: first release complete; the durable review backlog and
-reversible bulk review marking are delivered.** The first usable release described in
-[PRODUCT.md](PRODUCT.md) is implemented: live and fictional inboxes share the
-repository → commit → file → diff workflow, reviewed progress and comment drafts
-are durable in live mode, comments require an explicit publish confirmation,
-loading and failure states are actionable, and the terminal UI has compact
-layouts and deterministic end-to-end smoke coverage.
+**Current status: backlog release, following the completed first release.**
+The first usable release described in [PRODUCT.md](PRODUCT.md) is implemented:
+live and fictional inboxes share the repository → commit → file → diff
+workflow, reviewed progress and comment drafts are durable in live mode,
+comments require an explicit publish confirmation, loading and failure states
+are actionable, and the terminal UI has compact layouts and deterministic
+end-to-end smoke coverage. On top of that first release, this backlog release
+adds a durable, undated review backlog with progressive history loading and
+reversible bulk review marking.
 
 The default inbox is now an undated **backlog** of your unreviewed commits: a
 commit stays pending until you mark it reviewed, however old it is. History
@@ -326,23 +328,32 @@ or `stty sane`, then remove any leftover private editor temporary directory.
 ### Fixture-tested behavior
 
 The test suite and `--demo-smoke` use fictional, network-incapable dependencies.
+Arrow-key parity (`Left`/`Right`/`Up`/`Down` mirroring `h`/`l`/`k`/`j`) is
+covered across the repository, commit, file, and diff panes, with edit mode
+still moving the text cursor and Help/Comments/Search/Publish/Bulk modes
+either scrolling consistently or staying isolated; a dedicated test asserts
+every key dispatched in Normal mode, including the arrows, `o`/`O`/`x`,
+`Space`, and `A`, has a matching `?` help entry.
 Backlog tests drive the real background loader with scripted `gh` responses and
 in-memory pagers. They cover full raw pages whose accepted projection is empty
-followed by older pages, entirely reviewed first batches, multiple pages,
-overlapping branches, selection kept on the same SHA during loading,
-cancellation during Load all, rate-limited branches left incomplete and then
-retried, discovery failure, shutdown of blocked loads, stale-generation events,
-restart persistence with a temporary `review-state.json`, existing marks and
-drafts loading unchanged, and that viewing a commit never marks it. Bulk review
-tests cover single, several, and all-loaded selection, bulk mark and Reviewed
-view bulk unmark, partial versus complete scope wording before and after Load
-all, incomplete-history disclosure, a page arriving between confirmation and
-`y` staying excluded and pending, selection following commit identity through
-reordering and pruning, clearing on repository and view changes, a failing
-store keeping marks, drafts, and selection, restart persistence of bulk marks,
-and modal isolation. The demo smoke confirms a partial-scope bulk request and
-cancels it, then selects all after Load all, bulk marks, opens the Reviewed
-view, and bulk unmarks. They also
+followed by older pages (an empty initial batch), entirely reviewed first
+batches, multiple pages of incremental history, overlapping branches,
+selection kept on the same SHA during incremental loading, cancellation during
+Load all, rate-limited branches left incomplete and then retried (partial
+failure and rate limits), discovery failure, shutdown of blocked loads,
+stale-generation events, restart persistence with a temporary
+`review-state.json`, existing marks and drafts loading unchanged, and that
+viewing a commit never marks it. Bulk review tests cover single, several, and
+all-loaded selection, confirmed bulk mark and Reviewed view bulk unmark,
+partial versus complete scope wording before and after Load all,
+incomplete-history disclosure, a page arriving between confirmation and `y`
+staying excluded and pending (concurrently discovered commits are never
+included), selection following commit identity through reordering and
+pruning, clearing on repository and view changes, a failing store preserving
+prior marks, drafts, and selection on storage failure, restart persistence of
+bulk marks, and modal isolation. The demo smoke confirms a partial-scope bulk
+request and cancels it, then selects all after Load all, bulk marks, opens the
+Reviewed view, and bulk unmarks. They also
 cover day/timezone presentation, all four panes, navigation and search,
 representative and truncated diffs, resize/compact rendering, reviewed/filter
 state, commit and eligible-line drafts, unsupported-line refusal, external

@@ -67,8 +67,21 @@ Delivered in the backlog and bulk-review increments:
   explicit count, repository, and scope. Selection stays distinct from the
   durable reviewed flag, is cleared on repository or view changes and after a
   successful action, never covers unloaded history silently, and never applies
-  to commits discovered after the confirmation opened. There is no global
-  cross-repository bulk operation.
+  to commits discovered after the confirmation opened.
+
+### Out of scope
+
+These were considered while designing the backlog increment and are
+deliberately not supported. They are not promised future work; revisiting
+either requires a new agreed direction, not an implicit extension of the above.
+
+- A global, cross-repository bulk operation. Bulk marking always acts within
+  one repository and one view (backlog or Reviewed), never across
+  repositories.
+- Any date-range picker or other new date-filter UI. `--date` and
+  `--timezone` remain exactly the existing explicitly labeled single-day view
+  and do not gain new UI; they do not limit or otherwise control the default
+  backlog.
 
 ## Delivery order
 
